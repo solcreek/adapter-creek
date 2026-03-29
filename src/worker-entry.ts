@@ -17,6 +17,16 @@ export interface WorkerEntryOptions {
   basePath: string;
   /** Embedded manifests: absolute path → file content */
   manifests: Record<string, string>;
+  /** Prerender entries for ISR cache seeding */
+  prerenderEntries: Array<{
+    pathname: string;
+    html: string;
+    postponedState?: string;
+    initialRevalidate?: number | false;
+    initialStatus?: number;
+    initialHeaders?: Record<string, string | string[]>;
+    pprHeaders?: Record<string, string>;
+  }>;
 }
 
 interface HandlerEntry {
@@ -71,6 +81,9 @@ const PATHNAMES = ${JSON.stringify(pathnames)};
 // Embedded manifests — Next.js route modules call loadManifest() which
 // normally uses fs.readFileSync(). Expose on globalThis so the shim can access it.
 globalThis.__MANIFESTS = ${JSON.stringify(opts.manifests)};
+
+// Prerender entries for ISR cache seeding (PPR shells + static prerenders)
+const __PRERENDER_ENTRIES = ${JSON.stringify(opts.prerenderEntries)};
 
 // Initialize manifests singleton — called lazily on first SSR request.
 function __initManifests() {
@@ -162,6 +175,26 @@ function __initManifests() {
         }
       }),
     };
+  }
+
+  // Seed ISR cache with prerender entries from build output.
+  // This provides instant responses for statically prerendered pages
+  // and PPR shells, matching the behavior of next start.
+  if (__PRERENDER_ENTRIES.length > 0 && typeof globalThis.__CREEK_CACHE === "undefined") {
+    globalThis.__CREEK_CACHE = new Map();
+    for (const entry of __PRERENDER_ENTRIES) {
+      globalThis.__CREEK_CACHE.set(entry.pathname, {
+        value: {
+          kind: "APP_PAGE",
+          html: entry.html,
+          postponed: entry.postponedState,
+          status: entry.initialStatus,
+          headers: entry.initialHeaders,
+        },
+        lastModified: Date.now(),
+        revalidate: typeof entry.initialRevalidate === "number" ? entry.initialRevalidate : undefined,
+      });
+    }
   }
 }
 

@@ -54,6 +54,13 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   const manifests = await collectManifests(ctx.distDir);
   console.log(`  [Creek Adapter] ${Object.keys(manifests).length} manifests embedded`);
 
+  // Step 3b: Collect prerender entries for ISR cache seeding.
+  // Each prerender with a fallback file gets seeded into the cache at startup.
+  const prerenderEntries = await collectPrerenderEntries(ctx.outputs);
+  if (prerenderEntries.length > 0) {
+    console.log(`  [Creek Adapter] ${prerenderEntries.length} prerender entries for cache seeding`);
+  }
+
   // Step 4: Generate worker entry
   const workerSource = generateWorkerEntry({
     buildId: ctx.buildId,
@@ -61,6 +68,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     outputs: ctx.outputs,
     basePath: ctx.config.basePath || "",
     manifests,
+    prerenderEntries,
   });
 
   // Step 4: Bundle with esbuild
@@ -191,6 +199,48 @@ async function collectManifests(distDir: string): Promise<Record<string, string>
   } catch {}
 
   return manifests;
+}
+
+/** Prerender entry for ISR cache seeding */
+export interface PrerenderEntry {
+  pathname: string;
+  html: string;
+  postponedState?: string;
+  initialRevalidate?: number | false;
+  initialStatus?: number;
+  initialHeaders?: Record<string, string | string[]>;
+  initialExpiration?: number;
+  pprHeaders?: Record<string, string>;
+}
+
+/**
+ * Collect prerender entries from build outputs for cache seeding.
+ * Reads fallback HTML files and extracts metadata for ISR.
+ */
+async function collectPrerenderEntries(outputs: BuildContext["outputs"]): Promise<PrerenderEntry[]> {
+  const entries: PrerenderEntry[] = [];
+
+  for (const prerender of outputs.prerenders) {
+    if (!prerender.fallback?.filePath) continue;
+
+    try {
+      const html = await fs.readFile(prerender.fallback.filePath, "utf-8");
+      entries.push({
+        pathname: prerender.pathname,
+        html,
+        postponedState: prerender.fallback.postponedState,
+        initialRevalidate: prerender.fallback.initialRevalidate,
+        initialStatus: prerender.fallback.initialStatus,
+        initialHeaders: prerender.fallback.initialHeaders,
+        initialExpiration: prerender.fallback.initialExpiration,
+        pprHeaders: prerender.pprChain?.headers,
+      });
+    } catch {
+      // Skip prerenders whose fallback file can't be read
+    }
+  }
+
+  return entries;
 }
 
 function formatSize(bytes: number): string {
