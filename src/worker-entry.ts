@@ -232,56 +232,10 @@ export default {
         }
       }
 
-      // Invoke handler with error capture via manual promise
-      const { IncomingMessage: IM2, ServerResponse: SR2 } = await import("http");
-      const nodeReq = new IM2();
-      nodeReq.method = request.method;
-      nodeReq.url = url.pathname + url.search;
-      nodeReq.headers = Object.fromEntries(request.headers);
-      nodeReq.push(null);
-
-      const nodeRes = new SR2(nodeReq);
-      const resChunks = [];
-      nodeRes.on("data", (chunk) => {
-        if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
-        resChunks.push(chunk);
-      });
-
-      const responseReady = new Promise((resolve) => {
-        nodeRes.on("finish", () => resolve("finish"));
-        nodeRes.on("close", () => resolve("close"));
-        setTimeout(() => resolve("timeout"), 25000);
-      });
-
-      const handlerFn = mod.handler;
-      const handlerResult = handlerFn(nodeReq, nodeRes, {
-        waitUntil: (p) => ctx.waitUntil(p.catch(() => {})),
-        requestMeta: { relativeProjectDir: ".", hostname: request.headers.get("host") || "localhost" },
-      });
-
-      // Swallow the handler promise rejection to prevent 1101
-      if (handlerResult?.then) {
-        handlerResult.catch((err) => {
-          if (!nodeRes.finished) {
-            nodeRes.statusCode = 500;
-            nodeRes.end(JSON.stringify({ error: "render_error", message: err instanceof Error ? err.message : String(err) }));
-          }
-        });
-      }
-
-      const reason = await responseReady;
-
-      if (reason === "timeout" && resChunks.length === 0) {
-        return new Response(JSON.stringify({ error: "ssr_timeout", message: "Handler did not respond within 25s" }), {
-          status: 500, headers: { "Content-Type": "application/json" },
-        });
-      }
-
-      const body = resChunks.length > 0 ? new Blob(resChunks).stream() : null;
-      return new Response(body, {
-        status: nodeRes.statusCode,
-        headers: nodeRes.getHeaders(),
-      });
+      // Streaming SSR: use TransformStream so chunks flow to the client
+      // as Next.js writes them, enabling Server Components streaming,
+      // PPR shell delivery, and progressive HTML rendering.
+      return await invokeNodeHandler(request, mod, ctx);
     } catch (err) {
       const msg = err instanceof Error ? (err.stack || err.message) : String(err);
       return new Response(JSON.stringify({ error: "ssr_error", message: msg }), {
@@ -362,15 +316,21 @@ function collectPathnames(outputs: BuildContext["outputs"]): string[] {
 const NODE_BRIDGE_CODE = `
 import { IncomingMessage, ServerResponse } from "http";
 
+/**
+ * Streaming SSR bridge: Web Request -> IncomingMessage/ServerResponse -> Web Response.
+ *
+ * Uses TransformStream to stream chunks to the client as Next.js writes them.
+ * The Response is returned as soon as headers are sent (writeHead/first write),
+ * enabling Server Components streaming, PPR, and progressive rendering.
+ */
 async function invokeNodeHandler(request, mod, ctx) {
   const url = new URL(request.url);
 
-  // Create IncomingMessage from our shim (aliased from node:http)
+  // Build IncomingMessage
   const req = new IncomingMessage();
   req.method = request.method;
   req.url = url.pathname + url.search;
   req.headers = Object.fromEntries(request.headers);
-  // Push body
   if (request.body) {
     const reader = request.body.getReader();
     (async () => {
@@ -386,71 +346,99 @@ async function invokeNodeHandler(request, mod, ctx) {
     req.push(null);
   }
 
-  // Create ServerResponse from our shim
+  // Build ServerResponse with streaming output
   const res = new ServerResponse(req);
-  const chunks = [];
-  let resolveResponse, rejectResponse;
-  const responsePromise = new Promise((resolve, reject) => {
-    resolveResponse = resolve;
-    rejectResponse = reject;
-  });
+  const { readable, writable } = new TransformStream();
+  const writer = writable.getWriter();
 
-  // Capture written chunks
-  const origWrite = res.write.bind(res);
+  // resolveResponse is called when we have enough info to return a Response
+  // (status + headers). The body streams via the readable side.
+  let resolveResponse;
+  const responsePromise = new Promise((resolve) => { resolveResponse = resolve; });
+  let headersFlushed = false;
+
+  function flushHeaders() {
+    if (headersFlushed) return;
+    headersFlushed = true;
+    resolveResponse(new Response(readable, {
+      status: res.statusCode,
+      statusText: res.statusMessage || "",
+      headers: res.getHeaders(),
+    }));
+  }
+
+  // Intercept write — stream chunks to the client immediately
   res.write = function(chunk, encoding, cb) {
-    if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
-    if (chunk) chunks.push(chunk);
     if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
+    if (!headersFlushed) flushHeaders();
+    if (chunk) {
+      if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
+      writer.write(chunk);
+    }
     if (cb) cb();
     return true;
   };
 
-  const origEnd = res.end.bind(res);
+  // Intercept end — flush final chunk and close the stream
   res.end = function(chunk, encoding, cb) {
     if (typeof chunk === "function") { cb = chunk; chunk = null; }
     if (typeof encoding === "function") { cb = encoding; encoding = null; }
+    if (!headersFlushed) flushHeaders();
     if (chunk) {
       if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
-      chunks.push(chunk);
+      writer.write(chunk);
     }
+    writer.close().catch(() => {});
     res.finished = true;
-    resolveResponse();
+    res.emit("finish");
+    res.emit("close");
     if (cb) cb();
+    return res;
+  };
+
+  // Intercept writeHead to flush headers early (enables 103 Early Hints)
+  const origWriteHead = res.writeHead.bind(res);
+  res.writeHead = function(...args) {
+    origWriteHead(...args);
+    flushHeaders();
     return res;
   };
 
   // Invoke the handler
   const handlerFn = mod.handler || mod.routeModule?.handle?.bind(mod.routeModule) || mod.default;
   if (typeof handlerFn !== "function") {
-    throw new Error("No handler function found");
+    writer.close().catch(() => {});
+    throw new Error("No handler function found on module");
   }
 
-  try {
-    const result = handlerFn(req, res, {
-      waitUntil: ctx.waitUntil.bind(ctx),
-      requestMeta: {
-        relativeProjectDir: ".",
-        hostname: request.headers.get("host") || "localhost",
-      },
+  const handlerResult = handlerFn(req, res, {
+    waitUntil: (p) => ctx.waitUntil(p.catch(() => {})),
+    requestMeta: {
+      relativeProjectDir: ".",
+      hostname: request.headers.get("host") || "localhost",
+    },
+  });
+
+  // Swallow handler rejection to prevent CF Workers 1101.
+  // The actual response data is captured via res.write/end.
+  if (handlerResult?.then) {
+    handlerResult.catch((err) => {
+      if (!res.finished) {
+        res.statusCode = 500;
+        res.end(JSON.stringify({ error: "render_error", message: err instanceof Error ? err.message : String(err) }));
+      }
     });
-    if (result?.then) await result;
-  } catch (err) {
-    if (!res.finished) {
-      rejectResponse(err);
-    }
   }
 
-  // Wait for response with timeout
-  await Promise.race([
+  // Wait for the Response to be created (headers flushed), with timeout
+  const response = await Promise.race([
     responsePromise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error("SSR timeout (25s)")), 25000)),
+    new Promise((_, reject) => setTimeout(() => {
+      writer.close().catch(() => {});
+      reject(new Error("SSR timeout: no response headers within 25s"));
+    }, 25000)),
   ]);
 
-  const body = chunks.length > 0 ? new Blob(chunks).stream() : null;
-  return new Response(body, {
-    status: res.statusCode,
-    statusText: res.statusMessage,
-    headers: res.getHeaders(),
-  });
+  return response;
 }
 `;
