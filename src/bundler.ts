@@ -37,6 +37,8 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     main: entryPath,
     compatibility_date: "2026-03-28",
     compatibility_flags: ["nodejs_compat"],
+    // Replace __dirname/__filename — not available in CF Workers ESM
+    define: { __dirname: '""', __filename: '""' },
   };
   const configPath = path.join(opts.outputDir, "__wrangler.json");
   await fs.writeFile(configPath, JSON.stringify(wranglerConfig));
@@ -59,9 +61,12 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   }
 
   const bundleDir = path.join(opts.outputDir, "__bundle");
+  // Resolve wrangler binary from the adapter's own node_modules
+  const wranglerBin = path.join(adapterDir, "node_modules", ".bin", "wrangler");
+
   try {
     execSync(
-      `npx wrangler deploy --dry-run --outdir "${bundleDir}" --config "${configPath}"`,
+      `"${wranglerBin}" deploy --dry-run --outdir "${bundleDir}" --config "${configPath}"`,
       {
         cwd: path.dirname(opts.distDir),
         stdio: "pipe",

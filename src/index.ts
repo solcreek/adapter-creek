@@ -1,5 +1,5 @@
 import * as path from "node:path";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, copyFileSync, mkdirSync } from "node:fs";
 import type { NextAdapter } from "next";
 import { handleBuild } from "./build.js";
 
@@ -41,7 +41,6 @@ const adapter: NextAdapter = {
 
     // Copy cache handler into the project directory so Turbopack can resolve it.
     // Turbopack rejects paths outside the project root.
-    const { copyFileSync, mkdirSync } = require("node:fs") as typeof import("node:fs");
     const adapterDir = path.dirname(new URL(import.meta.url).pathname);
     const creekDir = path.join(projectDir, ".creek");
     mkdirSync(creekDir, { recursive: true });

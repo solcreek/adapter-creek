@@ -35,7 +35,7 @@ cat > wrangler.json <<WRANGLER_EOF
   "name": "test-app",
   "main": "${ADAPTER_OUTPUT}/server/worker.js",
   "compatibility_date": "2026-03-28",
-  "compatibility_flags": ["nodejs_compat_v2"],
+  "compatibility_flags": ["nodejs_compat"],
   "assets": {
     "directory": "${ADAPTER_OUTPUT}/assets",
     "binding": "ASSETS"
@@ -43,10 +43,13 @@ cat > wrangler.json <<WRANGLER_EOF
 }
 WRANGLER_EOF
 
+# Resolve wrangler from the adapter's node_modules
+WRANGLER="${ADAPTER_DIR}/node_modules/.bin/wrangler"
+
 # Start miniflare/wrangler dev in background on a random port
 PORT=$((3000 + RANDOM % 10000))
 echo "[adapter-creek] Starting local server on port ${PORT}..." >&2
-npx wrangler dev --port "${PORT}" --local > .adapter-server.log 2>&1 &
+"${WRANGLER}" dev --port "${PORT}" --local > .adapter-server.log 2>&1 &
 SERVER_PID=$!
 
 # Save PID for cleanup
