@@ -42,8 +42,18 @@ export class IncomingMessage extends EventEmitter {
   destroy() { this.emit("close"); return this; }
   [Symbol.asyncIterator]() {
     const self = this;
+    const chunks = [];
+    let done = false;
+    let resolve;
+    let pending = new Promise(r => { resolve = r; });
+    self.on("data", (chunk) => { chunks.push(chunk); resolve(); pending = new Promise(r => { resolve = r; }); });
+    self.on("end", () => { done = true; resolve(); });
     return {
-      async next() { return { done: true, value: undefined }; }
+      async next() {
+        while (chunks.length === 0 && !done) await pending;
+        if (chunks.length > 0) return { done: false, value: chunks.shift() };
+        return { done: true, value: undefined };
+      }
     };
   }
 }
