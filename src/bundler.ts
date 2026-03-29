@@ -121,6 +121,9 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     await fs.writeFile(path.join(opts.outputDir, "__entry_debug.mjs"), opts.workerSource);
   }
 
+  // Resolve adapter paths
+  const adapterDir = path.dirname(path.dirname(new URL(import.meta.url).pathname));
+
   // Generate wrangler config for the bundle step
   const wranglerConfig = {
     name: "creek-adapter-build",
@@ -128,6 +131,11 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     compatibility_date: "2026-03-28",
     compatibility_flags: ["nodejs_compat"],
     define: { __dirname: '""', __filename: '""' },
+    // Mark optional/unavailable deps as external to prevent build errors.
+    // These are caught at runtime and handled gracefully.
+    alias: {
+      "@opentelemetry/api": path.join(adapterDir, "src", "shims", "empty.js"),
+    },
   };
   const configPath = path.join(opts.outputDir, "__wrangler.json");
   await fs.writeFile(configPath, JSON.stringify(wranglerConfig));
@@ -138,7 +146,6 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   // Ensure @next/routing is resolvable from the project directory.
   // It's a dependency of the adapter, not the user's project.
   // Symlink it into the project's node_modules if missing.
-  const adapterDir = path.dirname(path.dirname(new URL(import.meta.url).pathname));
   const projectNodeModules = path.join(path.dirname(opts.distDir), "node_modules");
   const routingDest = path.join(projectNodeModules, "@next", "routing");
   const routingSrc = path.join(adapterDir, "node_modules", "@next", "routing");
