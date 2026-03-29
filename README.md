@@ -51,7 +51,7 @@ Creek is a **platform** — this adapter is the bridge between Next.js and that 
 ## Requirements
 
 - Next.js >= 16.2
-- `--webpack` build flag (Turbopack output is incompatible with esbuild)
+- Turbopack (default) or webpack
 
 ## Usage
 

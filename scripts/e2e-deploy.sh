@@ -23,7 +23,7 @@ npm install --no-audit --no-fund >&2 2>&1
 # Build with adapter
 export NEXT_ADAPTER_PATH="${ADAPTER_PATH}"
 echo "[adapter-creek] Building..." >&2
-npx next build --webpack >&2 2>&1
+npx next build >&2 2>&1
 
 # Save build metadata
 BUILD_ID=$(cat .next/BUILD_ID 2>/dev/null || echo "unknown")

@@ -101,7 +101,7 @@ jobs:
           NEXT_E2E_TEST_TIMEOUT: 240000
           NEXT_EXTERNAL_TESTS_FILTERS: test/deploy-tests-manifest.json
           ADAPTER_DIR: ${{ github.workspace }}/adapter
-          IS_TURBOPACK_TEST: 0
+          IS_TURBOPACK_TEST: 1
           NEXT_TEST_JOB: 1
           NEXT_TELEMETRY_DISABLED: 1
           NEXT_TEST_DEPLOY_SCRIPT_PATH: ${{ github.workspace }}/adapter/scripts/e2e-deploy.sh
