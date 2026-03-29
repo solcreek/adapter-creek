@@ -106,12 +106,40 @@ next build --webpack
 
 ## Testing
 
-Test suite scripts for the [Next.js adapter test harness](https://nextjs.org/docs/app/api-reference/config/next-config-js/adapterPath#testing-adapters). Uses `wrangler dev` (miniflare) for local testing:
+This adapter runs the [Next.js adapter test suite](https://nextjs.org/docs/app/api-reference/config/next-config-js/adapterPath#testing-adapters) on the **actual Cloudflare Workers runtime** via [miniflare](https://miniflare.dev/) (the local CF Workers simulator bundled with `wrangler dev`).
+
+Each adapter tests against its target runtime:
+
+| Adapter | Test runtime | How |
+|---------|-------------|-----|
+| adapter-vercel | Node.js | `next start` |
+| adapter-bun | Bun | `bun serve` |
+| **adapter-creek** | **CF Workers** | **`wrangler dev` (miniflare)** |
+
+This ensures test results reflect real CF Workers behavior — including `nodejs_compat` boundaries, V8 isolate limits, and streaming support — not a Node.js approximation.
+
+### Scripts
 
 ```bash
-scripts/e2e-deploy.sh    # Build + start local server, print URL
-scripts/e2e-logs.sh      # Return BUILD_ID, DEPLOYMENT_ID
-scripts/e2e-cleanup.sh   # Stop local server
+scripts/e2e-deploy.sh    # Build + start wrangler dev, print localhost URL
+scripts/e2e-logs.sh      # Return BUILD_ID, DEPLOYMENT_ID, server logs
+scripts/e2e-cleanup.sh   # Stop wrangler dev server
+```
+
+### Running locally
+
+```bash
+# Clone the Next.js repo alongside this adapter
+git clone https://github.com/vercel/next.js nextjs
+cd nextjs && pnpm install && pnpm build && pnpm install
+
+# Run a single test
+ADAPTER_DIR=../adapter-creek \
+NEXT_TEST_MODE=deploy \
+NEXT_TEST_DEPLOY_SCRIPT_PATH=../adapter-creek/scripts/e2e-deploy.sh \
+NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH=../adapter-creek/scripts/e2e-logs.sh \
+NEXT_TEST_CLEANUP_SCRIPT_PATH=../adapter-creek/scripts/e2e-cleanup.sh \
+node run-tests.js --type e2e test/e2e/app-dir/app/index.test.ts
 ```
 
 ## License
