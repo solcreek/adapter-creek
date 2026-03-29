@@ -37,7 +37,6 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     main: entryPath,
     compatibility_date: "2026-03-28",
     compatibility_flags: ["nodejs_compat"],
-    // Replace __dirname/__filename — not available in CF Workers ESM
     define: { __dirname: '""', __filename: '""' },
   };
   const configPath = path.join(opts.outputDir, "__wrangler.json");
