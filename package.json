@@ -24,6 +24,8 @@
     "build": "tsc",
     "dev": "tsc --watch",
     "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "clean": "rm -rf dist"
   },
   "keywords": [
@@ -52,6 +54,7 @@
     "@types/node": "^22.13.10",
     "next": "16.2.1",
     "typescript": "^5.8.2",
+    "vitest": "^4.1.2",
     "wrangler": "^4.0.0"
   }
 }

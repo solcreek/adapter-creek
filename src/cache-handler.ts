@@ -29,9 +29,10 @@ module.exports = class CacheHandler {
     if (!entry) return null;
 
     // Check if stale (time-based revalidation)
-    if (entry.revalidate && entry.revalidate > 0) {
+    // revalidate: 0 means always stale (revalidate on every request)
+    if (entry.revalidate !== undefined && entry.revalidate !== false) {
       const age = (Date.now() - entry.lastModified) / 1000;
-      if (age > entry.revalidate) {
+      if (entry.revalidate === 0 || age > entry.revalidate) {
         // Stale — return data but signal revalidation needed
         return {
           value: entry.value,
