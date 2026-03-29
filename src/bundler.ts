@@ -35,24 +35,27 @@ export interface BundleOptions {
  * 4. Append a requireChunk() switch that maps paths to static require()
  */
 async function patchTurbopackRuntime(distDir: string): Promise<void> {
-  const chunksDir = path.join(distDir, "server", "chunks", "ssr");
+  // Find ALL Turbopack runtime files — there can be multiple:
+  // .next/server/chunks/ssr/[turbopack]_runtime.js
+  // .next/server/chunks/[turbopack]_runtime.js
+  const runtimePaths: string[] = [];
+  const searchDirs = [
+    path.join(distDir, "server", "chunks", "ssr"),
+    path.join(distDir, "server", "chunks"),
+  ];
 
-  // Find the Turbopack runtime file
-  let runtimePath: string | null = null;
-  try {
-    const files = await fs.readdir(chunksDir);
-    const runtimeFile = files.find((f) => f.includes("[turbopack]_runtime"));
-    if (runtimeFile) {
-      runtimePath = path.join(chunksDir, runtimeFile);
-    }
-  } catch {
-    return; // No chunks dir = webpack build, skip
+  for (const dir of searchDirs) {
+    try {
+      const files = await fs.readdir(dir);
+      for (const f of files) {
+        if (f.includes("[turbopack]_runtime") && f.endsWith(".js")) {
+          runtimePaths.push(path.join(dir, f));
+        }
+      }
+    } catch {}
   }
 
-  if (!runtimePath) return; // Not Turbopack
-
-  const runtimeCode = await fs.readFile(runtimePath, "utf-8");
-  if (!runtimeCode.includes("loadRuntimeChunkPath")) return; // Not the right file
+  if (runtimePaths.length === 0) return; // Not Turbopack
 
   // Collect all chunk files from .next/server/chunks/
   const allChunks: string[] = [];
@@ -89,21 +92,24 @@ ${cases.join("\n")}
 }
 `;
 
-  // Patch: replace require(resolved) in loadRuntimeChunkPath with requireChunk(chunkPath)
-  let patched = runtimeCode;
+  // Patch each Turbopack runtime file
+  for (const runtimePath of runtimePaths) {
+    const runtimeCode = await fs.readFile(runtimePath, "utf-8");
+    if (!runtimeCode.includes("loadRuntimeChunkPath")) continue;
 
-  // The Turbopack runtime has a function like:
-  //   function loadRuntimeChunkPath(chunkPath) { ... require(resolved) ... }
-  // We replace the require(resolved) call with requireChunk(chunkPath)
-  patched = patched.replace(
-    /require\(resolved\)/g,
-    "requireChunk(chunkPath)",
-  );
+    let patched = runtimeCode;
 
-  // Append the requireChunk function
-  patched = patched + "\n" + requireChunkFn;
+    // Replace require(resolved) with requireChunk(chunkPath) in loadRuntimeChunkPath
+    patched = patched.replace(
+      /require\(resolved\)/g,
+      "requireChunk(chunkPath)",
+    );
 
-  await fs.writeFile(runtimePath, patched);
+    // Append the requireChunk function
+    patched = patched + "\n" + requireChunkFn;
+
+    await fs.writeFile(runtimePath, patched);
+  }
 }
 
 export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
@@ -134,7 +140,7 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     // Mark optional/unavailable deps as external to prevent build errors.
     // These are caught at runtime and handled gracefully.
     alias: {
-      "@opentelemetry/api": path.join(adapterDir, "src", "shims", "empty.js"),
+      "@opentelemetry/api": path.join(adapterDir, "src", "shims", "opentelemetry.js"),
     },
   };
   const configPath = path.join(opts.outputDir, "__wrangler.json");

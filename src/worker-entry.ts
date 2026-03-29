@@ -17,6 +17,8 @@ export interface WorkerEntryOptions {
   basePath: string;
   /** Embedded manifests: absolute path → file content */
   manifests: Record<string, string>;
+  /** Path to Turbopack runtime file (for static import to trigger chunk bundling) */
+  turbopackRuntimePath?: string;
   /** Prerender entries for ISR cache seeding */
   prerenderEntries: Array<{
     pathname: string;
@@ -66,6 +68,11 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import { DurableObject } from "cloudflare:workers";
 
+${opts.turbopackRuntimePath ? `
+// Import Turbopack runtime statically so wrangler bundles all chunks.
+// The runtime's requireChunk() switch was patched to inline all chunk paths.
+import ${JSON.stringify(opts.turbopackRuntimePath)};
+` : ""}
 ${opts.outputs.middleware?.edgeRuntime ? `
 // Load edge middleware module — populates globalThis._ENTRIES
 import ${JSON.stringify(opts.outputs.middleware.edgeRuntime.modulePath)};

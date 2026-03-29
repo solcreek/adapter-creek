@@ -61,6 +61,17 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     console.log(`  [Creek Adapter] ${prerenderEntries.length} prerender entries for cache seeding`);
   }
 
+  // Find Turbopack runtime for static import (triggers chunk bundling)
+  let turbopackRuntimePath: string | undefined;
+  try {
+    const ssrChunksDir = path.join(ctx.distDir, "server", "chunks", "ssr");
+    const files = await fs.readdir(ssrChunksDir);
+    const runtimeFile = files.find((f) => f.includes("[turbopack]_runtime"));
+    if (runtimeFile) {
+      turbopackRuntimePath = path.join(ssrChunksDir, runtimeFile);
+    }
+  } catch {}
+
   // Step 4: Generate worker entry
   const workerSource = generateWorkerEntry({
     buildId: ctx.buildId,
@@ -69,6 +80,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     basePath: ctx.config.basePath || "",
     manifests,
     prerenderEntries,
+    turbopackRuntimePath,
   });
 
   // Step 4: Bundle with esbuild
