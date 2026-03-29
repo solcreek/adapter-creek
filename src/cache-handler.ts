@@ -12,13 +12,13 @@ interface CacheEntry {
   value: unknown;
   lastModified: number;
   tags: string[];
-  revalidate?: number;
+  revalidate?: number | false;
 }
 
 const cache = new Map<string, CacheEntry>();
 const tagToKeys = new Map<string, Set<string>>();
 
-module.exports = class CacheHandler {
+export default class CacheHandler {
   constructor(_ctx?: unknown) {
     // Context includes serverDistDir, dev, etc.
     // Not needed for in-memory implementation.

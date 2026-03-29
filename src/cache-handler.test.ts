@@ -1,14 +1,5 @@
-import { describe, it, expect, beforeEach } from "vitest";
-
-// The cache handler uses module.exports (CJS), import the compiled version
-// For testing, we replicate the interface here
-let CacheHandler: any;
-
-beforeEach(async () => {
-  // Dynamic import to get a fresh module each test suite
-  const mod = await import("./cache-handler.js");
-  CacheHandler = mod.default || mod;
-});
+import { describe, it, expect } from "vitest";
+import CacheHandler from "./cache-handler.js";
 
 describe("CacheHandler", () => {
   it("returns null for missing keys", async () => {

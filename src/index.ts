@@ -45,10 +45,10 @@ const adapter: NextAdapter = {
 
     return {
       ...config,
-      output: "standalone" as const,
       // ISR cache handler — in-memory for now, DO-based in Phase 2
       cacheHandler: cacheHandlerPath,
-      cacheMaxMemorySize: 0, // disable Next.js default in-memory cache
+      cacheMaxMemorySize: 0,
+      // Monorepo: set tracing root so Next.js traces deps from repo root
       ...(isMonorepo && {
         outputFileTracingRoot: repoRoot,
       }),
