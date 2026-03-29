@@ -1,43 +1,86 @@
 #!/usr/bin/env bash
 # Next.js adapter test suite — deploy script
-# Contract: builds and deploys the test app, prints URL to stdout.
-# All diagnostic output goes to stderr.
+#
+# Contract:
+# - cwd is an isolated test app created by the Next.js harness
+# - Exit non-zero on failure
+# - Print ONLY the deployment URL to stdout
+# - All diagnostics to stderr or files
 set -euo pipefail
 
-# The adapter is in ADAPTER_DIR, the test app is in the current directory.
 ADAPTER_PATH="${ADAPTER_DIR}/dist/index.js"
 
-# Install the adapter into the test app
+# Install the adapter as a file dependency
+echo "[adapter-creek] Installing adapter..." >&2
 node -e "
 const pkg = JSON.parse(require('fs').readFileSync('package.json','utf8'));
 pkg.dependencies = pkg.dependencies || {};
-pkg.dependencies['@solcreek/adapter-nextjs'] = 'file:${ADAPTER_DIR}';
+pkg.dependencies['@solcreek/adapter-creek'] = 'file:${ADAPTER_DIR}';
 require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 " >&2
-
-# Install dependencies
 npm install --no-audit --no-fund >&2 2>&1
 
-# Set adapter path
+# Build with adapter
 export NEXT_ADAPTER_PATH="${ADAPTER_PATH}"
-
-# Build with webpack (Turbopack doesn't support standalone which the adapter needs)
+echo "[adapter-creek] Building..." >&2
 npx next build --webpack >&2 2>&1
 
-# Deploy to Creek sandbox (no auth needed, 60 min TTL, auto-cleanup)
-# Use --json for structured output, --yes to skip prompts
-RESULT=$(npx creek deploy .creek/adapter-output --json --yes 2>/dev/null)
-
-# Extract and save metadata for logs script
+# Save build metadata
 BUILD_ID=$(cat .next/BUILD_ID 2>/dev/null || echo "unknown")
-DEPLOYMENT_ID=$(echo "$RESULT" | node -e "process.stdin.resume(); let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{try{console.log(JSON.parse(d).sandboxId||'unknown')}catch{console.log('unknown')}})")
-URL=$(echo "$RESULT" | node -e "process.stdin.resume(); let d=''; process.stdin.on('data',c=>d+=c); process.stdin.on('end',()=>{try{console.log(JSON.parse(d).url||'')}catch{console.log('')}})")
 
+# Generate wrangler config for miniflare
+ADAPTER_OUTPUT=".creek/adapter-output"
+cat > wrangler.json <<WRANGLER_EOF
+{
+  "name": "test-app",
+  "main": "${ADAPTER_OUTPUT}/server/worker.js",
+  "compatibility_date": "2026-03-28",
+  "compatibility_flags": ["nodejs_compat_v2"],
+  "assets": {
+    "directory": "${ADAPTER_OUTPUT}/assets",
+    "binding": "ASSETS"
+  }
+}
+WRANGLER_EOF
+
+# Start miniflare/wrangler dev in background on a random port
+PORT=$((3000 + RANDOM % 10000))
+echo "[adapter-creek] Starting local server on port ${PORT}..." >&2
+npx wrangler dev --port "${PORT}" --local > .adapter-server.log 2>&1 &
+SERVER_PID=$!
+
+# Save PID for cleanup
+echo "${SERVER_PID}" > .adapter-server.pid
+
+# Wait for server to be ready (poll health)
+for i in $(seq 1 60); do
+  if curl -s "http://127.0.0.1:${PORT}/" > /dev/null 2>&1; then
+    break
+  fi
+  if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+    echo "[adapter-creek] Server process died" >&2
+    cat .adapter-server.log >&2
+    exit 1
+  fi
+  sleep 1
+done
+
+# Verify server is responding
+if ! curl -s "http://127.0.0.1:${PORT}/" > /dev/null 2>&1; then
+  echo "[adapter-creek] Server failed to start within 60s" >&2
+  cat .adapter-server.log >&2
+  kill "${SERVER_PID}" 2>/dev/null || true
+  exit 1
+fi
+
+# Save metadata for logs script
 {
   echo "BUILD_ID: ${BUILD_ID}"
-  echo "DEPLOYMENT_ID: ${DEPLOYMENT_ID}"
+  echo "DEPLOYMENT_ID: local-${PORT}"
   echo "IMMUTABLE_ASSET_TOKEN: undefined"
 } > .adapter-build.log
 
-# Print only the deployment URL to stdout (test harness reads this)
-echo "${URL}"
+echo "[adapter-creek] Ready at http://127.0.0.1:${PORT}" >&2
+
+# Print URL to stdout (test harness reads this)
+echo "http://127.0.0.1:${PORT}"

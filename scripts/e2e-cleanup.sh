@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
 # Next.js adapter test suite — cleanup script
-# Contract: tears down the deployment after tests complete.
-# Creek sandbox deploys auto-expire after 60 min, so cleanup is optional.
+# Stops the local wrangler dev server started by e2e-deploy.sh.
 set -euo pipefail
 
-# Read deployment ID from build log
-if [ -f ".adapter-build.log" ]; then
-  DEPLOYMENT_ID=$(grep "^DEPLOYMENT_ID:" .adapter-build.log | cut -d' ' -f2)
-  if [ -n "${DEPLOYMENT_ID}" ] && [ "${DEPLOYMENT_ID}" != "unknown" ]; then
-    # Attempt to delete sandbox (best effort)
-    curl -s -X DELETE "https://sandbox-api.creek.dev/api/sandbox/${DEPLOYMENT_ID}" > /dev/null 2>&1 || true
+if [ -f ".adapter-server.pid" ]; then
+  PID=$(cat .adapter-server.pid)
+  if kill -0 "${PID}" 2>/dev/null; then
+    echo "[adapter-creek] Stopping server (PID ${PID})..." >&2
+    kill "${PID}" 2>/dev/null || true
+    for i in $(seq 1 10); do
+      kill -0 "${PID}" 2>/dev/null || break
+      sleep 0.5
+    done
+    kill -9 "${PID}" 2>/dev/null || true
   fi
+  rm -f .adapter-server.pid
 fi
 
-echo "Cleanup complete"
+echo "[adapter-creek] Cleanup complete" >&2
