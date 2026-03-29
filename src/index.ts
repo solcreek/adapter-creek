@@ -39,13 +39,20 @@ const adapter: NextAdapter = {
     const repoRoot = findRepoRoot(projectDir);
     const isMonorepo = repoRoot !== projectDir;
 
-    // Resolve cache handler from the adapter's own directory
+    // Copy cache handler into the project directory so Turbopack can resolve it.
+    // Turbopack rejects paths outside the project root.
+    const { copyFileSync, mkdirSync } = require("node:fs") as typeof import("node:fs");
     const adapterDir = path.dirname(new URL(import.meta.url).pathname);
-    const cacheHandlerPath = path.join(adapterDir, "cache-handler.js");
+    const creekDir = path.join(projectDir, ".creek");
+    mkdirSync(creekDir, { recursive: true });
+    copyFileSync(
+      path.join(adapterDir, "cache-handler.js"),
+      path.join(creekDir, "cache-handler.js"),
+    );
+    const cacheHandlerPath = path.join(creekDir, "cache-handler.js");
 
     return {
       ...config,
-      // ISR cache handler — in-memory for now, DO-based in Phase 2
       cacheHandler: cacheHandlerPath,
       cacheMaxMemorySize: 0,
       // Monorepo: set tracing root so Next.js traces deps from repo root
