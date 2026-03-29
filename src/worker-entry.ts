@@ -461,11 +461,30 @@ async function invokeNodeHandler(request, mod, ctx) {
     return res;
   };
 
-  // Invoke the handler
-  const handlerFn = mod.handler || mod.routeModule?.handle?.bind(mod.routeModule) || mod.default;
+  // Invoke the handler — try multiple export patterns:
+  // - mod.handler: standard Next.js handler export (app pages, routes)
+  // - mod.routeModule.handle: route module instance method
+  // - mod.default: default export (some module formats)
+  // - mod.GET/POST/etc: App Route HTTP method handlers (route.ts)
+  let handlerFn = mod.handler
+    || mod.routeModule?.handle?.bind(mod.routeModule)
+    || mod.default;
+
+  // For App Routes that export HTTP methods directly
+  if (typeof handlerFn !== "function" && (mod.GET || mod.POST || mod.PUT || mod.DELETE || mod.PATCH)) {
+    const method = request.method.toUpperCase();
+    const methodHandler = mod[method];
+    if (typeof methodHandler === "function") {
+      // App Route handlers return Response directly (Web API)
+      writer.close().catch(() => {});
+      const response = await methodHandler(request);
+      return response;
+    }
+  }
+
   if (typeof handlerFn !== "function") {
     writer.close().catch(() => {});
-    throw new Error("No handler function found on module");
+    throw new Error("No handler function found on module (keys: " + Object.keys(mod).join(",") + ")");
   }
 
   const handlerResult = handlerFn(req, res, {
