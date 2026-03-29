@@ -30,7 +30,7 @@ function findRepoRoot(startDir: string): string {
 }
 
 const adapter: NextAdapter = {
-  name: "@solcreek/adapter-nextjs",
+  name: "adapter-creek",
 
   modifyConfig(config, { phase }) {
     if (phase !== "phase-production-build") return config;
@@ -39,12 +39,16 @@ const adapter: NextAdapter = {
     const repoRoot = findRepoRoot(projectDir);
     const isMonorepo = repoRoot !== projectDir;
 
+    // Resolve cache handler from the adapter's own directory
+    const adapterDir = path.dirname(new URL(import.meta.url).pathname);
+    const cacheHandlerPath = path.join(adapterDir, "cache-handler.js");
+
     return {
       ...config,
-      // Standalone output produces standard CJS that esbuild can bundle.
-      // (CLI forces --webpack since Turbopack doesn't support standalone.)
       output: "standalone" as const,
-      // For monorepos: trace deps from the repo root
+      // ISR cache handler — in-memory for now, DO-based in Phase 2
+      cacheHandler: cacheHandlerPath,
+      cacheMaxMemorySize: 0, // disable Next.js default in-memory cache
       ...(isMonorepo && {
         outputFileTracingRoot: repoRoot,
       }),
