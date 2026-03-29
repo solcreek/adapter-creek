@@ -1,0 +1,6 @@
+{
+  "//": "Tests excluded from the Next.js adapter test suite for adapter-creek.",
+  "//": "Each entry is a test file path relative to the Next.js repo root.",
+  "//": "Tests are excluded because of CF Workers runtime limitations.",
+  "skipped": []
+}
