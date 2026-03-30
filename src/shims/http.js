@@ -78,7 +78,11 @@ export class IncomingMessage extends EventEmitter {
     return this;
   }
   addListener(event, fn) { return this.on(event, fn); }
-  pipe(dest) { return dest; }
+  pipe(dest) {
+    this.on("data", (chunk) => dest.write(chunk));
+    this.on("end", () => { if (dest.end) dest.end(); });
+    return dest;
+  }
   unpipe() {}
   resume() { this._startFlowing(); return this; }
   pause() { return this; }
