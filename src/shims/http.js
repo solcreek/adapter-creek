@@ -144,7 +144,17 @@ export class ServerResponse extends EventEmitter {
     this.statusCode = code;
     if (typeof msg === "string") this.statusMessage = msg;
     else if (typeof msg === "object") hdrs = msg;
-    if (hdrs) Object.entries(hdrs).forEach(([k, v]) => this.setHeader(k, v));
+    if (hdrs) {
+      for (const [k, v] of Object.entries(hdrs)) {
+        // Array values (e.g., Set-Cookie) should be stored as-is
+        if (Array.isArray(v)) {
+          this._headers[k.toLowerCase()] = v;
+          this._headerNames[k.toLowerCase()] = k;
+        } else {
+          this.setHeader(k, v);
+        }
+      }
+    }
     this.headersSent = true;
     return this;
   }
