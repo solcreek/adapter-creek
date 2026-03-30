@@ -771,9 +771,11 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
   // Chain writes through pendingWrites to avoid race conditions.
   res.write = function(chunk, encoding, cb) {
     if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
+    if (res.finished) { if (cb) cb(); return false; }
     if (!headersFlushed) flushHeaders();
     if (chunk) {
       if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
+      else if (chunk instanceof Buffer) chunk = new Uint8Array(chunk);
       pendingWrites = pendingWrites
         .then(() => writer.write(chunk))
         .catch(() => {});
@@ -787,9 +789,12 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
   res.end = function(chunk, encoding, cb) {
     if (typeof chunk === "function") { cb = chunk; chunk = null; }
     if (typeof encoding === "function") { cb = encoding; encoding = null; }
+    if (res.finished) { if (cb) cb(); return res; }
+    clearTimeout(bodyTimeout);
     if (!headersFlushed) flushHeaders();
     if (chunk) {
       if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
+      else if (chunk instanceof Buffer) chunk = new Uint8Array(chunk);
       pendingWrites = pendingWrites
         .then(() => writer.write(chunk))
         .catch(() => {});
@@ -883,12 +888,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
     }
   }
 
-  // Clear body timeout once res.end() is called
-  const origEmit = res.emit.bind(res);
-  res.emit = function(event, ...args) {
-    if (event === "finish") clearTimeout(bodyTimeout);
-    return origEmit(event, ...args);
-  };
+  // bodyTimeout is cleared inside res.end() above.
 
   // Wait for the Response to be created (headers flushed), with timeout
   const response = await Promise.race([
