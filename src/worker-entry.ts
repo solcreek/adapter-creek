@@ -6,6 +6,7 @@
  * standard CJS modules that esbuild can bundle.
  */
 
+import { existsSync } from "node:fs";
 import type { NextAdapter } from "next";
 
 type BuildContext = Parameters<NonNullable<NextAdapter["onBuildComplete"]>>[0];
@@ -368,12 +369,15 @@ function collectManifestPaths(outputs: BuildContext["outputs"]): string[] {
 
   for (const page of outputs.appPages) {
     if (page.pathname.endsWith(".rsc")) continue;
+    // Skip edge runtime pages — their manifest paths use a different structure
+    // (.next/server/edge/chunks/ssr/...) that doesn't contain manifest files.
+    if (page.runtime === "edge") continue;
 
     // The manifest file is next to the page handler:
     // .next/server/app/<page>/page.js → page_client-reference-manifest.js
     const dir = page.filePath.replace(/\/page\.js$/, "");
     const manifestPath = dir + "/page_client-reference-manifest.js";
-    if (!seen.has(manifestPath)) {
+    if (!seen.has(manifestPath) && existsSync(manifestPath)) {
       seen.add(manifestPath);
       paths.push(manifestPath);
     }
