@@ -591,11 +591,26 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
   // - mod.handler: standard Next.js handler export (app pages, routes)
   // - mod.routeModule.handle: route module instance method
   // - mod.default: default export (some module formats)
-  // - mod.GET/POST/etc: App Route HTTP method handlers (route.ts)
+  // - mod.default.default: CJS interop nested default
   let handlerFn = mod.handler
     || mod.routeModule?.handle?.bind(mod.routeModule)
     || (typeof mod.default === "function" ? mod.default : null)
     || (typeof mod.default?.default === "function" ? mod.default.default : null);
+
+  // If module only exports default (no handler/routeModule), it's likely an
+  // edge-style handler that takes (Request, ctx) → Response. Call directly
+  // instead of going through Node.js IncomingMessage bridge.
+  if (typeof handlerFn === "function" && !mod.handler && !mod.routeModule
+      && Object.keys(mod).length <= 2) {
+    try {
+      const edgeResult = await handlerFn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
+      if (edgeResult instanceof Response) {
+        writer.close().catch(() => {});
+        return edgeResult;
+      }
+    } catch {}
+    // If it didn't return a Response, fall through to Node bridge
+  }
 
   if (typeof handlerFn !== "function") {
     writer.close().catch(() => {});
