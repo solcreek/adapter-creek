@@ -677,10 +677,18 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
   // Build IncomingMessage with body already buffered
   const req = new IncomingMessage();
   req.method = request.method;
-  // Use invocationTarget URL if available (handles rewrites)
-  const targetUrl = routeResult?.invocationTarget?.pathname || url.pathname;
-  const targetQuery = routeResult?.resolvedQuery
-    ? "?" + new URLSearchParams(routeResult.resolvedQuery).toString()
+  // Use invocationTarget URL if available (handles rewrites).
+  // Strip $nxtPrest sentinel from optional catch-all paths — Next.js uses
+  // this internally but the handler should receive the path without it.
+  let targetUrl = routeResult?.invocationTarget?.pathname || url.pathname;
+  targetUrl = targetUrl.replace(/\\/\\$nxtPrest/g, "").replace(/%24nxtPrest/gi, "") || targetUrl;
+  const resolvedQuery = routeResult?.resolvedQuery || {};
+  // Also strip sentinel from query params
+  for (const [k, v] of Object.entries(resolvedQuery)) {
+    if (v === "$nxtPrest" || v === "%24nxtPrest") resolvedQuery[k] = "";
+  }
+  const targetQuery = Object.keys(resolvedQuery).length > 0
+    ? "?" + new URLSearchParams(resolvedQuery).toString()
     : url.search;
   req.url = targetUrl + targetQuery;
   req.headers = Object.fromEntries(request.headers);
