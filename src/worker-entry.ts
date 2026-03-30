@@ -317,7 +317,7 @@ export default {
       // Clone request for routing — middleware may read the body, but the
       // original must remain available for the handler (server actions, POST).
       const routingClone = request.body ? request.clone() : request;
-      const result = await resolveRoutes({
+      let result = await resolveRoutes({
         url: new URL(request.url),
         buildId: BUILD_ID,
         basePath: BASE_PATH,
