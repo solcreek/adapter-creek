@@ -4,7 +4,18 @@
 const noop = () => {};
 const noopSync = () => undefined;
 
-export const existsSync = () => false;
+export const existsSync = (filePath) => {
+  if (typeof globalThis.__MANIFESTS === "undefined") return false;
+  for (const key of Object.keys(globalThis.__MANIFESTS)) {
+    if (key === filePath || key.endsWith(filePath)) return true;
+    if (filePath.includes(".next/")) {
+      const tail = ".next/" + filePath.split(".next/").pop();
+      const keyTail = key.includes(".next/") ? ".next/" + key.split(".next/").pop() : "";
+      if (tail === keyTail) return true;
+    }
+  }
+  return false;
+};
 export const readFileSync = (filePath, enc) => {
   // Try reading from embedded manifests
   if (typeof globalThis.__MANIFESTS !== "undefined") {
@@ -31,12 +42,15 @@ export const writeFileSync = noop;
 export const mkdirSync = noop;
 export const unlinkSync = noop;
 export const readdirSync = () => [];
-export const statSync = () => ({
-  isFile: () => false,
-  isDirectory: () => false,
-  mtime: new Date(0),
-  size: 0,
-});
+export const statSync = (filePath) => {
+  const exists = existsSync(filePath);
+  return {
+    isFile: () => exists,
+    isDirectory: () => false,
+    mtime: new Date(),
+    size: exists ? (readFileSync(filePath, "utf8")?.length || 0) : 0,
+  };
+};
 export const accessSync = noop;
 export const createReadStream = () => { throw new Error("fs.createReadStream not available in CF Workers"); };
 export const createWriteStream = () => { throw new Error("fs.createWriteStream not available in CF Workers"); };
@@ -50,7 +64,7 @@ export const promises = {
   writeFile: async () => {},
   mkdir: async () => {},
   readdir: async () => [],
-  stat: async () => statSync(),
+  stat: async (filePath) => statSync(filePath),
   access: async () => {},
   unlink: async () => {},
   rm: async () => {},
