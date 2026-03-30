@@ -73,8 +73,11 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
 import { AsyncLocalStorage } from "node:async_hooks";
 if (!globalThis.AsyncLocalStorage) globalThis.AsyncLocalStorage = AsyncLocalStorage;
 
-// Polyfill process methods that Next.js uses but CF Workers may not provide.
+// Polyfill process methods and env that Next.js uses.
 if (typeof process !== "undefined") {
+  if (!process.env) process.env = {};
+  if (!process.env.NODE_ENV) process.env.NODE_ENV = "production";
+  if (!process.env.NEXT_RUNTIME) process.env.NEXT_RUNTIME = "nodejs";
   if (!process.cwd) process.cwd = () => "/";
   if (!process.hrtime) {
     process.hrtime = Object.assign((prev) => {
