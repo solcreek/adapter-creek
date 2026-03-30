@@ -541,8 +541,8 @@ async function invokeNodeHandler(request, mod, ctx) {
     responsePromise,
     new Promise((_, reject) => setTimeout(() => {
       writer.close().catch(() => {});
-      reject(new Error("SSR timeout: no response headers within 25s"));
-    }, 25000)),
+      reject(new Error("SSR timeout: no response headers within 60s"));
+    }, 60000)),
   ]);
 
   return response;
