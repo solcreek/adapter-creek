@@ -491,7 +491,43 @@ function collectPathnames(outputs: BuildContext["outputs"]): string[] {
 }
 
 const NODE_BRIDGE_CODE = `
-import { IncomingMessage, ServerResponse } from "http";
+import { EventEmitter } from "node:events";
+import { IncomingMessage as _IM, ServerResponse as _SR } from "http";
+
+// Extend built-in IncomingMessage with buffered body support.
+// The built-in node:http IncomingMessage works for most cases but
+// we need push() with deferred flowing for body buffering.
+class IncomingMessage extends _IM {
+  constructor() {
+    super({ encrypted: true, remoteAddress: "127.0.0.1", address: () => ({ port: 443 }), end() {}, destroy() {} });
+    this._bufferedChunks = [];
+    this._ended = false;
+    this._customFlowing = false;
+  }
+  push(chunk) {
+    if (chunk === null) {
+      this._ended = true;
+      if (this._customFlowing) { super.push(null); return; }
+      return;
+    }
+    if (this._customFlowing) { super.push(chunk); return; }
+    this._bufferedChunks.push(chunk);
+  }
+  _startFlowing() {
+    if (this._customFlowing) return;
+    this._customFlowing = true;
+    for (const c of this._bufferedChunks) super.push(c);
+    this._bufferedChunks = [];
+    if (this._ended) super.push(null);
+  }
+  on(event, fn) {
+    super.on(event, fn);
+    if (event === "data" && !this._customFlowing) queueMicrotask(() => this._startFlowing());
+    return this;
+  }
+  resume() { this._startFlowing(); return super.resume(); }
+}
+const ServerResponse = _SR;
 
 /**
  * Streaming SSR bridge: Web Request -> IncomingMessage/ServerResponse -> Web Response.

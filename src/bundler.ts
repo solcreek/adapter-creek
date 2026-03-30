@@ -155,10 +155,9 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       "node:vm": path.join(adapterDir, "src", "shims", "vm.js"),
       // critters is bundled by Next.js for CSS inlining — not needed on Workers.
       "critters": path.join(adapterDir, "src", "shims", "critters.js"),
-      // http shim — our custom IncomingMessage/ServerResponse with buffered
-      // body support and proper streaming for the Node.js bridge.
-      "http": path.join(adapterDir, "src", "shims", "http.js"),
-      "node:http": path.join(adapterDir, "src", "shims", "http.js"),
+      // NOTE: http/node:http is NOT aliased — CF Workers nodejs_compat provides it.
+      // The worker entry uses our custom IncomingMessage/ServerResponse inline via
+      // the NODE_BRIDGE_CODE template, which imports from "http" (the built-in).
     },
   };
   const configPath = path.join(opts.outputDir, "__wrangler.json");
