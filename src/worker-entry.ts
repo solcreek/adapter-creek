@@ -343,10 +343,18 @@ export default {
       // 4. Invoke matched handler
       let resolvedPathname = result.resolvedPathname;
       // resolveRoutes may return invocationTarget with the actual pathname to invoke.
-      // This handles rewrites where the rewritten URL maps to a handler.
       if (!resolvedPathname && result.invocationTarget?.pathname) {
         const target = result.invocationTarget.pathname;
         if (HANDLERS[target]) resolvedPathname = target;
+      }
+      // If resolvedPathname has .rsc suffix, try without it
+      if (resolvedPathname && !HANDLERS[resolvedPathname] && resolvedPathname.endsWith(".rsc")) {
+        const withoutRsc = resolvedPathname.slice(0, -4);
+        if (HANDLERS[withoutRsc]) resolvedPathname = withoutRsc;
+      }
+      // Try index route: /foo → /foo/index or /foo/page
+      if (resolvedPathname && !HANDLERS[resolvedPathname]) {
+        if (HANDLERS[resolvedPathname + "/index"]) resolvedPathname = resolvedPathname + "/index";
       }
       // If no route handler matched, check for static assets or 404.
       if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
