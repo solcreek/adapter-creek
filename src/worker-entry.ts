@@ -299,12 +299,13 @@ export default {
       const url = new URL(request.url);
 
       // 1. Static assets via WfP ASSETS binding
-      if (url.pathname.startsWith("/_next/")) {
+      // /_next/data/ requests are Pages Router data fetches — must go through routing
+      if (url.pathname.startsWith("/_next/") && !url.pathname.startsWith("/_next/data/")) {
         try {
           const assetRes = await env.ASSETS.fetch(request);
           if (assetRes.ok) return assetRes;
         } catch {}
-        // Fall through to routing for _next/image, _next/data, etc.
+        // Fall through to routing for _next/image etc.
       }
 
       // 2. Image optimization — proxy to original image.
