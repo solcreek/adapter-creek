@@ -155,6 +155,10 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       "node:vm": path.join(adapterDir, "src", "shims", "vm.js"),
       // critters is bundled by Next.js for CSS inlining — not needed on Workers.
       "critters": path.join(adapterDir, "src", "shims", "critters.js"),
+      // http shim — our custom IncomingMessage/ServerResponse with buffered
+      // body support and proper streaming for the Node.js bridge.
+      "http": path.join(adapterDir, "src", "shims", "http.js"),
+      "node:http": path.join(adapterDir, "src", "shims", "http.js"),
     },
   };
   const configPath = path.join(opts.outputDir, "__wrangler.json");
