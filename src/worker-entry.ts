@@ -289,14 +289,6 @@ export default {
         return new Response("Image not found", { status: 404 });
       }
 
-      // 3. Try serving as static asset
-      try {
-        const assetRes = await env.ASSETS.fetch(
-          new Request(new URL(url.pathname, url.origin), { headers: request.headers })
-        );
-        if (assetRes.ok) return assetRes;
-      } catch {}
-
       // 3. Route resolution via @next/routing
       // Clone request for routing — middleware may read the body, but the
       // original must remain available for the handler (server actions, POST).
@@ -321,9 +313,17 @@ export default {
 
       // 4. Invoke matched handler
       let resolvedPathname = result.resolvedPathname;
-      // If resolved pathname has no handler, try the /_not-found handler for SSR 404.
-      // This renders the not-found boundary instead of static 404.html.
+      // If no route handler matched, try serving as static asset before 404.
+      // This is after route resolution so redirects (trailing slash etc.) are handled first.
       if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
+        try {
+          const assetRes = await env.ASSETS.fetch(
+            new Request(new URL(url.pathname, url.origin), { headers: request.headers })
+          );
+          if (assetRes.ok) return assetRes;
+        } catch {}
+
+        // Fall back to SSR _not-found handler or static 404
         if (HANDLERS["/_not-found"]) {
           resolvedPathname = "/_not-found";
         } else {
