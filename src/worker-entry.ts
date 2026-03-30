@@ -262,7 +262,34 @@ export default {
         return env.ASSETS.fetch(request);
       }
 
-      // 2. Try serving as static asset
+      // 2. Image optimization — proxy to original image.
+      // Full optimization (resize/format) will use CF Image Resizing in production.
+      if (url.pathname === "/_next/image") {
+        const imageUrl = url.searchParams.get("url");
+        if (imageUrl) {
+          try {
+            // Internal images — serve from assets
+            if (imageUrl.startsWith("/")) {
+              const assetRes = await env.ASSETS.fetch(
+                new Request(new URL(imageUrl, url.origin), { headers: request.headers })
+              );
+              if (assetRes.ok) {
+                const headers = new Headers(assetRes.headers);
+                headers.set("Cache-Control", "public, max-age=60");
+                return new Response(assetRes.body, { status: 200, headers });
+              }
+            }
+            // External images — proxy
+            if (imageUrl.startsWith("http")) {
+              const imgRes = await fetch(imageUrl);
+              if (imgRes.ok) return imgRes;
+            }
+          } catch {}
+        }
+        return new Response("Image not found", { status: 404 });
+      }
+
+      // 3. Try serving as static asset
       try {
         const assetRes = await env.ASSETS.fetch(
           new Request(new URL(url.pathname, url.origin), { headers: request.headers })
@@ -466,10 +493,20 @@ async function invokeNodeHandler(request, mod, ctx) {
   function flushHeaders() {
     if (headersFlushed) return;
     headersFlushed = true;
+    // Build Headers manually to handle multi-value headers (Set-Cookie).
+    const h = new Headers();
+    for (const [key, val] of Object.entries(res.getHeaders())) {
+      if (val === undefined) continue;
+      if (Array.isArray(val)) {
+        for (const v of val) h.append(key, String(v));
+      } else {
+        h.set(key, String(val));
+      }
+    }
     resolveResponse(new Response(readable, {
       status: res.statusCode,
       statusText: res.statusMessage || "",
-      headers: res.getHeaders(),
+      headers: h,
     }));
   }
 

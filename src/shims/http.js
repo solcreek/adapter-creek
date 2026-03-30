@@ -26,6 +26,8 @@ export class IncomingMessage extends EventEmitter {
     this.readable = true;
     this._body = null;
     this._bodyConsumed = false;
+    // Node.js Readable state — some Next.js code checks this directly.
+    this._readableState = { ended: false, endEmitted: false, flowing: null };
     // Buffer chunks until a listener is attached.
     // push() may be called before the handler adds "data" listeners.
     this._bufferedChunks = [];
@@ -41,9 +43,11 @@ export class IncomingMessage extends EventEmitter {
     if (chunk === null) {
       this._ended = true;
       this.complete = true;
-      // If already flowing (listener attached), emit immediately
-      if (this._flowing) { this.emit("end"); return; }
-      // Otherwise buffer — will emit when resume() or listener attached
+      this._readableState.ended = true;
+      if (this._flowing) {
+        this._readableState.endEmitted = true;
+        this.emit("end");
+      }
       return;
     }
     if (this._flowing) {
@@ -56,10 +60,14 @@ export class IncomingMessage extends EventEmitter {
   _startFlowing() {
     if (this._flowing) return;
     this._flowing = true;
+    this._readableState.flowing = true;
     while (this._bufferedChunks.length > 0) {
       this.emit("data", this._bufferedChunks.shift());
     }
-    if (this._ended) this.emit("end");
+    if (this._ended) {
+      this._readableState.endEmitted = true;
+      this.emit("end");
+    }
   }
   on(event, fn) {
     super.on(event, fn);
@@ -111,6 +119,18 @@ export class ServerResponse extends EventEmitter {
     this.connection = this.socket;
   }
   setHeader(name, value) { this._headers[name.toLowerCase()] = value; this._headerNames[name.toLowerCase()] = name; }
+  appendHeader(name, value) {
+    const key = name.toLowerCase();
+    const existing = this._headers[key];
+    if (existing === undefined) {
+      this._headers[key] = value;
+    } else if (Array.isArray(existing)) {
+      existing.push(value);
+    } else {
+      this._headers[key] = [existing, value];
+    }
+    this._headerNames[key] = name;
+  }
   getHeader(name) { return this._headers[name.toLowerCase()]; }
   getHeaders() { return { ...this._headers }; }
   getHeaderNames() { return Object.keys(this._headers); }
