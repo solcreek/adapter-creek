@@ -48,7 +48,7 @@ interface HandlerEntry {
 export function generateWorkerEntry(opts: WorkerEntryOptions): string {
   const handlers = collectHandlers(opts.outputs);
   const pathnames = collectPathnames(opts.outputs);
-  const staticPages = collectStaticPagePathnames(opts.outputs);
+  const staticPageMap = collectStaticPageMap(opts.outputs);
 
   // Lazy imports — used at request time, not module evaluation.
   // wrangler bundles the entry + all reachable imports.
@@ -123,10 +123,10 @@ const BASE_PATH = ${JSON.stringify(opts.basePath)};
 const ROUTING = ${JSON.stringify(opts.routing)};
 const PATHNAMES = ${JSON.stringify(pathnames)};
 
-// Static page pathnames — pre-rendered HTML served from assets, not handlers.
+// Static page map: request pathname → asset file path.
 // Pages Router static pages and auto-statically-optimized pages don't work
 // through handler invocation in CF Workers (no filesystem access).
-const STATIC_PAGES = new Set(${JSON.stringify(staticPages)});
+const STATIC_PAGES = ${JSON.stringify(staticPageMap)};
 
 // Embedded manifests — Next.js route modules call loadManifest() which
 // normally uses fs.readFileSync(). Expose on globalThis so the shim can access it.
@@ -375,12 +375,11 @@ export default {
       // at build time. Their handlers require filesystem access that CF Workers
       // doesn't have, so we serve the HTML directly from assets.
       const servePath = resolvedPathname || url.pathname;
-      if (STATIC_PAGES.has(servePath)) {
+      const staticAssetPath = STATIC_PAGES[servePath];
+      if (staticAssetPath) {
         try {
-          // Static pages are stored as <pathname>/index.html in assets
-          const assetPath = servePath === "/" ? "/index.html" : servePath + "/index.html";
           const assetRes = await env.ASSETS.fetch(
-            new Request(new URL(assetPath, url.origin), { headers: request.headers })
+            new Request(new URL(staticAssetPath, url.origin), { headers: request.headers })
           );
           if (assetRes.ok) {
             const headers = new Headers(assetRes.headers);
@@ -419,8 +418,9 @@ export default {
           if (!result.status) result = { ...result, status: 404 };
         } else {
           // Try static 404 page from assets
+          const notFoundPath = STATIC_PAGES["/404"] || "/404/index.html";
           try {
-            const notFound = await env.ASSETS.fetch(new Request(new URL("/404/index.html", url.origin)));
+            const notFound = await env.ASSETS.fetch(new Request(new URL(notFoundPath, url.origin)));
             if (notFound.ok) {
               return new Response(notFound.body, { status: 404, headers: notFound.headers });
             }
@@ -517,19 +517,29 @@ function collectManifestPaths(outputs: BuildContext["outputs"]): string[] {
 }
 
 /**
- * Collect pathnames of pre-rendered static HTML pages.
- * These pages are served from assets rather than handlers because
- * their handlers require filesystem access unavailable in CF Workers.
+ * Build a map from request pathname → asset file path for static HTML pages.
+ * Pages Router static pages need to be served from assets because their
+ * handlers require filesystem access unavailable in CF Workers.
+ *
+ * Handles the /index → / normalization: outputs.staticFiles uses /index
+ * as the pathname for the root page, but resolveRoutes resolves to /.
  */
-function collectStaticPagePathnames(outputs: BuildContext["outputs"]): string[] {
-  const staticPages = new Set<string>();
+function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, string> {
+  const map: Record<string, string> = {};
   for (const file of outputs.staticFiles) {
     // Only include HTML pages (no file extension), not _next/static/* assets
     if (!file.pathname.startsWith("/_next/") && !path.extname(file.pathname)) {
-      staticPages.add(file.pathname);
+      const assetPath = path.join(file.pathname, "index.html");
+      // Map the original pathname
+      map[file.pathname] = assetPath;
+      // Also map normalized form: /index → /, /foo/index → /foo
+      if (file.pathname.endsWith("/index")) {
+        const parent = file.pathname.slice(0, -6) || "/";
+        map[parent] = assetPath;
+      }
     }
   }
-  return [...staticPages];
+  return map;
 }
 
 function collectPathnames(outputs: BuildContext["outputs"]): string[] {
