@@ -247,9 +247,13 @@ export interface PrerenderEntry {
  */
 async function collectPrerenderEntries(outputs: BuildContext["outputs"]): Promise<PrerenderEntry[]> {
   const entries: PrerenderEntry[] = [];
+  // Limit prerender entries to prevent oversized worker bundles.
+  // Large apps can have hundreds of prerenders, each with full HTML.
+  const MAX_PRERENDER_ENTRIES = 50;
 
   for (const prerender of outputs.prerenders) {
     if (!prerender.fallback?.filePath) continue;
+    if (entries.length >= MAX_PRERENDER_ENTRIES) break;
 
     try {
       const html = await fs.readFile(prerender.fallback.filePath, "utf-8");
