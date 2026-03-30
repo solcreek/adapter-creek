@@ -367,6 +367,16 @@ export default {
         });
       }
 
+      // Strip Next.js internal sentinel values from route matches.
+      // $nxtPrest is used for optional catch-all [[...rest]] when no params present.
+      if (result.routeMatches) {
+        for (const [key, val] of Object.entries(result.routeMatches)) {
+          if (val === "$nxtPrest" || val === "%24nxtPrest") {
+            result = { ...result, routeMatches: { ...result.routeMatches, [key]: "" } };
+          }
+        }
+      }
+
       // 4. Resolve handler pathname
       let resolvedPathname = result.resolvedPathname;
       // resolveRoutes may return invocationTarget with the actual pathname to invoke.
@@ -807,25 +817,51 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
     throw new Error("No handler function found on module (keys: " + Object.keys(mod).join(",") + ")");
   }
 
-  const handlerResult = handlerFn(req, res, {
-    waitUntil: (p) => ctx.waitUntil(p.catch(() => {})),
-    params: routeResult?.routeMatches || {},
-    requestMeta: {
-      relativeProjectDir: ".",
-      hostname: request.headers.get("host") || "localhost",
-    },
-  });
+  // Safety timeout: force-close the body stream if the handler never calls
+  // res.end(). Prevents ERR_INCOMPLETE_CHUNKED_ENCODING hangs.
+  const bodyTimeout = setTimeout(() => {
+    if (!res.finished) {
+      res.finished = true;
+      pendingWrites
+        .then(() => writer.close())
+        .catch(() => {});
+    }
+  }, 30000);
 
-  // Swallow handler rejection to prevent CF Workers 1101.
-  // The actual response data is captured via res.write/end.
-  if (handlerResult?.then) {
-    handlerResult.catch((err) => {
-      if (!res.finished) {
-        res.statusCode = 500;
-        res.end(JSON.stringify({ error: "render_error", message: err instanceof Error ? err.message : String(err) }));
-      }
+  try {
+    const handlerResult = handlerFn(req, res, {
+      waitUntil: (p) => ctx.waitUntil(p.catch(() => {})),
+      params: routeResult?.routeMatches || {},
+      requestMeta: {
+        relativeProjectDir: ".",
+        hostname: request.headers.get("host") || "localhost",
+      },
     });
+
+    // Swallow handler rejection to prevent CF Workers 1101.
+    // The actual response data is captured via res.write/end.
+    if (handlerResult?.then) {
+      handlerResult.catch((err) => {
+        if (!res.finished) {
+          res.statusCode = 500;
+          res.end(JSON.stringify({ error: "render_error", message: err instanceof Error ? err.message : String(err) }));
+        }
+      });
+    }
+  } catch (err) {
+    // Handle synchronous handler errors
+    if (!res.finished) {
+      res.statusCode = 500;
+      res.end(JSON.stringify({ error: "render_error", message: err instanceof Error ? err.message : String(err) }));
+    }
   }
+
+  // Clear body timeout once res.end() is called
+  const origEmit = res.emit.bind(res);
+  res.emit = function(event, ...args) {
+    if (event === "finish") clearTimeout(bodyTimeout);
+    return origEmit(event, ...args);
+  };
 
   // Wait for the Response to be created (headers flushed), with timeout
   const response = await Promise.race([
