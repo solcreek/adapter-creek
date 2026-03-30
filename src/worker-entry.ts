@@ -446,6 +446,8 @@ async function invokeNodeHandler(request, mod, ctx) {
   req.url = url.pathname + url.search;
   req.headers = Object.fromEntries(request.headers);
   if (bodyBuffer) {
+    // Ensure Content-Length is set — body parsers need it.
+    req.headers['content-length'] = String(bodyBuffer.length);
     req.push(bodyBuffer);
   }
   req.push(null);
@@ -471,32 +473,45 @@ async function invokeNodeHandler(request, mod, ctx) {
     }));
   }
 
-  // Intercept write — stream chunks to the client immediately
+  // Track pending writes to prevent writer.close() racing with writes.
+  let pendingWrites = Promise.resolve();
+
+  // Intercept write — stream chunks to the client.
+  // Chain writes through pendingWrites to avoid race conditions.
   res.write = function(chunk, encoding, cb) {
     if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
     if (!headersFlushed) flushHeaders();
     if (chunk) {
       if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
-      writer.write(chunk);
+      pendingWrites = pendingWrites
+        .then(() => writer.write(chunk))
+        .catch(() => {});
     }
-    if (cb) cb();
+    if (cb) pendingWrites.then(() => cb(), () => cb());
     return true;
   };
 
-  // Intercept end — flush final chunk and close the stream
+  // Intercept end — flush final chunk and close the stream.
+  // Wait for all pending writes before closing.
   res.end = function(chunk, encoding, cb) {
     if (typeof chunk === "function") { cb = chunk; chunk = null; }
     if (typeof encoding === "function") { cb = encoding; encoding = null; }
     if (!headersFlushed) flushHeaders();
     if (chunk) {
       if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
-      writer.write(chunk);
+      pendingWrites = pendingWrites
+        .then(() => writer.write(chunk))
+        .catch(() => {});
     }
-    writer.close().catch(() => {});
-    res.finished = true;
-    res.emit("finish");
-    res.emit("close");
-    if (cb) cb();
+    pendingWrites
+      .then(() => writer.close())
+      .catch(() => {})
+      .then(() => {
+        res.finished = true;
+        res.emit("finish");
+        res.emit("close");
+        if (cb) cb();
+      });
     return res;
   };
 

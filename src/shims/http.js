@@ -26,16 +26,53 @@ export class IncomingMessage extends EventEmitter {
     this.readable = true;
     this._body = null;
     this._bodyConsumed = false;
+    // Buffer chunks until a listener is attached.
+    // push() may be called before the handler adds "data" listeners.
+    this._bufferedChunks = [];
+    this._ended = false;
+    this._flowing = false;
   }
   // Readable stream interface (minimal)
-  read() { return null; }
-  push(chunk) {
-    if (chunk === null) { this.complete = true; this.emit("end"); return; }
-    this.emit("data", chunk);
+  read() {
+    if (this._bufferedChunks.length > 0) return this._bufferedChunks.shift();
+    return null;
   }
+  push(chunk) {
+    if (chunk === null) {
+      this._ended = true;
+      this.complete = true;
+      // If already flowing (listener attached), emit immediately
+      if (this._flowing) { this.emit("end"); return; }
+      // Otherwise buffer — will emit when resume() or listener attached
+      return;
+    }
+    if (this._flowing) {
+      this.emit("data", chunk);
+    } else {
+      this._bufferedChunks.push(chunk);
+    }
+  }
+  // Flush buffered data when listeners are ready
+  _startFlowing() {
+    if (this._flowing) return;
+    this._flowing = true;
+    while (this._bufferedChunks.length > 0) {
+      this.emit("data", this._bufferedChunks.shift());
+    }
+    if (this._ended) this.emit("end");
+  }
+  on(event, fn) {
+    super.on(event, fn);
+    // When a "data" listener is attached, start flowing
+    if (event === "data" && !this._flowing) {
+      queueMicrotask(() => this._startFlowing());
+    }
+    return this;
+  }
+  addListener(event, fn) { return this.on(event, fn); }
   pipe(dest) { return dest; }
   unpipe() {}
-  resume() { return this; }
+  resume() { this._startFlowing(); return this; }
   pause() { return this; }
   setEncoding() { return this; }
   setTimeout() { return this; }
