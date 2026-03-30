@@ -14,7 +14,7 @@ on:
 jobs:
   build:
     name: Build Next.js + adapter
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-core
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -46,18 +46,25 @@ jobs:
         working-directory: adapter
         run: pnpm install && pnpm build
 
+      # Pack adapter as tarball — avoids symlink issues with test fixtures
+      # and matches the approach used by adapter-bun.
+      - name: Pack adapter
+        working-directory: adapter
+        run: npm pack --pack-destination "${{ github.workspace }}"
+
       - uses: actions/cache/save@v4
         with:
           path: |
             nextjs
             adapter
             ~/.cache/ms-playwright
+            ${{ github.workspace }}/solcreek-adapter-creek-*.tgz
           key: build-${{ github.sha }}-${{ github.run_id }}
 
   test:
     name: Tests (${{ matrix.group }})
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-latest-8-core
     timeout-minutes: 120
     strategy:
       fail-fast: false
@@ -76,6 +83,7 @@ jobs:
             nextjs
             adapter
             ~/.cache/ms-playwright
+            ${{ github.workspace }}/solcreek-adapter-creek-*.tgz
           key: build-${{ github.sha }}-${{ github.run_id }}
 
       - uses: actions/setup-node@v4
@@ -101,6 +109,7 @@ jobs:
           NEXT_E2E_TEST_TIMEOUT: 240000
           NEXT_EXTERNAL_TESTS_FILTERS: test/deploy-tests-manifest.json
           ADAPTER_DIR: ${{ github.workspace }}/adapter
+          ADAPTER_TARBALL: ${{ github.workspace }}/solcreek-adapter-creek-0.1.0.tgz
           IS_TURBOPACK_TEST: 1
           NEXT_TEST_JOB: 1
           NEXT_TELEMETRY_DISABLED: 1

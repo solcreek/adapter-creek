@@ -10,14 +10,24 @@ set -euo pipefail
 
 ADAPTER_PATH="${ADAPTER_DIR}/dist/index.js"
 
-# Install the adapter as a file dependency
+# Install the adapter — use tarball if available (faster, avoids symlink issues),
+# otherwise fall back to file: dependency.
 echo "[adapter-creek] Installing adapter..." >&2
-node -e "
+if [ -n "${ADAPTER_TARBALL:-}" ] && [ -f "${ADAPTER_TARBALL}" ]; then
+  node -e "
+const pkg = JSON.parse(require('fs').readFileSync('package.json','utf8'));
+pkg.dependencies = pkg.dependencies || {};
+pkg.dependencies['@solcreek/adapter-creek'] = '${ADAPTER_TARBALL}';
+require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+" >&2
+else
+  node -e "
 const pkg = JSON.parse(require('fs').readFileSync('package.json','utf8'));
 pkg.dependencies = pkg.dependencies || {};
 pkg.dependencies['@solcreek/adapter-creek'] = 'file:${ADAPTER_DIR}';
 require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 " >&2
+fi
 npm install --no-audit --no-fund >&2 2>&1
 
 # Build with adapter
