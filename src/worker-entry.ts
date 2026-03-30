@@ -39,6 +39,10 @@ interface HandlerEntry {
   varName: string;
   runtime: "nodejs" | "edge";
   type: string;
+  edgeRuntime?: {
+    entryKey: string;
+    handlerExport: string;
+  };
 }
 
 /**
@@ -54,8 +58,18 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
   // wrangler bundles the entry + all reachable imports.
   const handlerEntries = handlers
     .map(
-      (h) =>
-        `  ${JSON.stringify(h.pathname)}: { load: () => import(${JSON.stringify(h.importPath)}), runtime: ${JSON.stringify(h.runtime)}, type: ${JSON.stringify(h.type)} },`,
+      (h) => {
+        const parts = [
+          `load: () => import(${JSON.stringify(h.importPath)})`,
+          `runtime: ${JSON.stringify(h.runtime)}`,
+          `type: ${JSON.stringify(h.type)}`,
+        ];
+        if (h.edgeRuntime) {
+          parts.push(`entryKey: ${JSON.stringify(h.edgeRuntime.entryKey)}`);
+          parts.push(`handlerExport: ${JSON.stringify(h.edgeRuntime.handlerExport)}`);
+        }
+        return `  ${JSON.stringify(h.pathname)}: { ${parts.join(", ")} },`;
+      },
     )
     .join("\n");
 
@@ -433,7 +447,20 @@ export default {
       const mod = await handler.load();
 
       if (handler.runtime === "edge") {
-        // Edge handlers export a default function (or nested default from CJS interop)
+        // Edge runtime handlers register in globalThis._ENTRIES when their
+        // module is loaded. Use the entryKey/handlerExport metadata to invoke
+        // them through the official Next.js edge entry registry.
+        if (handler.entryKey) {
+          await handler.load(); // Trigger module registration in _ENTRIES
+          const entry = globalThis._ENTRIES?.[handler.entryKey];
+          if (entry) {
+            const fn = entry[handler.handlerExport || "handler"];
+            if (typeof fn === "function") {
+              return fn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
+            }
+          }
+        }
+        // Fallback: try direct module exports
         const fn = typeof mod.default === "function" ? mod.default
           : typeof mod.default?.default === "function" ? mod.default.default
           : mod.handler;
@@ -464,20 +491,32 @@ function collectHandlers(outputs: BuildContext["outputs"]): HandlerEntry[] {
   let idx = 0;
 
   const addOutput = (
-    output: { pathname: string; filePath: string; runtime: "nodejs" | "edge" },
+    output: {
+      pathname: string;
+      filePath: string;
+      runtime: "nodejs" | "edge";
+      edgeRuntime?: { modulePath: string; entryKey: string; handlerExport: string };
+    },
     type: string,
   ) => {
     if (output.pathname.endsWith(".rsc")) return;
     if (seen.has(output.pathname)) return;
     seen.add(output.pathname);
 
-    handlers.push({
+    const entry: HandlerEntry = {
       pathname: output.pathname,
-      importPath: output.filePath,
+      importPath: output.edgeRuntime?.modulePath || output.filePath,
       varName: `_h${idx++}`,
       runtime: output.runtime,
       type,
-    });
+    };
+    if (output.edgeRuntime) {
+      entry.edgeRuntime = {
+        entryKey: output.edgeRuntime.entryKey,
+        handlerExport: output.edgeRuntime.handlerExport,
+      };
+    }
+    handlers.push(entry);
   };
 
   for (const page of outputs.appPages) addOutput(page, "APP_PAGE");
