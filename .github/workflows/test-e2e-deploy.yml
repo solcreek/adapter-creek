@@ -5,7 +5,7 @@ on:
     inputs:
       nextjsRef:
         description: 'Next.js repo ref (branch/tag/SHA)'
-        default: 'canary'
+        default: 'v16.2.1'
         type: string
   # Uncomment for nightly runs:
   # schedule:
