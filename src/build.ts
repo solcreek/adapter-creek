@@ -196,17 +196,22 @@ async function collectManifests(distDir: string): Promise<Record<string, string>
         // Skip large directories that don't contain manifests
         if (entry.name === "static" || entry.name === "cache" || entry.name === "chunks") continue;
         await walk(fullPath);
-      } else if (
-        entry.name.endsWith(".json") ||
-        entry.name.endsWith(".js") ||
-        entry.name === "BUILD_ID" ||
-        entry.name === "package.json"
-      ) {
-        // Manifest-like files: JSON, JS build manifests, BUILD_ID, package.json
+      } else if (entry.name === "BUILD_ID" || entry.name === "package.json") {
+        manifests[fullPath] = await fs.readFile(fullPath, "utf-8").catch(() => "");
+      } else if (entry.name.endsWith(".json") || entry.name.endsWith(".js")) {
+        // Skip non-essential files that bloat the worker entry:
+        // - .nft.json (file tracing, not needed at runtime)
+        // - .segments files
+        // - page.js / route.js (handler code, imported separately)
+        // - _client-reference-manifest.js (imported as static imports)
+        if (entry.name.endsWith(".nft.json")) continue;
+        if (entry.name.endsWith(".segments")) continue;
+        if (entry.name === "page.js" || entry.name === "route.js") continue;
+        if (entry.name.endsWith("_client-reference-manifest.js")) continue;
         try {
           const stat = await fs.stat(fullPath);
-          // Skip files > 1MB (not manifests)
-          if (stat.size < 1_000_000) {
+          // Skip files > 512KB (not manifests)
+          if (stat.size < 512_000) {
             manifests[fullPath] = await fs.readFile(fullPath, "utf-8");
           }
         } catch {}
