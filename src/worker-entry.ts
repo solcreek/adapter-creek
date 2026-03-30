@@ -643,6 +643,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
 
   const handlerResult = handlerFn(req, res, {
     waitUntil: (p) => ctx.waitUntil(p.catch(() => {})),
+    params: routeResult?.routeMatches || {},
     requestMeta: {
       relativeProjectDir: ".",
       hostname: request.headers.get("host") || "localhost",
