@@ -4,3 +4,4 @@ dist/
 .creek/
 *.tsbuildinfo
 package-lock.json
+nextjs/
