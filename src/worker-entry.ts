@@ -493,13 +493,14 @@ function collectPathnames(outputs: BuildContext["outputs"]): string[] {
 const NODE_BRIDGE_CODE = `
 import { EventEmitter } from "node:events";
 import { IncomingMessage as _IM, ServerResponse as _SR } from "http";
+import { Socket } from "net";
 
 // Extend built-in IncomingMessage with buffered body support.
 // The built-in node:http IncomingMessage works for most cases but
 // we need push() with deferred flowing for body buffering.
 class IncomingMessage extends _IM {
   constructor() {
-    super({ encrypted: true, remoteAddress: "127.0.0.1", address: () => ({ port: 443 }), end() {}, destroy() {} });
+    super(new Socket());
     this._bufferedChunks = [];
     this._ended = false;
     this._customFlowing = false;
