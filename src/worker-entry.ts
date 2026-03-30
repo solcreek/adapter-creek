@@ -73,6 +73,23 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
 import { AsyncLocalStorage } from "node:async_hooks";
 if (!globalThis.AsyncLocalStorage) globalThis.AsyncLocalStorage = AsyncLocalStorage;
 
+// Polyfill process methods that Next.js uses but CF Workers may not provide.
+if (typeof process !== "undefined") {
+  if (!process.cwd) process.cwd = () => "/";
+  if (!process.hrtime) {
+    process.hrtime = Object.assign((prev) => {
+      const now = performance.now();
+      const sec = Math.floor(now / 1000);
+      const nsec = Math.floor((now % 1000) * 1e6);
+      if (prev) return [sec - prev[0], nsec - prev[1]];
+      return [sec, nsec];
+    }, { bigint: () => BigInt(Math.floor(performance.now() * 1e6)) });
+  }
+  if (!process.on) process.on = () => process;
+  if (!process.removeListener) process.removeListener = () => process;
+  if (!process.off) process.off = () => process;
+}
+
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import { DurableObject } from "cloudflare:workers";
 
@@ -311,6 +328,13 @@ export default {
       }
       if (result.middlewareResponded) {
         return new Response(null, { status: 204 });
+      }
+      if (result.externalRewrite) {
+        return fetch(result.externalRewrite.toString(), {
+          method: request.method,
+          headers: request.headers,
+          body: request.body,
+        });
       }
 
       // 4. Invoke matched handler

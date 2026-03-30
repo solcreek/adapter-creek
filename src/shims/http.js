@@ -165,6 +165,8 @@ export class ServerResponse extends EventEmitter {
     if (cb) cb();
     return this;
   }
+  get writableEnded() { return this.finished; }
+  get writableFinished() { return this.finished; }
   flushHeaders() { this.headersSent = true; }
   assignSocket() {}
   detachSocket() {}
