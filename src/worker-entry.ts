@@ -269,12 +269,30 @@ ${handlerEntries}
 
 // Middleware handler — invoked by @next/routing when a request matches
 // middleware matchers. Uses the edge runtime _ENTRIES pattern.
-${opts.outputs.middleware && opts.outputs.middleware.runtime === "edge" && opts.outputs.middleware.edgeRuntime ? `
+${opts.outputs.middleware?.edgeRuntime ? `
 const middlewareHandler = async (mwCtx) => {
   try {
     const entry = globalThis._ENTRIES?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.entryKey)}];
     if (!entry) return {};
     const handler = entry[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}];
+    if (typeof handler !== "function") return {};
+    const mwReq = new Request(mwCtx.url, {
+      method: mwCtx.requestBody ? "POST" : "GET",
+      headers: mwCtx.headers,
+      body: mwCtx.requestBody,
+    });
+    const response = await handler(mwReq, {});
+    return responseToMiddlewareResult(response, mwCtx.headers, mwCtx.url);
+  } catch {
+    return {};
+  }
+};
+` : opts.outputs.middleware ? `
+// Node.js runtime middleware — import the module and call handler directly.
+import * as __middleware_mod from ${JSON.stringify(opts.outputs.middleware.filePath)};
+const middlewareHandler = async (mwCtx) => {
+  try {
+    const handler = __middleware_mod.handler || __middleware_mod.default;
     if (typeof handler !== "function") return {};
     const mwReq = new Request(mwCtx.url, {
       method: mwCtx.requestBody ? "POST" : "GET",
