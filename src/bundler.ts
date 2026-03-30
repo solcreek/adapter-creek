@@ -146,6 +146,8 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       // to our shim that reads from embedded __MANIFESTS.
       "fs": path.join(adapterDir, "src", "shims", "fs.js"),
       "node:fs": path.join(adapterDir, "src", "shims", "fs.js"),
+      "vm": path.join(adapterDir, "src", "shims", "vm.js"),
+      "node:vm": path.join(adapterDir, "src", "shims", "vm.js"),
     },
   };
   const configPath = path.join(opts.outputDir, "__wrangler.json");
