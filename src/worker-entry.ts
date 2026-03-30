@@ -292,13 +292,19 @@ export default {
       }
 
       // 4. Invoke matched handler
-      const resolvedPathname = result.resolvedPathname;
+      let resolvedPathname = result.resolvedPathname;
+      // If resolved pathname has no handler, try the /_not-found handler for SSR 404.
+      // This renders the not-found boundary instead of static 404.html.
       if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
-        try {
-          const notFound = await env.ASSETS.fetch(new Request(new URL("/404.html", url.origin)));
-          return new Response(notFound.body, { status: 404, headers: notFound.headers });
-        } catch {
-          return new Response("Not Found", { status: 404 });
+        if (HANDLERS["/_not-found"]) {
+          resolvedPathname = "/_not-found";
+        } else {
+          try {
+            const notFound = await env.ASSETS.fetch(new Request(new URL("/404.html", url.origin)));
+            return new Response(notFound.body, { status: 404, headers: notFound.headers });
+          } catch {
+            return new Response("Not Found", { status: 404 });
+          }
         }
       }
 
