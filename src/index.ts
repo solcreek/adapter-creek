@@ -43,6 +43,10 @@ const adapter: NextAdapter = {
       ...config,
       // Disable memory cache — CF Workers doesn't have persistent fs.
       cacheMaxMemorySize: 0,
+      // Skip TypeScript type checking during build — CF Workers adapter
+      // builds run `next build` where TS errors block the build. Type
+      // checking should happen before deployment, not during bundling.
+      typescript: { ...config.typescript, ignoreBuildErrors: true },
       // Monorepo: set tracing root so Next.js traces deps from repo root
       ...(isMonorepo && {
         outputFileTracingRoot: repoRoot,

@@ -30,6 +30,29 @@ require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 fi
 npm install --no-audit --no-fund --legacy-peer-deps >&2 2>&1
 
+# Patch Next.js: fix invariant error for dynamic metadata routes in handleBuildComplete.
+# Static metadata files (e.g., icon.png) inside dynamic route segments cause a
+# "failed to find source route" invariant because the prerender entry's srcRoute
+# points to a path not in appOutputMap. Allow missing parent and try parent dir.
+# Upstream issue: https://github.com/vercel/next.js/issues/XXXXX
+node -e "
+const fs = require('fs');
+const p = require.resolve('next/dist/build/adapter/build-complete.js');
+let code = fs.readFileSync(p, 'utf8');
+if (code.includes('failed to find source route')) {
+  // Replace the getParentOutput function to try parent directory as fallback
+  // for metadata routes inside dynamic segments (Next.js bug).
+  const old = 'if (!parentOutput && !allowMissing) {';
+  const replacement = 'if (!parentOutput && !allowMissing) { ' +
+    'const _pr = srcRoute.replace(/\\\\/[^\\\\/]+\$/, \"\") || \"/\"; ' +
+    'const _fb = pageOutputMap[_pr] || appOutputMap[_pr]; ' +
+    'if (_fb) return _fb; ';
+  code = code.replace(old, replacement);
+  fs.writeFileSync(p, code);
+  console.error('[adapter-creek] Patched build-complete.js for dynamic metadata routes');
+}
+" >&2 2>&1 || true
+
 # Build with adapter
 export NEXT_ADAPTER_PATH="${ADAPTER_PATH}"
 echo "[adapter-creek] Building..." >&2
