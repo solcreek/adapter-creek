@@ -321,15 +321,20 @@ export default {
         const target = result.invocationTarget.pathname;
         if (HANDLERS[target]) resolvedPathname = target;
       }
-      // If no route handler matched, try serving as static asset before 404.
-      // This is after route resolution so redirects (trailing slash etc.) are handled first.
+      // If no route handler matched, check for static assets or 404.
       if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
-        try {
-          const assetRes = await env.ASSETS.fetch(
-            new Request(new URL(url.pathname, url.origin), { headers: request.headers })
-          );
-          if (assetRes.ok) return assetRes;
-        } catch {}
+        // Only try static assets for paths with extensions or known prefixes.
+        // Without this check, CF Workers Assets may return index.html as SPA
+        // fallback for any path, making all 404s return 200.
+        const hasExt = url.pathname.includes(".");
+        if (hasExt) {
+          try {
+            const assetRes = await env.ASSETS.fetch(
+              new Request(new URL(url.pathname, url.origin), { headers: request.headers })
+            );
+            if (assetRes.ok) return assetRes;
+          } catch {}
+        }
 
         // Fall back to SSR _not-found handler or static 404
         if (HANDLERS["/_not-found"]) {
