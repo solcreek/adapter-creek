@@ -511,8 +511,19 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
   // Build IncomingMessage with body already buffered
   const req = new IncomingMessage();
   req.method = request.method;
-  req.url = url.pathname + url.search;
+  // Use invocationTarget URL if available (handles rewrites)
+  const targetUrl = routeResult?.invocationTarget?.pathname || url.pathname;
+  const targetQuery = routeResult?.resolvedQuery
+    ? "?" + new URLSearchParams(routeResult.resolvedQuery).toString()
+    : url.search;
+  req.url = targetUrl + targetQuery;
   req.headers = Object.fromEntries(request.headers);
+  // Merge resolved headers from middleware into request headers
+  if (routeResult?.resolvedHeaders) {
+    routeResult.resolvedHeaders.forEach((val, key) => {
+      req.headers[key.toLowerCase()] = val;
+    });
+  }
   if (bodyBuffer) {
     // Ensure Content-Length is set — body parsers need it.
     req.headers['content-length'] = String(bodyBuffer.length);
