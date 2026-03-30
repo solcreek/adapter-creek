@@ -141,6 +141,11 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     // These are caught at runtime and handled gracefully.
     alias: {
       "@opentelemetry/api": path.join(adapterDir, "src", "shims", "opentelemetry.js"),
+      // fs shim — intercept both bare and node: prefixed imports.
+      // Turbopack runtime uses require("fs") which wrangler must redirect
+      // to our shim that reads from embedded __MANIFESTS.
+      "fs": path.join(adapterDir, "src", "shims", "fs.js"),
+      "node:fs": path.join(adapterDir, "src", "shims", "fs.js"),
     },
   };
   const configPath = path.join(opts.outputDir, "__wrangler.json");
