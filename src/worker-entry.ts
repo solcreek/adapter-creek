@@ -306,7 +306,10 @@ export default {
       const mod = await handler.load();
 
       if (handler.runtime === "edge") {
-        const fn = mod.default || mod.handler;
+        // Edge handlers export a default function (or nested default from CJS interop)
+        const fn = typeof mod.default === "function" ? mod.default
+          : typeof mod.default?.default === "function" ? mod.default.default
+          : mod.handler;
         if (typeof fn === "function") {
           return fn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
         }
@@ -506,7 +509,8 @@ async function invokeNodeHandler(request, mod, ctx) {
   // - mod.GET/POST/etc: App Route HTTP method handlers (route.ts)
   let handlerFn = mod.handler
     || mod.routeModule?.handle?.bind(mod.routeModule)
-    || mod.default;
+    || (typeof mod.default === "function" ? mod.default : null)
+    || (typeof mod.default?.default === "function" ? mod.default.default : null);
 
   if (typeof handlerFn !== "function") {
     writer.close().catch(() => {});
