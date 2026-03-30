@@ -23,7 +23,12 @@ const NOOP_CONTEXT_MANAGER = {
   enable: NOOP, disable: NOOP,
 };
 
-export const ROOT_CONTEXT = {};
+// Context objects need getValue/setValue/deleteValue per OpenTelemetry API
+export const ROOT_CONTEXT = {
+  getValue: () => undefined,
+  setValue: (key, value) => ROOT_CONTEXT,
+  deleteValue: () => ROOT_CONTEXT,
+};
 export const defaultTextMapGetter = { get: () => undefined, keys: () => [] };
 export const defaultTextMapSetter = { set: NOOP };
 export const INVALID_SPANID = "";
@@ -36,9 +41,9 @@ export const trace = {
   setGlobalTracerProvider: () => NOOP_TRACER_PROVIDER,
   getSpan: () => undefined,
   getActiveSpan: () => undefined,
-  setSpan: (ctx) => ctx,
-  deleteSpan: (ctx) => ctx,
-  setSpanContext: (ctx) => ctx,
+  setSpan: (ctx) => ctx || ROOT_CONTEXT,
+  deleteSpan: (ctx) => ctx || ROOT_CONTEXT,
+  setSpanContext: (ctx) => ctx || ROOT_CONTEXT,
   isSpanContextValid: () => false,
 };
 

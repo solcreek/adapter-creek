@@ -217,6 +217,23 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     }
   }
 
+  // Post-process bundled worker to fix CF Workers compatibility issues.
+  const workerPath = path.join(opts.outputDir, "worker.js");
+  try {
+    let workerCode = await fs.readFile(workerPath, "utf-8");
+
+    // Fix instrumentation module loading — Next.js's catch only handles
+    // ENOENT/MODULE_NOT_FOUND error codes, but CF Workers __require throws
+    // "Dynamic require of ... is not supported" without those codes.
+    // Patch the catch to also handle "is not supported" errors.
+    workerCode = workerCode.replace(
+      /err\.code !== "ENOENT" && err\.code !== "MODULE_NOT_FOUND" && err\.code !== "ERR_MODULE_NOT_FOUND"/g,
+      'err.code !== "ENOENT" && err.code !== "MODULE_NOT_FOUND" && err.code !== "ERR_MODULE_NOT_FOUND" && !err.message?.includes("is not supported")',
+    );
+
+    await fs.writeFile(workerPath, workerCode);
+  } catch {}
+
   // Copy WASM files alongside the bundle
   for (const [name, absPath] of opts.wasmFiles) {
     await fs.copyFile(absPath, path.join(opts.outputDir, name));

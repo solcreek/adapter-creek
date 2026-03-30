@@ -72,6 +72,17 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     }
   } catch {}
 
+  // Create no-op instrumentation.js if missing — Next.js tries to require()
+  // this at runtime, and CF Workers throws a generic error for dynamic require
+  // of missing modules. The error code doesn't match ENOENT/MODULE_NOT_FOUND
+  // that Next.js expects, causing an unhandled rejection.
+  const instrumentationPath = path.join(ctx.distDir, "server", "instrumentation.js");
+  try {
+    await fs.access(instrumentationPath);
+  } catch {
+    await fs.writeFile(instrumentationPath, "module.exports = {};");
+  }
+
   // Step 4: Generate worker entry
   const workerSource = generateWorkerEntry({
     buildId: ctx.buildId,

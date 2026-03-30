@@ -21,7 +21,11 @@ export const readFileSync = (filePath, enc) => {
       if (filePath.split("/").pop() === key.split("/").pop()) return val;
     }
   }
-  return "";
+  // Throw ENOENT like real fs — Next.js loadManifest relies on this
+  // to distinguish between missing and empty files.
+  const err = new Error(`ENOENT: no such file or directory, open '${filePath}'`);
+  err.code = "ENOENT";
+  throw err;
 };
 export const writeFileSync = noop;
 export const mkdirSync = noop;
