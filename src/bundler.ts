@@ -136,7 +136,12 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     main: entryPath,
     compatibility_date: "2026-03-28",
     compatibility_flags: ["nodejs_compat"],
-    define: { __dirname: '""', __filename: '""' },
+    define: {
+      __dirname: '""',
+      __filename: '""',
+      "process.env.NODE_ENV": '"production"',
+      "process.env.NEXT_RUNTIME": '"nodejs"',
+    },
     // Mark optional/unavailable deps as external to prevent build errors.
     // These are caught at runtime and handled gracefully.
     alias: {
