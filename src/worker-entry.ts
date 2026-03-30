@@ -313,6 +313,12 @@ export default {
 
       // 4. Invoke matched handler
       let resolvedPathname = result.resolvedPathname;
+      // resolveRoutes may return invocationTarget with the actual pathname to invoke.
+      // This handles rewrites where the rewritten URL maps to a handler.
+      if (!resolvedPathname && result.invocationTarget?.pathname) {
+        const target = result.invocationTarget.pathname;
+        if (HANDLERS[target]) resolvedPathname = target;
+      }
       // If no route handler matched, try serving as static asset before 404.
       // This is after route resolution so redirects (trailing slash etc.) are handled first.
       if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
