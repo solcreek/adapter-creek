@@ -28,7 +28,7 @@ pkg.dependencies['@solcreek/adapter-creek'] = 'file:${ADAPTER_DIR}';
 require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 " >&2
 fi
-npm install --no-audit --no-fund >&2 2>&1
+npm install --no-audit --no-fund --legacy-peer-deps >&2 2>&1
 
 # Build with adapter
 export NEXT_ADAPTER_PATH="${ADAPTER_PATH}"
