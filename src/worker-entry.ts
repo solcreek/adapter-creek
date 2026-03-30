@@ -305,7 +305,11 @@ export default {
       });
 
       if (result.redirect) {
-        return Response.redirect(result.redirect.url.toString(), result.redirect.status);
+        // Use manual Response — Response.redirect() may not support all status codes (e.g., 308)
+        return new Response(null, {
+          status: result.redirect.status,
+          headers: { Location: result.redirect.url.toString() },
+        });
       }
       if (result.middlewareResponded) {
         return new Response(null, { status: 204 });
@@ -332,6 +336,9 @@ export default {
         // Fall back to SSR _not-found handler or static 404
         if (HANDLERS["/_not-found"]) {
           resolvedPathname = "/_not-found";
+          // Force 404 status — the handler renders the not-found boundary
+          // but doesn't know the original request was unmatched.
+          if (!result.status) result = { ...result, status: 404 };
         } else {
           try {
             const notFound = await env.ASSETS.fetch(new Request(new URL("/404.html", url.origin)));
