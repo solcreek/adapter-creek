@@ -42,8 +42,6 @@ const adapter: NextAdapter = {
     return {
       ...config,
       // Disable memory cache — CF Workers doesn't have persistent fs.
-      // The default file-based cache handler hits our fs shim (no-op).
-      // Future: use DO/KV cache handler for ISR persistence.
       cacheMaxMemorySize: 0,
       // Monorepo: set tracing root so Next.js traces deps from repo root
       ...(isMonorepo && {
