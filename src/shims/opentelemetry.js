@@ -2,15 +2,25 @@
 // Next.js uses it for tracing but it's not required for functionality.
 
 const NOOP = () => {};
-const NOOP_SPAN = {
-  setAttribute: NOOP, setAttributes: NOOP, addEvent: NOOP,
-  setStatus: NOOP, updateName: NOOP, end: NOOP,
-  isRecording: () => false, recordException: NOOP,
-  spanContext: () => ({ traceId: "", spanId: "", traceFlags: 0 }),
-};
+// NOOP_SPAN must be usable by Next.js (has methods like isRecording/end)
+// but must NOT be serializable by React RSC. React only serializes
+// enumerable own properties — so we use non-enumerable properties.
+const NOOP_SPAN = Object.create(null);
+Object.defineProperties(NOOP_SPAN, {
+  setAttribute: { value: () => NOOP_SPAN },
+  setAttributes: { value: () => NOOP_SPAN },
+  addEvent: { value: () => NOOP_SPAN },
+  setStatus: { value: () => NOOP_SPAN },
+  updateName: { value: () => NOOP_SPAN },
+  end: { value: NOOP },
+  isRecording: { value: () => false },
+  recordException: { value: NOOP },
+  spanContext: { value: () => ({ traceId: "", spanId: "", traceFlags: 0 }) },
+});
 const NOOP_TRACER = {
   startSpan: () => NOOP_SPAN,
-  startActiveSpan: (name, fn) => {
+  startActiveSpan: (name, ...args) => {
+    const fn = args[args.length - 1];
     if (typeof fn === "function") return fn(NOOP_SPAN);
     return NOOP_SPAN;
   },
