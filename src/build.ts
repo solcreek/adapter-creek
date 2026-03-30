@@ -131,12 +131,9 @@ async function collectStaticFiles(
   for (const file of outputs.staticFiles) {
     let destRelative = file.pathname;
     if (!path.extname(destRelative)) {
-      const isDirectoryPrefix = [...allPathnames].some(
-        (p) => p !== destRelative && p.startsWith(destRelative + "/"),
-      );
-      if (isDirectoryPrefix) {
-        destRelative = destRelative + "/index.html";
-      }
+      // Extensionless static files are pre-rendered HTML pages (e.g. /, /about, /404).
+      // Store as <pathname>/index.html so CF Workers Assets serves them correctly.
+      destRelative = path.join(destRelative, "index.html");
     }
     const destPath = path.join(assetsDir, destRelative);
     await fs.mkdir(path.dirname(destPath), { recursive: true });

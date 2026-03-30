@@ -7,6 +7,7 @@
  */
 
 import { existsSync } from "node:fs";
+import * as path from "node:path";
 import type { NextAdapter } from "next";
 
 type BuildContext = Parameters<NonNullable<NextAdapter["onBuildComplete"]>>[0];
@@ -47,6 +48,7 @@ interface HandlerEntry {
 export function generateWorkerEntry(opts: WorkerEntryOptions): string {
   const handlers = collectHandlers(opts.outputs);
   const pathnames = collectPathnames(opts.outputs);
+  const staticPages = collectStaticPagePathnames(opts.outputs);
 
   // Lazy imports — used at request time, not module evaluation.
   // wrangler bundles the entry + all reachable imports.
@@ -120,6 +122,11 @@ const BUILD_ID = ${JSON.stringify(opts.buildId)};
 const BASE_PATH = ${JSON.stringify(opts.basePath)};
 const ROUTING = ${JSON.stringify(opts.routing)};
 const PATHNAMES = ${JSON.stringify(pathnames)};
+
+// Static page pathnames — pre-rendered HTML served from assets, not handlers.
+// Pages Router static pages and auto-statically-optimized pages don't work
+// through handler invocation in CF Workers (no filesystem access).
+const STATIC_PAGES = new Set(${JSON.stringify(staticPages)});
 
 // Embedded manifests — Next.js route modules call loadManifest() which
 // normally uses fs.readFileSync(). Expose on globalThis so the shim can access it.
@@ -346,7 +353,7 @@ export default {
         });
       }
 
-      // 4. Invoke matched handler
+      // 4. Resolve handler pathname
       let resolvedPathname = result.resolvedPathname;
       // resolveRoutes may return invocationTarget with the actual pathname to invoke.
       if (!resolvedPathname && result.invocationTarget?.pathname) {
@@ -362,20 +369,47 @@ export default {
       if (resolvedPathname && !HANDLERS[resolvedPathname]) {
         if (HANDLERS[resolvedPathname + "/index"]) resolvedPathname = resolvedPathname + "/index";
       }
-      // If no route handler matched, check for static assets or 404.
+
+      // 4a. Static pages — serve pre-rendered HTML from assets.
+      // Pages Router static pages and auto-optimized pages are pre-rendered
+      // at build time. Their handlers require filesystem access that CF Workers
+      // doesn't have, so we serve the HTML directly from assets.
+      const servePath = resolvedPathname || url.pathname;
+      if (STATIC_PAGES.has(servePath)) {
+        try {
+          // Static pages are stored as <pathname>/index.html in assets
+          const assetPath = servePath === "/" ? "/index.html" : servePath + "/index.html";
+          const assetRes = await env.ASSETS.fetch(
+            new Request(new URL(assetPath, url.origin), { headers: request.headers })
+          );
+          if (assetRes.ok) {
+            const headers = new Headers(assetRes.headers);
+            headers.set("Content-Type", "text/html; charset=utf-8");
+            // Apply middleware resolved headers if present
+            if (result.resolvedHeaders) {
+              result.resolvedHeaders.forEach((val, key) => {
+                if (key.toLowerCase() === "set-cookie") headers.append(key, val);
+                else headers.set(key, val);
+              });
+            }
+            return new Response(assetRes.body, {
+              status: result.status || 200,
+              headers,
+            });
+          }
+        } catch {}
+      }
+
+      // 4b. If no route handler matched, check for static assets or 404.
       if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
-        // Only try static assets for paths with extensions or known prefixes.
-        // Without this check, CF Workers Assets may return index.html as SPA
-        // fallback for any path, making all 404s return 200.
-        const hasExt = url.pathname.includes(".");
-        if (hasExt) {
-          try {
-            const assetRes = await env.ASSETS.fetch(
-              new Request(new URL(url.pathname, url.origin), { headers: request.headers })
-            );
-            if (assetRes.ok) return assetRes;
-          } catch {}
-        }
+        // Try static assets — for paths with extensions (JS, CSS, images)
+        // or paths that might be stored in assets.
+        try {
+          const assetRes = await env.ASSETS.fetch(
+            new Request(new URL(url.pathname, url.origin), { headers: request.headers })
+          );
+          if (assetRes.ok) return assetRes;
+        } catch {}
 
         // Fall back to SSR _not-found handler or static 404
         if (HANDLERS["/_not-found"]) {
@@ -384,12 +418,14 @@ export default {
           // but doesn't know the original request was unmatched.
           if (!result.status) result = { ...result, status: 404 };
         } else {
+          // Try static 404 page from assets
           try {
-            const notFound = await env.ASSETS.fetch(new Request(new URL("/404.html", url.origin)));
-            return new Response(notFound.body, { status: 404, headers: notFound.headers });
-          } catch {
-            return new Response("Not Found", { status: 404 });
-          }
+            const notFound = await env.ASSETS.fetch(new Request(new URL("/404/index.html", url.origin)));
+            if (notFound.ok) {
+              return new Response(notFound.body, { status: 404, headers: notFound.headers });
+            }
+          } catch {}
+          return new Response("Not Found", { status: 404 });
         }
       }
 
@@ -478,6 +514,22 @@ function collectManifestPaths(outputs: BuildContext["outputs"]): string[] {
   }
 
   return paths;
+}
+
+/**
+ * Collect pathnames of pre-rendered static HTML pages.
+ * These pages are served from assets rather than handlers because
+ * their handlers require filesystem access unavailable in CF Workers.
+ */
+function collectStaticPagePathnames(outputs: BuildContext["outputs"]): string[] {
+  const staticPages = new Set<string>();
+  for (const file of outputs.staticFiles) {
+    // Only include HTML pages (no file extension), not _next/static/* assets
+    if (!file.pathname.startsWith("/_next/") && !path.extname(file.pathname)) {
+      staticPages.add(file.pathname);
+    }
+  }
+  return [...staticPages];
 }
 
 function collectPathnames(outputs: BuildContext["outputs"]): string[] {
