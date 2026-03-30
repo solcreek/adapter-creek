@@ -66,12 +66,17 @@ function evalManifest(path, shouldCache = true, _cache = cache, handleMissing) {
   try {
     contextObject = JSON.parse(content);
   } catch {
-    // JS manifests (e.g., _buildManifest.js) — run in sandbox
+    // JS manifests (e.g., _buildManifest.js) — extract JSON via regex.
+    // CF Workers blocks new Function() (CSP), so we parse the assignment
+    // pattern: self.__BUILD_MANIFEST = {...}
     try {
-      const fn = new Function("self", content);
-      const selfObj = {};
-      fn(selfObj);
-      contextObject = selfObj;
+      const jsonMatch = content.match(/=\s*(\{[\s\S]*\})\s*[;\n]/);
+      if (jsonMatch) {
+        const data = JSON.parse(jsonMatch[1]);
+        for (const [key, val] of Object.entries(data)) {
+          contextObject[key] = val;
+        }
+      }
     } catch {}
   }
 
