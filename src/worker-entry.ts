@@ -270,12 +270,14 @@ export default {
       } catch {}
 
       // 3. Route resolution via @next/routing
+      // Pass null for requestBody — resolveRoutes only needs it for
+      // middleware that reads the body. Preserves request.body for handlers.
       const result = await resolveRoutes({
         url: new URL(request.url),
         buildId: BUILD_ID,
         basePath: BASE_PATH,
         headers: request.headers,
-        requestBody: request.body,
+        requestBody: null,
         pathnames: PATHNAMES,
         routes: ROUTING,
         invokeMiddleware: middlewareHandler,
@@ -403,25 +405,37 @@ import { IncomingMessage, ServerResponse } from "http";
 async function invokeNodeHandler(request, mod, ctx) {
   const url = new URL(request.url);
 
-  // Build IncomingMessage
+  // Read entire body first — async piping to IncomingMessage causes
+  // timing issues where the handler reads before chunks arrive.
+  let bodyBuffer = null;
+  if (request.body) {
+    const chunks = [];
+    const reader = request.body.getReader();
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+    }
+    if (chunks.length > 0) {
+      const total = chunks.reduce((s, c) => s + c.length, 0);
+      bodyBuffer = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bodyBuffer.set(chunk, offset);
+        offset += chunk.length;
+      }
+    }
+  }
+
+  // Build IncomingMessage with body already buffered
   const req = new IncomingMessage();
   req.method = request.method;
   req.url = url.pathname + url.search;
   req.headers = Object.fromEntries(request.headers);
-  if (request.body) {
-    const reader = request.body.getReader();
-    (async () => {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) { req.push(null); break; }
-          req.push(value);
-        }
-      } catch { req.push(null); }
-    })();
-  } else {
-    req.push(null);
+  if (bodyBuffer) {
+    req.push(bodyBuffer);
   }
+  req.push(null);
 
   // Build ServerResponse with streaming output
   const res = new ServerResponse(req);
@@ -489,18 +503,6 @@ async function invokeNodeHandler(request, mod, ctx) {
   let handlerFn = mod.handler
     || mod.routeModule?.handle?.bind(mod.routeModule)
     || mod.default;
-
-  // For App Routes that export HTTP methods directly
-  if (typeof handlerFn !== "function" && (mod.GET || mod.POST || mod.PUT || mod.DELETE || mod.PATCH)) {
-    const method = request.method.toUpperCase();
-    const methodHandler = mod[method];
-    if (typeof methodHandler === "function") {
-      // App Route handlers return Response directly (Web API)
-      writer.close().catch(() => {});
-      const response = await methodHandler(request);
-      return response;
-    }
-  }
 
   if (typeof handlerFn !== "function") {
     writer.close().catch(() => {});
