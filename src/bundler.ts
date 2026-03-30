@@ -204,7 +204,7 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       const logs = readdirSync(logDir).sort().reverse();
       if (logs[0]) logContent = readFileSync(path.join(logDir, logs[0]), "utf-8").slice(-1000);
     } catch {}
-    throw new Error(`Wrangler bundle failed:\nSTDERR: ${stderr.slice(-500)}\nSTDOUT: ${stdout.slice(-500)}\nLOG: ${logContent}`);
+    throw new Error(`Wrangler bundle failed:\nSTDERR: ${stderr.slice(-2000)}\nSTDOUT: ${stdout.slice(-500)}\nLOG: ${logContent}`);
   }
 
   // Move bundled files to output directory
