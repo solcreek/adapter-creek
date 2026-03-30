@@ -352,7 +352,7 @@ export default {
       // Streaming SSR: use TransformStream so chunks flow to the client
       // as Next.js writes them, enabling Server Components streaming,
       // PPR shell delivery, and progressive HTML rendering.
-      return await invokeNodeHandler(request, mod, ctx);
+      return await invokeNodeHandler(request, mod, ctx, result);
     } catch (err) {
       const msg = err instanceof Error ? (err.stack || err.message) : String(err);
       return new Response(JSON.stringify({ error: "ssr_error", message: msg }), {
@@ -443,7 +443,7 @@ import { IncomingMessage, ServerResponse } from "http";
  * The Response is returned as soon as headers are sent (writeHead/first write),
  * enabling Server Components streaming, PPR, and progressive rendering.
  */
-async function invokeNodeHandler(request, mod, ctx) {
+async function invokeNodeHandler(request, mod, ctx, routeResult) {
   const url = new URL(request.url);
 
   // Read entire body first — async piping to IncomingMessage causes
@@ -504,8 +504,18 @@ async function invokeNodeHandler(request, mod, ctx) {
         h.set(key, String(val));
       }
     }
+    // Merge resolved headers from middleware (e.g., Set-Cookie, custom headers)
+    if (routeResult?.resolvedHeaders) {
+      routeResult.resolvedHeaders.forEach((val, key) => {
+        if (key.toLowerCase() === "set-cookie") {
+          h.append(key, val);
+        } else if (!h.has(key)) {
+          h.set(key, val);
+        }
+      });
+    }
     resolveResponse(new Response(readable, {
-      status: res.statusCode,
+      status: routeResult?.status || res.statusCode,
       statusText: res.statusMessage || "",
       headers: h,
     }));
