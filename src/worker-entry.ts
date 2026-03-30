@@ -233,15 +233,13 @@ const middlewareHandler = async (mwCtx) => {
     if (!entry) return {};
     const handler = entry[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}];
     if (typeof handler !== "function") return {};
-    const response = await handler(
-      new Request(mwCtx.url, {
-        method: "GET",
-        headers: mwCtx.headers,
-        body: mwCtx.requestBody,
-      }),
-      {}
-    );
-    return responseToMiddlewareResult(response);
+    const mwReq = new Request(mwCtx.url, {
+      method: mwCtx.requestBody ? "POST" : "GET",
+      headers: mwCtx.headers,
+      body: mwCtx.requestBody,
+    });
+    const response = await handler(mwReq, {});
+    return responseToMiddlewareResult(response, mwCtx.headers, mwCtx.url);
   } catch {
     return {};
   }
