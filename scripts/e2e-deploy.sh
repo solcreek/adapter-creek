@@ -48,7 +48,9 @@ cat > wrangler.json <<WRANGLER_EOF
   "compatibility_flags": ["nodejs_compat"],
   "assets": {
     "directory": "${ADAPTER_OUTPUT}/assets",
-    "binding": "ASSETS"
+    "binding": "ASSETS",
+    "html_handling": "none",
+    "not_found_handling": "none"
   }
 }
 WRANGLER_EOF
