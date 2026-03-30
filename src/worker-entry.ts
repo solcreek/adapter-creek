@@ -78,6 +78,8 @@ if (typeof process !== "undefined") {
   if (!process.env) process.env = {};
   if (!process.env.NODE_ENV) process.env.NODE_ENV = "production";
   if (!process.env.NEXT_RUNTIME) process.env.NEXT_RUNTIME = "nodejs";
+  if (!process.version) process.version = "v20.0.0";
+  if (!process.versions) process.versions = { node: "20.0.0" };
   if (!process.cwd) process.cwd = () => "/";
   if (!process.hrtime) {
     process.hrtime = Object.assign((prev) => {
@@ -276,8 +278,12 @@ export default {
       const url = new URL(request.url);
 
       // 1. Static assets via WfP ASSETS binding
-      if (url.pathname.startsWith("/_next/static/")) {
-        return env.ASSETS.fetch(request);
+      if (url.pathname.startsWith("/_next/")) {
+        try {
+          const assetRes = await env.ASSETS.fetch(request);
+          if (assetRes.ok) return assetRes;
+        } catch {}
+        // Fall through to routing for _next/image, _next/data, etc.
       }
 
       // 2. Image optimization — proxy to original image.
