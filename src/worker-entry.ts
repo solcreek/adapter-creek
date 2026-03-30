@@ -298,14 +298,15 @@ export default {
       } catch {}
 
       // 3. Route resolution via @next/routing
-      // Pass null for requestBody — resolveRoutes only needs it for
-      // middleware that reads the body. Preserves request.body for handlers.
+      // Clone request for routing — middleware may read the body, but the
+      // original must remain available for the handler (server actions, POST).
+      const routingClone = request.body ? request.clone() : request;
       const result = await resolveRoutes({
         url: new URL(request.url),
         buildId: BUILD_ID,
         basePath: BASE_PATH,
-        headers: request.headers,
-        requestBody: null,
+        headers: routingClone.headers,
+        requestBody: routingClone.body,
         pathnames: PATHNAMES,
         routes: ROUTING,
         invokeMiddleware: middlewareHandler,
