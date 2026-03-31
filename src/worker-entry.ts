@@ -396,6 +396,11 @@ export default {
           const assetRes = await env.ASSETS.fetch(assetReq);
           if (assetRes.ok) return assetRes;
         } catch {}
+        // For /_next/static/ paths that aren't found, return plain 404
+        // instead of falling through to routing (which would render a full page).
+        if (assetPath.startsWith("/_next/static/")) {
+          return new Response("Not Found", { status: 404 });
+        }
         // Fall through to routing for _next/image etc.
       }
 
