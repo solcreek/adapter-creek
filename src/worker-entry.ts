@@ -36,6 +36,8 @@ export interface WorkerEntryOptions {
   edgeRegistrationChunkPath?: string;
   /** Turbopack runtime module IDs for edge middleware evaluation */
   edgeRuntimeModuleIds?: number[];
+  /** Paths to edge otherChunks that need explicit import */
+  edgeOtherChunkPaths?: string[];
 }
 
 interface HandlerEntry {
@@ -125,9 +127,15 @@ ${opts.outputs.middleware?.edgeRuntime ? `
 // The edge runtime checks Array.isArray(TURBOPACK) and bails out if it's not
 // an array. If the SSR runtime runs first, it replaces TURBOPACK with an object,
 // causing the edge runtime to never initialize.
+// Import edge otherChunks FIRST so their module factories are in the
+// TURBOPACK array before the edge runtime processes it.
+// Use import * + void to prevent esbuild from tree-shaking.
+${(opts.edgeOtherChunkPaths || []).map((p: string, i: number) => `import * as __edgeChunk${i} from ${JSON.stringify(p)};\nvoid __edgeChunk${i};`).join("\n")}
+
+// Then import the edge runtime (processes the queue and sets up _ENTRIES).
 import * as __middleware_edge from ${JSON.stringify(opts.outputs.middleware.edgeRuntime.modulePath)};
+import * as __middleware_file from ${JSON.stringify(opts.outputs.middleware.filePath)};
 void __middleware_edge;
-${opts.edgeRegistrationChunkPath ? `import ${JSON.stringify(opts.edgeRegistrationChunkPath)};` : ""}
 
 // Trigger edge middleware module evaluation.
 // The Turbopack edge runtime's chunk dependency tracking may not resolve
@@ -302,14 +310,28 @@ ${handlerEntries}
 ${opts.outputs.middleware?.edgeRuntime ? `
 const middlewareHandler = async (mwCtx) => {
   try {
-    // Initialize edge modules (resolves Turbopack chunk factories)
+    // Initialize edge modules
     __initEdgeModules();
 
-    // Try _ENTRIES first (populated by edge module initialization)
-    const _mwEntry = globalThis._ENTRIES?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.entryKey)}];
-    let handler = typeof _mwEntry?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}] === "function"
-      ? _mwEntry[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}]
-      : _mwEntry?.default;  // The entry might be a promise proxy with default
+    // Try multiple sources for the middleware handler:
+    // 1. Bridge module (pre-evaluated Turbopack module via build.ts)
+    // 2. _ENTRIES (populated by edge module initialization)
+    let handler;
+
+    // Bridge: __middleware_file exports the pre-evaluated handler module
+    const bridgeMod = typeof __middleware_file !== "undefined" ? __middleware_file : null;
+    if (bridgeMod) {
+      const h = bridgeMod.default?.default || bridgeMod.default || bridgeMod;
+      if (typeof h === "function") handler = h;
+    }
+
+    // _ENTRIES fallback
+    if (!handler) {
+      const _mwEntry = globalThis._ENTRIES?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.entryKey)}];
+      handler = typeof _mwEntry?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}] === "function"
+        ? _mwEntry[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}]
+        : _mwEntry?.default;
+    }
     if (typeof handler !== "function") return {};
     const mwReq = new Request(mwCtx.url, {
       method: mwCtx.requestBody ? "POST" : "GET",
