@@ -34,6 +34,8 @@ export interface WorkerEntryOptions {
   }>;
   /** Path to edge registration chunk (contains _ENTRIES setup) */
   edgeRegistrationChunkPath?: string;
+  /** Turbopack runtime module IDs for edge middleware evaluation */
+  edgeRuntimeModuleIds?: number[];
 }
 
 interface HandlerEntry {
@@ -117,72 +119,38 @@ if (typeof process !== "undefined") {
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import { DurableObject } from "cloudflare:workers";
 
-${opts.turbopackRuntimePath ? `
-// Save the TURBOPACK chunk queue before runtime replaces it with a processing object.
-// Edge chunk factories are registered here and need to be evaluated later.
-const __turbopackChunks = Array.isArray(globalThis.TURBOPACK) ? [...globalThis.TURBOPACK] : [];
-
-// Import Turbopack runtime statically so wrangler bundles all chunks.
-// Use import * + void to prevent esbuild tree-shaking.
-import * as __turbopack_runtime from ${JSON.stringify(opts.turbopackRuntimePath)};
-void __turbopack_runtime;
-` : ""}
 ${opts.outputs.middleware?.edgeRuntime ? `
-// Import edge middleware modules — both the runtime wrapper and the
-// registration chunk that writes to _ENTRIES.
+// IMPORTANT: Edge middleware must be imported BEFORE the SSR Turbopack runtime.
+// Both runtimes replace globalThis.TURBOPACK with a processing object.
+// The edge runtime checks Array.isArray(TURBOPACK) and bails out if it's not
+// an array. If the SSR runtime runs first, it replaces TURBOPACK with an object,
+// causing the edge runtime to never initialize.
 import * as __middleware_edge from ${JSON.stringify(opts.outputs.middleware.edgeRuntime.modulePath)};
 void __middleware_edge;
 ${opts.edgeRegistrationChunkPath ? `import ${JSON.stringify(opts.edgeRegistrationChunkPath)};` : ""}
 
-// Initialize Turbopack edge modules lazily on first use.
-// Edge chunks push [chunkName, moduleId1, factory1, ...] to TURBOPACK.
-// We build a module registry from these factories to resolve e.i(moduleId).
+// Trigger edge middleware module evaluation.
+// The Turbopack edge runtime's chunk dependency tracking may not resolve
+// during initialization (timing issue with otherChunks loading).
+// We manually trigger runtimeModuleIds evaluation via TURBOPACK.push.
+${opts.edgeRuntimeModuleIds && opts.edgeRuntimeModuleIds.length > 0 ? `
 let __edgeModulesInitialized = false;
-const __edgeModules = {};
 function __initEdgeModules() {
   if (__edgeModulesInitialized) return;
   __edgeModulesInitialized = true;
-  self._ENTRIES = self._ENTRIES || {};
-  // Use the saved chunks from before Turbopack runtime replaced the array.
-  const chunks = typeof __turbopackChunks !== "undefined" ? __turbopackChunks : (Array.isArray(globalThis.TURBOPACK) ? globalThis.TURBOPACK : []);
-  if (chunks.length === 0) return;
-
-  // Phase 1: collect all module factories
-  const factories = {};
-  for (const chunk of chunks) {
-    if (!Array.isArray(chunk)) continue;
-    for (let i = 1; i < chunk.length; i += 2) {
-      if (typeof chunk[i] === "number" && typeof chunk[i + 1] === "function") {
-        factories[chunk[i]] = chunk[i + 1];
-      }
-    }
-  }
-
-  // Phase 2: create module loader that can resolve dependencies
-  function loadModule(id) {
-    if (__edgeModules[id]) return __edgeModules[id].exports;
-    const factory = factories[id];
-    if (!factory) return {};
-    const mod = { exports: {} };
-    __edgeModules[id] = mod;
+  if (typeof globalThis.TURBOPACK?.push === "function" && !self._ENTRIES?.middleware_middleware) {
     try {
-      const loader = {
-        i: (reqId) => loadModule(reqId),
-        r: (exports) => {
-          Object.defineProperty(exports, "__esModule", { value: true });
-        },
-      };
-      factory(mod.exports, mod, loader);
+      globalThis.TURBOPACK.push(["__creek_edge_init", {otherChunks: [], runtimeModuleIds: ${JSON.stringify(opts.edgeRuntimeModuleIds)}}]);
     } catch {}
-    return mod.exports;
-  }
-
-  // Phase 3: evaluate all factories (some register in _ENTRIES as side effect)
-  const factoryIds = Object.keys(factories);
-  for (const id of factoryIds) {
-    loadModule(Number(id));
   }
 }
+` : `function __initEdgeModules() {}`}
+` : ""}
+${opts.turbopackRuntimePath ? `
+// Import Turbopack SSR runtime — AFTER edge middleware to avoid replacing
+// TURBOPACK before edge runtime initializes.
+import * as __turbopack_runtime from ${JSON.stringify(opts.turbopackRuntimePath)};
+void __turbopack_runtime;
 ` : ""}
 // Import client-reference manifests — these set globalThis.__RSC_MANIFEST[page]
 // which the Next.js renderer needs for React Server Components.
@@ -402,6 +370,12 @@ export default {
           return new Response("Not Found", { status: 404 });
         }
         // Fall through to routing for _next/image etc.
+      }
+
+      // Debug endpoint
+      if (url.pathname === "/__debug") {
+        ${opts.outputs.middleware?.edgeRuntime ? "__initEdgeModules();" : ""}
+        return new Response("OK");
       }
 
       // 2. Image optimization — proxy to original image.

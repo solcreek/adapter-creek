@@ -90,6 +90,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // 2. node_modules_..._edge-wrapper (contains _ENTRIES registration + module loader)
   // File 2 is NOT referenced by modulePath, so we need to import it explicitly.
   let edgeRegistrationChunkPath: string | undefined;
+  let edgeRuntimeModuleIds: number[] = [];
   if (ctx.outputs.middleware?.edgeRuntime) {
     try {
       const edgeChunksDir = path.join(ctx.distDir, "server", "edge", "chunks");
@@ -100,6 +101,17 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
           if (content.includes("_ENTRIES")) {
             edgeRegistrationChunkPath = path.join(edgeChunksDir, f);
             break;
+          }
+        }
+      }
+      // Extract runtimeModuleIds from the Turbopack runtime chunk.
+      // Format: {otherChunks: [...], runtimeModuleIds: [94924]}
+      for (const f of files) {
+        if (f.startsWith("turbopack-") && f.includes("edge-wrapper") && !f.endsWith(".map")) {
+          const content = await fs.readFile(path.join(edgeChunksDir, f), "utf-8");
+          const match = content.match(/runtimeModuleIds:\s*\[([0-9,\s]+)\]/);
+          if (match) {
+            edgeRuntimeModuleIds = match[1].split(",").map((s: string) => parseInt(s.trim(), 10)).filter((n: number) => !isNaN(n));
           }
         }
       }
@@ -117,6 +129,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     prerenderEntries,
     turbopackRuntimePath,
     edgeRegistrationChunkPath,
+    edgeRuntimeModuleIds,
   });
 
   // Step 4: Bundle with esbuild

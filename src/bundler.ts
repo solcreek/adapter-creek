@@ -98,10 +98,17 @@ async function patchTurbopackRuntime(distDir: string): Promise<void> {
 
   const requireChunkFn = `
 function requireChunk(chunkPath) {
-  switch(chunkPath) {
+  // Decode URL-encoded paths (edge runtime encodes [, ] as %5B, %5D)
+  var decoded = decodeURIComponent(chunkPath);
+  switch(decoded) {
 ${cases.join("\n")}
     default:
-      throw new Error("Chunk not found: " + chunkPath);
+      // Try with original (encoded) path
+      switch(chunkPath) {
+${cases.join("\n")}
+        default:
+          throw new Error("Chunk not found: " + chunkPath);
+      }
   }
 }
 `;
@@ -130,7 +137,12 @@ ${cases.join("\n")}
       patched = patched.replace(
         /loadChunkCached\([^)]*\)\s*\{[^}]*throw\s+Error\s*\(\s*"chunk loading is not supported"\s*\)[^}]*\}/,
         `loadChunkCached(e2, t2) {
-          try { requireChunk(t2); } catch {}
+          try {
+            var decoded = decodeURIComponent(t2);
+            requireChunk(decoded);
+          } catch (err) {
+            console.error("[creek-chunk] Failed to load chunk:", t2, "decoded:", decodeURIComponent(t2), "error:", err.message);
+          }
           return Promise.resolve();
         }`,
       );
