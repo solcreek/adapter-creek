@@ -17,6 +17,7 @@ export interface WorkerEntryOptions {
   routing: BuildContext["routing"];
   outputs: BuildContext["outputs"];
   basePath: string;
+  assetPrefix: string;
   /** Embedded manifests: absolute path → file content */
   manifests: Record<string, string>;
   /** Path to Turbopack runtime file (for static import to trigger chunk bundling) */
@@ -194,6 +195,7 @@ export class BucketCachePurge extends DurableObject {}
 
 const BUILD_ID = ${JSON.stringify(opts.buildId)};
 const BASE_PATH = ${JSON.stringify(opts.basePath)};
+const ASSET_PREFIX = ${JSON.stringify(opts.assetPrefix || "")};
 const ROUTING = ${JSON.stringify(opts.routing)};
 const PATHNAMES = ${JSON.stringify(pathnames)};
 
@@ -384,9 +386,14 @@ export default {
 
       // 1. Static assets via WfP ASSETS binding
       // /_next/data/ requests are Pages Router data fetches — must go through routing
-      if (url.pathname.startsWith("/_next/") && !url.pathname.startsWith("/_next/data/")) {
+      const assetPath = ASSET_PREFIX ? url.pathname.replace(ASSET_PREFIX, "") : url.pathname;
+      if (assetPath.startsWith("/_next/") && !assetPath.startsWith("/_next/data/")) {
         try {
-          const assetRes = await env.ASSETS.fetch(request);
+          // Strip asset prefix for ASSETS binding lookup
+          const assetReq = ASSET_PREFIX
+            ? new Request(new URL(assetPath, url.origin), { headers: request.headers })
+            : request;
+          const assetRes = await env.ASSETS.fetch(assetReq);
           if (assetRes.ok) return assetRes;
         } catch {}
         // Fall through to routing for _next/image etc.
