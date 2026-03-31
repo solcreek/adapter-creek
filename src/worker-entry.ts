@@ -361,10 +361,12 @@ const middlewareHandler = async (mwCtx) => {
       return {};
     }
     if (!response || !(response instanceof Response)) {
-      console.error("[creek-mw] handler returned non-Response:", typeof response);
+      console.error("[creek-mw] handler returned non-Response:", typeof response, response);
       return {};
     }
-    return responseToMiddlewareResult(response, mwCtx.headers, mwCtx.url);
+    console.error("[creek-mw]", mwCtx.url?.pathname, "status:", response.status, "location:", response.headers.get("location"), "x-mw-rewrite:", response.headers.get("x-middleware-rewrite"));
+    const mwResult = responseToMiddlewareResult(response, mwCtx.headers, mwCtx.url);
+    return mwResult;
   } catch (err) {
     console.error("[creek-mw] Error:", err instanceof Error ? err.stack || err.message : String(err));
     return {};
@@ -468,11 +470,24 @@ export default {
       });
 
       if (result.redirect) {
-        // Use manual Response — Response.redirect() may not support all status codes (e.g., 308)
         return new Response(null, {
           status: result.redirect.status,
           headers: { Location: result.redirect.url.toString() },
         });
+      }
+      // Middleware redirects: resolveRoutes returns Location in resolvedHeaders + 3xx status
+      // (not as result.redirect) when middleware calls NextResponse.redirect().
+      if (result.status && result.status >= 300 && result.status < 400 && result.resolvedHeaders) {
+        const location = result.resolvedHeaders.get("location") || result.resolvedHeaders.get("Location");
+        if (location) {
+          const headers = new Headers();
+          headers.set("Location", location);
+          // Forward other middleware headers (e.g., x-redirect-header)
+          result.resolvedHeaders.forEach((val, key) => {
+            if (key.toLowerCase() !== "location") headers.set(key, val);
+          });
+          return new Response(null, { status: result.status, headers });
+        }
       }
       if (result.middlewareResponded) {
         return new Response(null, { status: 204 });
