@@ -42,13 +42,18 @@ async function patchTurbopackRuntime(distDir: string): Promise<void> {
   const searchDirs = [
     path.join(distDir, "server", "chunks", "ssr"),
     path.join(distDir, "server", "chunks"),
+    path.join(distDir, "server", "edge", "chunks"),
   ];
 
   for (const dir of searchDirs) {
     try {
       const files = await fs.readdir(dir);
       for (const f of files) {
-        if (f.includes("[turbopack]_runtime") && f.endsWith(".js")) {
+        if (f.endsWith(".js") && (
+          f.includes("[turbopack]_runtime") ||
+          // Edge Turbopack runtimes are in turbopack-..._edge-wrapper files
+          (f.startsWith("turbopack-") && f.includes("edge-wrapper"))
+        )) {
           runtimePaths.push(path.join(dir, f));
         }
       }
@@ -57,7 +62,7 @@ async function patchTurbopackRuntime(distDir: string): Promise<void> {
 
   if (runtimePaths.length === 0) return; // Not Turbopack
 
-  // Collect all chunk files from .next/server/chunks/
+  // Collect all chunk files from .next/server/chunks/ AND .next/server/edge/chunks/
   const allChunks: string[] = [];
   async function walkChunks(dir: string): Promise<void> {
     let entries;
@@ -72,15 +77,24 @@ async function patchTurbopackRuntime(distDir: string): Promise<void> {
     }
   }
   await walkChunks(path.join(distDir, "server", "chunks"));
+  // Include edge chunks — required for middleware and edge runtime pages
+  await walkChunks(path.join(distDir, "server", "edge", "chunks"));
 
   if (allChunks.length === 0) return;
 
   // Generate the requireChunk switch statement
-  const cases = allChunks.map((chunk) => {
+  const cases: string[] = [];
+  for (const chunk of allChunks) {
     // Extract the relative path after .next/ for the case label
     const relFromDotNext = chunk.replace(/.*\/\.next\//, "");
-    return `      case "${relFromDotNext}": return require("${chunk}");`;
-  });
+    cases.push(`      case "${relFromDotNext}": return require("${chunk}");`);
+    // For edge chunks, also add a short form (relative to server/edge/)
+    // because the edge Turbopack runtime resolves chunks relative to itself.
+    if (relFromDotNext.startsWith("server/edge/")) {
+      const shortRel = relFromDotNext.replace("server/edge/", "");
+      cases.push(`      case "${shortRel}": return require("${chunk}");`);
+    }
+  }
 
   const requireChunkFn = `
 function requireChunk(chunkPath) {
@@ -95,20 +109,41 @@ ${cases.join("\n")}
   // Patch each Turbopack runtime file
   for (const runtimePath of runtimePaths) {
     const runtimeCode = await fs.readFile(runtimePath, "utf-8");
-    if (!runtimeCode.includes("loadRuntimeChunkPath")) continue;
 
     let patched = runtimeCode;
+    let modified = false;
 
-    // Replace require(resolved) with requireChunk(chunkPath) in loadRuntimeChunkPath
-    patched = patched.replace(
-      /require\(resolved\)/g,
-      "requireChunk(chunkPath)",
-    );
+    // Standard SSR runtime: replace require(resolved) with requireChunk(chunkPath)
+    if (runtimeCode.includes("loadRuntimeChunkPath") && runtimeCode.includes("require(resolved)")) {
+      patched = patched.replace(
+        /require\(resolved\)/g,
+        "requireChunk(chunkPath)",
+      );
+      patched = patched + "\n" + requireChunkFn;
+      modified = true;
+    }
 
-    // Append the requireChunk function
-    patched = patched + "\n" + requireChunkFn;
+    // Edge runtime: replace "chunk loading is not supported" with actual chunk loading.
+    // The edge Turbopack runtime has loadChunkCached that throws — we replace it
+    // to return a resolved promise after loading the chunk via requireChunk.
+    if (runtimeCode.includes("chunk loading is not supported")) {
+      patched = patched.replace(
+        /loadChunkCached\([^)]*\)\s*\{[^}]*throw\s+Error\s*\(\s*"chunk loading is not supported"\s*\)[^}]*\}/,
+        `loadChunkCached(e2, t2) {
+          try { requireChunk(t2); } catch {}
+          return Promise.resolve();
+        }`,
+      );
+      // Also add requireChunk if not already appended
+      if (!modified) {
+        patched = patched + "\n" + requireChunkFn;
+      }
+      modified = true;
+    }
 
-    await fs.writeFile(runtimePath, patched);
+    if (modified) {
+      await fs.writeFile(runtimePath, patched);
+    }
   }
 }
 

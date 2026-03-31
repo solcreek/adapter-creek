@@ -31,6 +31,8 @@ export interface WorkerEntryOptions {
     initialHeaders?: Record<string, string | string[]>;
     pprHeaders?: Record<string, string>;
   }>;
+  /** Path to edge registration chunk (contains _ENTRIES setup) */
+  edgeRegistrationChunkPath?: string;
 }
 
 interface HandlerEntry {
@@ -115,37 +117,71 @@ import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import { DurableObject } from "cloudflare:workers";
 
 ${opts.turbopackRuntimePath ? `
+// Save the TURBOPACK chunk queue before runtime replaces it with a processing object.
+// Edge chunk factories are registered here and need to be evaluated later.
+const __turbopackChunks = Array.isArray(globalThis.TURBOPACK) ? [...globalThis.TURBOPACK] : [];
+
 // Import Turbopack runtime statically so wrangler bundles all chunks.
 // Use import * + void to prevent esbuild tree-shaking.
 import * as __turbopack_runtime from ${JSON.stringify(opts.turbopackRuntimePath)};
 void __turbopack_runtime;
 ` : ""}
 ${opts.outputs.middleware?.edgeRuntime ? `
-// Initialize _ENTRIES before edge module imports.
-// Turbopack edge chunks register handlers via (globalThis.TURBOPACK || []).push().
-// Set up TURBOPACK as a processing array so chunks are evaluated on push.
-globalThis._ENTRIES = globalThis._ENTRIES || {};
-const __turbopackQueue = [];
-globalThis.TURBOPACK = new Proxy(__turbopackQueue, {
-  get(target, prop) {
-    if (prop === "push") return (...items) => {
-      for (const item of items) {
-        target.push(item);
-        // Execute chunk factory if present
-        if (Array.isArray(item) && typeof item[2] === "function") {
-          try { item[2]({}, {}, { i: () => ({}) }); } catch {}
-        }
-      }
-      return target.length;
-    };
-    return target[prop];
-  }
-});
-
-// Import edge middleware modules.
+// Import edge middleware modules — both the runtime wrapper and the
+// registration chunk that writes to _ENTRIES.
 import * as __middleware_edge from ${JSON.stringify(opts.outputs.middleware.edgeRuntime.modulePath)};
-import * as __middleware_file from ${JSON.stringify(opts.outputs.middleware.filePath)};
 void __middleware_edge;
+${opts.edgeRegistrationChunkPath ? `import ${JSON.stringify(opts.edgeRegistrationChunkPath)};` : ""}
+
+// Initialize Turbopack edge modules lazily on first use.
+// Edge chunks push [chunkName, moduleId1, factory1, ...] to TURBOPACK.
+// We build a module registry from these factories to resolve e.i(moduleId).
+let __edgeModulesInitialized = false;
+const __edgeModules = {};
+function __initEdgeModules() {
+  if (__edgeModulesInitialized) return;
+  __edgeModulesInitialized = true;
+  self._ENTRIES = self._ENTRIES || {};
+  // Use the saved chunks from before Turbopack runtime replaced the array.
+  const chunks = typeof __turbopackChunks !== "undefined" ? __turbopackChunks : (Array.isArray(globalThis.TURBOPACK) ? globalThis.TURBOPACK : []);
+  if (chunks.length === 0) return;
+
+  // Phase 1: collect all module factories
+  const factories = {};
+  for (const chunk of chunks) {
+    if (!Array.isArray(chunk)) continue;
+    for (let i = 1; i < chunk.length; i += 2) {
+      if (typeof chunk[i] === "number" && typeof chunk[i + 1] === "function") {
+        factories[chunk[i]] = chunk[i + 1];
+      }
+    }
+  }
+
+  // Phase 2: create module loader that can resolve dependencies
+  function loadModule(id) {
+    if (__edgeModules[id]) return __edgeModules[id].exports;
+    const factory = factories[id];
+    if (!factory) return {};
+    const mod = { exports: {} };
+    __edgeModules[id] = mod;
+    try {
+      const loader = {
+        i: (reqId) => loadModule(reqId),
+        r: (exports) => {
+          Object.defineProperty(exports, "__esModule", { value: true });
+        },
+      };
+      factory(mod.exports, mod, loader);
+    } catch {}
+    return mod.exports;
+  }
+
+  // Phase 3: evaluate all factories (some register in _ENTRIES as side effect)
+  const factoryIds = Object.keys(factories);
+  for (const id of factoryIds) {
+    loadModule(Number(id));
+  }
+}
 ` : ""}
 // Import client-reference manifests — these set globalThis.__RSC_MANIFEST[page]
 // which the Next.js renderer needs for React Server Components.
@@ -296,22 +332,14 @@ ${handlerEntries}
 ${opts.outputs.middleware?.edgeRuntime ? `
 const middlewareHandler = async (mwCtx) => {
   try {
-    // Try _ENTRIES first (populated by Turbopack runtime), then fall back
-    // to direct module imports.
-    let handler = globalThis._ENTRIES?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.entryKey)}]?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}];
-    if (typeof handler !== "function") {
-      // Try the filePath module's exports.
-      handler = __middleware_file?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}]
-        || __middleware_file?.default?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}]
-        || __middleware_file?.default?.default
-        || __middleware_file?.default;
-    }
-    if (typeof handler !== "function") {
-      // Try the edge module's exports.
-      handler = __middleware_edge?.default?.default
-        || __middleware_edge?.default
-        || __middleware_edge?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}];
-    }
+    // Initialize edge modules (resolves Turbopack chunk factories)
+    __initEdgeModules();
+
+    // Try _ENTRIES first (populated by edge module initialization)
+    const _mwEntry = globalThis._ENTRIES?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.entryKey)}];
+    let handler = typeof _mwEntry?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}] === "function"
+      ? _mwEntry[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}]
+      : _mwEntry?.default;  // The entry might be a promise proxy with default
     if (typeof handler !== "function") return {};
     const mwReq = new Request(mwCtx.url, {
       method: mwCtx.requestBody ? "POST" : "GET",

@@ -84,6 +84,28 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   }
 
 
+  // Step 3c: Find edge middleware registration chunk.
+  // Turbopack generates TWO edge-wrapper files:
+  // 1. turbopack-..._edge-wrapper (modulePath — Turbopack runtime, imported by worker)
+  // 2. node_modules_..._edge-wrapper (contains _ENTRIES registration + module loader)
+  // File 2 is NOT referenced by modulePath, so we need to import it explicitly.
+  let edgeRegistrationChunkPath: string | undefined;
+  if (ctx.outputs.middleware?.edgeRuntime) {
+    try {
+      const edgeChunksDir = path.join(ctx.distDir, "server", "edge", "chunks");
+      const files = await fs.readdir(edgeChunksDir);
+      for (const f of files) {
+        if (f.includes("edge-wrapper") && !f.endsWith(".map") && !f.startsWith("turbopack-")) {
+          const content = await fs.readFile(path.join(edgeChunksDir, f), "utf-8");
+          if (content.includes("_ENTRIES")) {
+            edgeRegistrationChunkPath = path.join(edgeChunksDir, f);
+            break;
+          }
+        }
+      }
+    } catch {}
+  }
+
   // Step 4: Generate worker entry
   const workerSource = generateWorkerEntry({
     buildId: ctx.buildId,
@@ -93,6 +115,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     manifests,
     prerenderEntries,
     turbopackRuntimePath,
+    edgeRegistrationChunkPath,
   });
 
   // Step 4: Bundle with esbuild
