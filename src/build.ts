@@ -211,6 +211,59 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     } catch {}
   }
 
+  // Step 3d: Extract runtimeModuleIds for edge handlers.
+  // Log edge handler info for debugging
+  for (const outputs2 of [ctx.outputs.appPages, ctx.outputs.appRoutes, ctx.outputs.pages, ctx.outputs.pagesApi]) {
+    for (const output of outputs2) {
+      if (output.runtime === "edge") {
+      }
+    }
+  }
+  // Each edge page/route has its own Turbopack edge-wrapper with runtimeModuleIds.
+  // We read the wrapper files to extract the module IDs and attach them to outputs.
+  for (const outputs of [ctx.outputs.appPages, ctx.outputs.appRoutes, ctx.outputs.pages, ctx.outputs.pagesApi]) {
+    for (const output of outputs) {
+      if (output.runtime === "edge" && output.edgeRuntime?.modulePath) {
+        try {
+          const content = await fs.readFile(output.edgeRuntime.modulePath, "utf-8");
+          const idsMatch = content.match(/runtimeModuleIds:\s*\[([0-9,\s]+)\]/);
+          if (idsMatch) {
+            const ids = idsMatch[1].split(",").map((s: string) => parseInt(s.trim(), 10)).filter((n: number) => !isNaN(n));
+            if (ids.length > 0) {
+              (output.edgeRuntime as Record<string, unknown>).runtimeModuleId = ids[0];
+            }
+          }
+          // Also find and import otherChunks for this edge handler
+          const chunksMatch = content.match(/otherChunks:\s*\[((?:"[^"]*"(?:,\s*)?)*)\]/);
+          if (chunksMatch) {
+            const chunkPaths = chunksMatch[1].match(/"([^"]+)"/g);
+            if (chunkPaths) {
+              const edgeDir = path.dirname(output.edgeRuntime.modulePath);
+              for (const raw of chunkPaths) {
+                const rel = raw.replace(/"/g, "");
+                // Resolve relative to the edge wrapper's directory parent (server/edge/)
+                let absPath = path.join(path.dirname(edgeDir), rel);
+                if (!edgeOtherChunkPaths.includes(absPath)) {
+                  if (absPath.includes("[") || absPath.includes("]")) {
+                    const dir2 = path.dirname(absPath);
+                    const base2 = path.basename(absPath).replace(/\[/g, "_").replace(/\]/g, "_");
+                    const safePath = path.join(dir2, base2);
+                    try {
+                      const c = await fs.readFile(absPath, "utf-8");
+                      await fs.writeFile(safePath, c);
+                      absPath = safePath;
+                    } catch {}
+                  }
+                  edgeOtherChunkPaths.push(absPath);
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+    }
+  }
+
   // Step 4: Generate worker entry
   const workerSource = generateWorkerEntry({
     buildId: ctx.buildId,

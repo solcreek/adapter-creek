@@ -50,6 +50,7 @@ interface HandlerEntry {
   edgeRuntime?: {
     entryKey: string;
     handlerExport: string;
+    runtimeModuleId?: number;
   };
 }
 
@@ -75,6 +76,9 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
         if (h.edgeRuntime) {
           parts.push(`entryKey: ${JSON.stringify(h.edgeRuntime.entryKey)}`);
           parts.push(`handlerExport: ${JSON.stringify(h.edgeRuntime.handlerExport)}`);
+          if (h.edgeRuntime.runtimeModuleId) {
+            parts.push(`runtimeModuleId: ${h.edgeRuntime.runtimeModuleId}`);
+          }
         }
         return `  ${JSON.stringify(h.pathname)}: { ${parts.join(", ")} },`;
       },
@@ -593,13 +597,28 @@ export default {
       const mod = await handler.load();
 
       if (handler.runtime === "edge") {
-        // Edge runtime handlers register in globalThis._ENTRIES when their
-        // module is loaded. Use the entryKey/handlerExport metadata to invoke
-        // them through the official Next.js edge entry registry.
+        // Edge runtime handlers register in globalThis._ENTRIES via Turbopack
+        // chunk evaluation. Try _ENTRIES first, then resolve the promise proxy.
         if (handler.entryKey) {
-          await handler.load(); // Trigger module registration in _ENTRIES
+          // Trigger runtimeModuleIds evaluation for this handler
+          if (handler.runtimeModuleId && typeof globalThis.TURBOPACK?.push === "function") {
+            try {
+              globalThis.TURBOPACK.push(["__creek_edge_" + handler.entryKey, {otherChunks: [], runtimeModuleIds: [handler.runtimeModuleId]}]);
+            } catch {}
+          }
+
           const entry = globalThis._ENTRIES?.[handler.entryKey];
           if (entry) {
+            // Entry might be a promise proxy — await it to get the actual module
+            let edgeMod;
+            try { edgeMod = await entry; } catch {}
+            if (edgeMod) {
+              const fn = edgeMod[handler.handlerExport || "handler"] || edgeMod.default;
+              if (typeof fn === "function") {
+                return fn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
+              }
+            }
+            // Direct property access (non-proxy case)
             const fn = entry[handler.handlerExport || "handler"];
             if (typeof fn === "function") {
               return fn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
@@ -641,7 +660,7 @@ function collectHandlers(outputs: BuildContext["outputs"]): HandlerEntry[] {
       pathname: string;
       filePath: string;
       runtime: "nodejs" | "edge";
-      edgeRuntime?: { modulePath: string; entryKey: string; handlerExport: string };
+      edgeRuntime?: { modulePath: string; entryKey: string; handlerExport: string; runtimeModuleId?: number };
     },
     type: string,
   ) => {
@@ -660,6 +679,7 @@ function collectHandlers(outputs: BuildContext["outputs"]): HandlerEntry[] {
       entry.edgeRuntime = {
         entryKey: output.edgeRuntime.entryKey,
         handlerExport: output.edgeRuntime.handlerExport,
+        runtimeModuleId: (output.edgeRuntime as Record<string, unknown>).runtimeModuleId as number | undefined,
       };
     }
     handlers.push(entry);
