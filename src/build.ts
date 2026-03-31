@@ -83,6 +83,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     await fs.writeFile(instrumentationPath, "module.exports = {};");
   }
 
+
   // Step 4: Generate worker entry
   const workerSource = generateWorkerEntry({
     buildId: ctx.buildId,

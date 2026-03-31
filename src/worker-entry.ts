@@ -116,12 +116,36 @@ import { DurableObject } from "cloudflare:workers";
 
 ${opts.turbopackRuntimePath ? `
 // Import Turbopack runtime statically so wrangler bundles all chunks.
-// The runtime's requireChunk() switch was patched to inline all chunk paths.
-import ${JSON.stringify(opts.turbopackRuntimePath)};
+// Use import * + void to prevent esbuild tree-shaking.
+import * as __turbopack_runtime from ${JSON.stringify(opts.turbopackRuntimePath)};
+void __turbopack_runtime;
 ` : ""}
 ${opts.outputs.middleware?.edgeRuntime ? `
-// Load edge middleware module — populates globalThis._ENTRIES
-import ${JSON.stringify(opts.outputs.middleware.edgeRuntime.modulePath)};
+// Initialize _ENTRIES before edge module imports.
+// Turbopack edge chunks register handlers via (globalThis.TURBOPACK || []).push().
+// Set up TURBOPACK as a processing array so chunks are evaluated on push.
+globalThis._ENTRIES = globalThis._ENTRIES || {};
+const __turbopackQueue = [];
+globalThis.TURBOPACK = new Proxy(__turbopackQueue, {
+  get(target, prop) {
+    if (prop === "push") return (...items) => {
+      for (const item of items) {
+        target.push(item);
+        // Execute chunk factory if present
+        if (Array.isArray(item) && typeof item[2] === "function") {
+          try { item[2]({}, {}, { i: () => ({}) }); } catch {}
+        }
+      }
+      return target.length;
+    };
+    return target[prop];
+  }
+});
+
+// Import edge middleware modules.
+import * as __middleware_edge from ${JSON.stringify(opts.outputs.middleware.edgeRuntime.modulePath)};
+import * as __middleware_file from ${JSON.stringify(opts.outputs.middleware.filePath)};
+void __middleware_edge;
 ` : ""}
 // Import client-reference manifests — these set globalThis.__RSC_MANIFEST[page]
 // which the Next.js renderer needs for React Server Components.
@@ -272,9 +296,22 @@ ${handlerEntries}
 ${opts.outputs.middleware?.edgeRuntime ? `
 const middlewareHandler = async (mwCtx) => {
   try {
-    const entry = globalThis._ENTRIES?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.entryKey)}];
-    if (!entry) return {};
-    const handler = entry[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}];
+    // Try _ENTRIES first (populated by Turbopack runtime), then fall back
+    // to direct module imports.
+    let handler = globalThis._ENTRIES?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.entryKey)}]?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}];
+    if (typeof handler !== "function") {
+      // Try the filePath module's exports.
+      handler = __middleware_file?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}]
+        || __middleware_file?.default?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}]
+        || __middleware_file?.default?.default
+        || __middleware_file?.default;
+    }
+    if (typeof handler !== "function") {
+      // Try the edge module's exports.
+      handler = __middleware_edge?.default?.default
+        || __middleware_edge?.default
+        || __middleware_edge?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}];
+    }
     if (typeof handler !== "function") return {};
     const mwReq = new Request(mwCtx.url, {
       method: mwCtx.requestBody ? "POST" : "GET",
@@ -283,7 +320,8 @@ const middlewareHandler = async (mwCtx) => {
     });
     const response = await handler(mwReq, {});
     return responseToMiddlewareResult(response, mwCtx.headers, mwCtx.url);
-  } catch {
+  } catch (err) {
+    console.error("[creek-mw] Error:", err instanceof Error ? err.message : String(err));
     return {};
   }
 };
