@@ -18,6 +18,7 @@ export interface WorkerEntryOptions {
   outputs: BuildContext["outputs"];
   basePath: string;
   assetPrefix: string;
+  i18n: unknown;
   /** Embedded manifests: absolute path → file content */
   manifests: Record<string, string>;
   /** Path to Turbopack runtime file (for static import to trigger chunk bundling) */
@@ -181,6 +182,7 @@ const BASE_PATH = ${JSON.stringify(opts.basePath)};
 const ASSET_PREFIX = ${JSON.stringify(opts.assetPrefix || "")};
 const ROUTING = ${JSON.stringify(opts.routing)};
 const PATHNAMES = ${JSON.stringify(pathnames)};
+const I18N = ${JSON.stringify(opts.i18n)};
 
 // Static page map: request pathname → asset file path.
 // Pages Router static pages and auto-statically-optimized pages don't work
@@ -462,6 +464,7 @@ export default {
         url: new URL(request.url),
         buildId: BUILD_ID,
         basePath: BASE_PATH,
+        i18n: I18N || undefined,
         headers: routingClone.headers,
         requestBody: routingClone.body,
         pathnames: PATHNAMES,

@@ -218,6 +218,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     outputs: ctx.outputs,
     basePath: ctx.config.basePath || "",
     assetPrefix: ctx.config.assetPrefix || "",
+    i18n: ctx.config.i18n || null,
     manifests,
     prerenderEntries,
     turbopackRuntimePath,
