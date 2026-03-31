@@ -41,12 +41,12 @@ Creek is a **platform** — this adapter is the bridge between Next.js and that 
 |---------|:------:|
 | Static pages / SSG | ✅ Working |
 | SSR (streaming) | ✅ Working |
-| Middleware (edge) | ✅ Working |
-| Server Actions | ✅ Working |
+| Middleware (edge + node) | ✅ Working |
+| Server Actions | 🔲 In progress |
 | ISR / Cache | ✅ In-memory (DO planned) |
 | PPR cache seeding | ✅ Working |
 | Image Optimization | ✅ CF Image Resizing |
-| Test suite | 🔲 In progress |
+| Test suite | ~73% passing |
 
 ## Requirements
 
