@@ -155,11 +155,9 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       "node:vm": path.join(adapterDir, "src", "shims", "vm.js"),
       // critters is bundled by Next.js for CSS inlining — not needed on Workers.
       "critters": path.join(adapterDir, "src", "shims", "critters.js"),
-      // load-manifest shim — reads from embedded __MANIFESTS instead of filesystem.
-      "next/dist/server/load-manifest": path.join(adapterDir, "src", "shims", "load-manifest.js"),
-      "next/dist/server/load-manifest.external": path.join(adapterDir, "src", "shims", "load-manifest.js"),
-      // fast-set-immediate — no-op install() since CF Workers nodejs_compat provides setImmediate.
-      "next/dist/server/node-environment-extensions/fast-set-immediate": path.join(adapterDir, "src", "shims", "fast-set-immediate.js"),
+      // NOTE: load-manifest and fast-set-immediate shims exist in src/shims/
+      // but are handled by the fs shim (manifest loading) and nodejs_compat
+      // (setImmediate) respectively, so no alias needed.
       // NOTE: http/node:http is NOT aliased — CF Workers nodejs_compat provides it.
       // The worker entry uses our custom IncomingMessage/ServerResponse inline via
       // the NODE_BRIDGE_CODE template, which imports from "http" (the built-in).
