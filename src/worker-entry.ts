@@ -443,7 +443,8 @@ export default {
         url: new URL(request.url),
         buildId: BUILD_ID,
         basePath: BASE_PATH,
-        i18n: I18N || undefined,
+        // i18n support disabled — needs locale-aware handler matching
+        // TODO: implement locale-prefixed routing for static pages and handlers
         headers: routingClone.headers,
         requestBody: routingClone.body,
         pathnames: PATHNAMES,
