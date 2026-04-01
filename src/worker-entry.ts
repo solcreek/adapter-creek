@@ -131,6 +131,7 @@ if (typeof process !== "undefined") {
 }
 
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
+import { IncrementalCache } from "next/dist/server/lib/incremental-cache/index.js";
 import { DurableObject } from "cloudflare:workers";
 
 ${opts.outputs.middleware?.edgeRuntime ? `
@@ -187,6 +188,105 @@ globalThis.__MANIFESTS = ${JSON.stringify(opts.manifests)};
 // Prerender entries for ISR cache seeding (PPR shells + static prerenders)
 const __PRERENDER_ENTRIES = ${JSON.stringify(opts.prerenderEntries)};
 
+function __findManifestEntry(manifestName) {
+  if (!globalThis.__MANIFESTS) return null;
+  const matches = Object.entries(globalThis.__MANIFESTS)
+    .filter(([key]) => key.replaceAll("\\\\", "/").endsWith("/" + manifestName));
+  if (matches.length === 0) return null;
+
+  // Prefer the top-level .next/server manifest over per-route nested copies.
+  const topLevel = matches.find(([key]) => {
+    const normalizedKey = key.replaceAll("\\\\", "/");
+    const marker = "/.next/server/";
+    const markerIndex = normalizedKey.lastIndexOf(marker);
+    if (markerIndex === -1) return false;
+    return !normalizedKey.slice(markerIndex + marker.length).includes("/");
+  });
+  return topLevel || matches[0];
+}
+
+function __getPrerenderManifest() {
+  try {
+    const raw = __findManifestEntry("prerender-manifest.json");
+    if (raw) return JSON.parse(raw[1]);
+  } catch {}
+  return {
+    version: 4,
+    routes: {},
+    dynamicRoutes: {},
+    preview: {
+      previewModeEncryptionKey: "",
+      previewModeId: "",
+      previewModeSigningKey: "",
+    },
+    notFoundRoutes: [],
+  };
+}
+
+class CreekCacheHandler {
+  constructor() {
+    if (!globalThis.__CREEK_CACHE) globalThis.__CREEK_CACHE = new Map();
+    if (!globalThis.__CREEK_TAG_TO_KEYS) globalThis.__CREEK_TAG_TO_KEYS = new Map();
+  }
+
+  async get(key) {
+    const entry = globalThis.__CREEK_CACHE.get(key);
+    if (!entry) return null;
+    if (entry.revalidate !== undefined && entry.revalidate !== false) {
+      const age = (Date.now() - entry.lastModified) / 1000;
+      if (entry.revalidate === 0 || age > entry.revalidate) {
+        return {
+          value: entry.value,
+          lastModified: entry.lastModified,
+          age: Math.floor(age),
+          cacheState: "stale",
+        };
+      }
+    }
+    return {
+      value: entry.value,
+      lastModified: entry.lastModified,
+      age: Math.floor((Date.now() - entry.lastModified) / 1000),
+      cacheState: "fresh",
+    };
+  }
+
+  async set(key, data, ctx) {
+    if (data === null) {
+      globalThis.__CREEK_CACHE.delete(key);
+      return;
+    }
+    const tags = ctx?.tags ?? [];
+    const revalidate = typeof ctx?.revalidate === "number" ? ctx.revalidate : undefined;
+    globalThis.__CREEK_CACHE.set(key, {
+      value: data,
+      lastModified: Date.now(),
+      tags,
+      revalidate,
+    });
+    for (const tag of tags) {
+      let keys = globalThis.__CREEK_TAG_TO_KEYS.get(tag);
+      if (!keys) {
+        keys = new Set();
+        globalThis.__CREEK_TAG_TO_KEYS.set(tag, keys);
+      }
+      keys.add(key);
+    }
+  }
+
+  async revalidateTag(tag) {
+    const tags = Array.isArray(tag) ? tag : [tag];
+    for (const t of tags) {
+      const keys = globalThis.__CREEK_TAG_TO_KEYS.get(t);
+      if (!keys) continue;
+      for (const key of keys) globalThis.__CREEK_CACHE.delete(key);
+      globalThis.__CREEK_TAG_TO_KEYS.delete(t);
+    }
+  }
+
+  resetRequestCache() {}
+}
+
 // Initialize manifests singleton — called lazily on first SSR request.
 function __initManifests() {
   const MANIFESTS_SINGLETON = Symbol.for('next.server.manifests');
@@ -221,8 +321,7 @@ function __initManifests() {
     // Parse server-reference-manifest for server actions
     let serverActionsManifest = { encryptionKey: "", node: {}, edge: {} };
     try {
-      const raw = globalThis.__MANIFESTS && Object.entries(globalThis.__MANIFESTS)
-        .find(([k]) => k.includes("server-reference-manifest.json"));
+      const raw = __findManifestEntry("server-reference-manifest.json");
       if (raw) serverActionsManifest = JSON.parse(raw[1]);
     } catch {}
 
@@ -376,8 +475,53 @@ const middlewareHandler = async (mwCtx) => {
 // --- Node.js bridge ---
 ${NODE_BRIDGE_CODE}
 
-export default {
-  async fetch(request, env, ctx) {
+const __INTERNAL_FETCH_CONTEXT = new AsyncLocalStorage();
+const __nativeFetch = globalThis.fetch.bind(globalThis);
+function __asByteStream(stream) {
+  if (!stream) return stream;
+  if (stream.supportsBYOB) return stream;
+  try {
+    const byobReader = stream.getReader({ mode: "byob" });
+    byobReader.releaseLock();
+    return stream;
+  } catch {}
+
+  const reader = stream.getReader();
+  return new ReadableStream({
+    type: "bytes",
+    async pull(controller) {
+      const { done, value } = await reader.read();
+      if (done) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(value);
+    },
+    cancel(reason) {
+      return reader.cancel(reason);
+    },
+  });
+}
+
+globalThis.fetch = function(input, init) {
+  const store = __INTERNAL_FETCH_CONTEXT.getStore();
+  if (!store) return __nativeFetch(input, init);
+  const request = input instanceof Request && init === undefined
+    ? input
+    : new Request(input, init);
+  try {
+    if (new URL(request.url).origin === store.origin) {
+      return __nativeFetch(request).then((response) => {
+        if (!response?.body) return response;
+        return new Response(__asByteStream(response.body), response);
+      });
+    }
+  } catch {}
+  return __nativeFetch(input, init);
+};
+
+async function __handleRequest(request, env, ctx) {
+  return __INTERNAL_FETCH_CONTEXT.run({ origin: new URL(request.url).origin, env, ctx }, async () => {
     try {
       __initManifests();
       const url = new URL(request.url);
@@ -601,7 +745,11 @@ export default {
         headers: { "Content-Type": "application/json" },
       });
     }
-  },
+  });
+}
+
+export default {
+  fetch: __handleRequest,
 };
 `;
 }
@@ -762,6 +910,13 @@ const ServerResponse = _SR;
  */
 async function invokeNodeHandler(request, mod, ctx, routeResult) {
   const url = new URL(request.url);
+  const normalizedRouteParams = {};
+  for (const [key, value] of Object.entries(routeResult?.routeMatches || {})) {
+    if (value === "$nxtPrest" || value === "%24nxtPrest") continue;
+    if (/^\d+$/.test(key)) continue;
+    const normalizedKey = key.startsWith("nxtP") ? key.slice(4) : key;
+    normalizedRouteParams[normalizedKey] = value;
+  }
 
   // Read entire body first — async piping to IncomingMessage causes
   // timing issues where the handler reads before chunks arrive.
@@ -820,6 +975,26 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
   const res = new ServerResponse(req);
   const { readable, writable } = new TransformStream();
   const writer = writable.getWriter();
+  const origEmit = res.emit.bind(res);
+  let allowCloseEvent = false;
+  res.emit = function(event, ...args) {
+    if (event === "close" && !allowCloseEvent) return false;
+    return origEmit(event, ...args);
+  };
+  const incrementalCache = new IncrementalCache({
+    dev: false,
+    minimalMode: true,
+    requestHeaders: req.headers,
+    maxMemoryCacheSize: 0,
+    getPrerenderManifest: __getPrerenderManifest,
+    CurCacheHandler: CreekCacheHandler,
+  });
+  if (mod?.routeModule && typeof mod.routeModule.getIncrementalCache === "function") {
+    mod.routeModule.getIncrementalCache = async () => incrementalCache;
+  }
+  if (typeof mod?.getIncrementalCache === "function") {
+    mod.getIncrementalCache = async () => incrementalCache;
+  }
 
   // resolveResponse is called when we have enough info to return a Response
   // (status + headers). The body streams via the readable side.
@@ -897,6 +1072,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
       .catch(() => {})
       .then(() => {
         res.finished = true;
+        allowCloseEvent = true;
         res.emit("finish");
         res.emit("close");
         if (cb) cb();
@@ -954,24 +1130,34 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
   }, 30000);
 
   try {
+    const requestMeta = {
+      incrementalCache,
+      minimalMode: true,
+      params: normalizedRouteParams,
+      query: resolvedQuery,
+    };
     const handlerResult = handlerFn(req, res, {
       waitUntil: (p) => ctx.waitUntil(p.catch(() => {})),
-      params: routeResult?.routeMatches || {},
+      // Some Next.js handler templates still read params directly from ctx,
+      // but App Router handlers consume requestMeta.params/query instead.
+      params: normalizedRouteParams,
       requestMeta: {
+        ...requestMeta,
         relativeProjectDir: ".",
         hostname: request.headers.get("host") || "localhost",
       },
     });
 
-    // Swallow handler rejection to prevent CF Workers 1101.
-    // The actual response data is captured via res.write/end.
+    // Keep async handlers alive after returning the Response so streaming
+    // route handlers and Server Actions can continue writing body chunks.
     if (handlerResult?.then) {
-      handlerResult.catch((err) => {
+      const handlerPromise = Promise.resolve(handlerResult).catch((err) => {
         if (!res.finished) {
           res.statusCode = 500;
           res.end(JSON.stringify({ error: "render_error", message: err instanceof Error ? err.message : String(err) }));
         }
       });
+      ctx.waitUntil(handlerPromise.catch(() => {}));
     }
   } catch (err) {
     // Handle synchronous handler errors
