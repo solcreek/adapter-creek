@@ -175,11 +175,12 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
           if (chunksMatch) {
             const chunkPaths = chunksMatch[1].match(/"([^"]+)"/g);
             if (chunkPaths) {
-              const edgeDir = path.dirname(output.edgeRuntime.modulePath);
+              const edgeRootDir = path.join(ctx.distDir, "server", "edge");
               for (const raw of chunkPaths) {
                 const rel = raw.replace(/"/g, "");
-                // Resolve relative to the edge wrapper's directory parent (server/edge/)
-                let absPath = path.join(path.dirname(edgeDir), rel);
+                // Turbopack edge wrapper otherChunks are emitted relative to
+                // .next/server/edge/, e.g. "chunks/ssr/<file>.js".
+                let absPath = path.join(edgeRootDir, rel);
                 if (!edgeOtherChunkPaths.includes(absPath)) {
                   if (absPath.includes("[") || absPath.includes("]")) {
                     const dir2 = path.dirname(absPath);
