@@ -407,18 +407,6 @@ export default {
         return new Response("OK");
       }
 
-      // Fix content-type for metadata routes served from assets.
-      // CF Workers Assets uses different MIME types than Next.js expects.
-      if (url.pathname === "/favicon.ico" || url.pathname.endsWith("/favicon.ico")) {
-        try {
-          const assetRes = await env.ASSETS.fetch(request);
-          if (assetRes.ok) {
-            const headers = new Headers(assetRes.headers);
-            headers.set("Content-Type", "image/x-icon");
-            return new Response(assetRes.body, { status: 200, headers });
-          }
-        } catch {}
-      }
 
       // 2. Image optimization — proxy to original image.
       // Full optimization (resize/format) will use CF Image Resizing in production.
