@@ -56,9 +56,8 @@ const adapter: NextAdapter = {
     return {
       ...config,
       // Disable memory cache — CF Workers doesn't have persistent fs.
+      // The runtime cache handler is inlined in the worker entry (CreekCacheHandler).
       cacheMaxMemorySize: 0,
-      // Route/ISR cache must avoid the default filesystem-backed handler.
-      cacheHandler: config.cacheHandler || resolvedCacheHandlerPath,
       // Skip TypeScript type checking during build — CF Workers adapter
       // builds run `next build` where TS errors block the build. Type
       // checking should happen before deployment, not during bundling.

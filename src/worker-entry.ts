@@ -381,22 +381,10 @@ function __initManifests() {
   // Seed ISR cache with prerender entries from build output.
   // This provides instant responses for statically prerendered pages
   // and PPR shells, matching the behavior of next start.
-  if (__PRERENDER_ENTRIES.length > 0 && typeof globalThis.__CREEK_CACHE === "undefined") {
-    globalThis.__CREEK_CACHE = new Map();
-    for (const entry of __PRERENDER_ENTRIES) {
-      globalThis.__CREEK_CACHE.set(entry.pathname, {
-        value: {
-          kind: "APP_PAGE",
-          html: entry.html,
-          postponed: entry.postponedState,
-          status: entry.initialStatus,
-          headers: entry.initialHeaders,
-        },
-        lastModified: Date.now(),
-        revalidate: typeof entry.initialRevalidate === "number" ? entry.initialRevalidate : undefined,
-      });
-    }
-  }
+  // Cache seeding disabled — let handlers generate responses dynamically.
+  // Pre-seeding breaks Pages Router ISR fallback behavior (isFallback: true)
+  // and doesn't correctly distinguish between App Router and Pages Router entries.
+  // The cache will be populated on first request by CreekCacheHandler.set().
 }
 
 
@@ -981,20 +969,10 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
     if (event === "close" && !allowCloseEvent) return false;
     return origEmit(event, ...args);
   };
-  const incrementalCache = new IncrementalCache({
-    dev: false,
-    minimalMode: true,
-    requestHeaders: req.headers,
-    maxMemoryCacheSize: 0,
-    getPrerenderManifest: __getPrerenderManifest,
-    CurCacheHandler: CreekCacheHandler,
-  });
-  if (mod?.routeModule && typeof mod.routeModule.getIncrementalCache === "function") {
-    mod.routeModule.getIncrementalCache = async () => incrementalCache;
-  }
-  if (typeof mod?.getIncrementalCache === "function") {
-    mod.getIncrementalCache = async () => incrementalCache;
-  }
+  // IncrementalCache is available via CreekCacheHandler but NOT injected
+  // into handler modules directly — doing so breaks Pages Router ISR
+  // fallback behavior (isFallback: true). The cache is populated by
+  // CreekCacheHandler.set() when handlers write cache entries.
 
   // resolveResponse is called when we have enough info to return a Response
   // (status + headers). The body streams via the readable side.
@@ -1132,7 +1110,6 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
 
   try {
     const requestMeta = {
-      incrementalCache,
       minimalMode: true,
       params: normalizedRouteParams,
       query: resolvedQuery,

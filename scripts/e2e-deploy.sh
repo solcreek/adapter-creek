@@ -102,6 +102,11 @@ SERVER_PID=$!
 
 # Save PID for cleanup
 echo "${SERVER_PID}" > .adapter-server.pid
+{
+  echo "PORT=${PORT}"
+  echo "SERVER_PID=${SERVER_PID}"
+  echo "APP_DIR=${PWD}"
+} > .adapter-runtime.env
 
 # Wait for server to be ready (poll health)
 for i in $(seq 1 60); do
