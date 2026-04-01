@@ -122,19 +122,8 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
             if (chunkPaths) {
               for (const raw of chunkPaths) {
                 const rel = raw.replace(/"/g, "");
-                let absPath = path.join(ctx.distDir, "server", "edge", rel);
-                // Copy files with brackets to safe names — esbuild can't import paths with [].
-                if (absPath.includes("[") || absPath.includes("]")) {
-                  const dir = path.dirname(absPath);
-                  const base = path.basename(absPath).replace(/\[/g, "_").replace(/\]/g, "_");
-                  const safePath = path.join(dir, base);
-                  try {
-                    const content2 = await fs.readFile(absPath, "utf-8");
-                    await fs.writeFile(safePath, content2);
-                    absPath = safePath;
-                  } catch {}
-                }
-                edgeOtherChunkPaths.push(absPath);
+                const absPath = path.join(ctx.distDir, "server", "edge", rel);
+                await addEdgeChunkImportPath(edgeOtherChunkPaths, absPath);
                 console.log(`  [Creek Adapter] Edge otherChunk: ${path.basename(absPath)}`);
               }
             }
@@ -180,20 +169,8 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
                 const rel = raw.replace(/"/g, "");
                 // Turbopack edge wrapper otherChunks are emitted relative to
                 // .next/server/edge/, e.g. "chunks/ssr/<file>.js".
-                let absPath = path.join(edgeRootDir, rel);
-                if (!edgeOtherChunkPaths.includes(absPath)) {
-                  if (absPath.includes("[") || absPath.includes("]")) {
-                    const dir2 = path.dirname(absPath);
-                    const base2 = path.basename(absPath).replace(/\[/g, "_").replace(/\]/g, "_");
-                    const safePath = path.join(dir2, base2);
-                    try {
-                      const c = await fs.readFile(absPath, "utf-8");
-                      await fs.writeFile(safePath, c);
-                      absPath = safePath;
-                    } catch {}
-                  }
-                  edgeOtherChunkPaths.push(absPath);
-                }
+                const absPath = path.join(edgeRootDir, rel);
+                await addEdgeChunkImportPath(edgeOtherChunkPaths, absPath);
               }
             }
           }
@@ -201,6 +178,17 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
       }
     }
   }
+
+  // Turbopack edge wrappers do not enumerate every transitive chunk in
+  // otherChunks. Preload the full edge chunk directory so module factories
+  // for builtins like global-error are always registered before execution.
+  try {
+    const edgeChunksDir = path.join(ctx.distDir, "server", "edge", "chunks");
+    const chunkPaths = await collectJsFilesRecursive(edgeChunksDir);
+    for (const chunkPath of chunkPaths) {
+      await addEdgeChunkImportPath(edgeOtherChunkPaths, chunkPath);
+    }
+  } catch {}
 
   // Step 4: Generate worker entry
   const workerSource = generateWorkerEntry({
@@ -285,6 +273,46 @@ async function collectStaticFiles(
   return count;
 }
 
+async function addEdgeChunkImportPath(paths: string[], absPath: string): Promise<void> {
+  const importPath = await getSafeEdgeImportPath(absPath);
+  if (!paths.includes(importPath)) {
+    paths.push(importPath);
+  }
+}
+
+async function getSafeEdgeImportPath(absPath: string): Promise<string> {
+  if (!absPath.includes("[") && !absPath.includes("]")) {
+    return absPath;
+  }
+
+  const dir = path.dirname(absPath);
+  const base = path.basename(absPath).replace(/\[/g, "_").replace(/\]/g, "_");
+  const safePath = path.join(dir, base);
+  try {
+    const content = await fs.readFile(absPath, "utf-8");
+    await fs.writeFile(safePath, content);
+    return safePath;
+  } catch {
+    return absPath;
+  }
+}
+
+async function collectJsFilesRecursive(dir: string): Promise<string[]> {
+  const entries = await fs.readdir(dir, { withFileTypes: true });
+  const files: string[] = [];
+  for (const entry of entries) {
+    const absPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...await collectJsFilesRecursive(absPath));
+      continue;
+    }
+    if (entry.isFile() && entry.name.endsWith(".js") && !entry.name.endsWith(".js.map")) {
+      files.push(absPath);
+    }
+  }
+  return files;
+}
+
 async function getTotalSize(dir: string, files: string[]): Promise<number> {
   let total = 0;
   for (const f of files) {
@@ -324,11 +352,10 @@ async function collectManifests(distDir: string): Promise<Record<string, string>
         // - .nft.json (file tracing, not needed at runtime)
         // - .segments files
         // - page.js / route.js (handler code, imported separately)
-        // - _client-reference-manifest.js (imported as static imports)
+        // - client/route handler code (imported separately)
         if (entry.name.endsWith(".nft.json")) continue;
         if (entry.name.endsWith(".segments")) continue;
         if (entry.name === "page.js" || entry.name === "route.js") continue;
-        if (entry.name.endsWith("_client-reference-manifest.js")) continue;
         try {
           const stat = await fs.stat(fullPath);
           // Skip files > 512KB (not manifests)

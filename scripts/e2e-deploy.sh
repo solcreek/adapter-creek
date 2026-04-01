@@ -68,36 +68,24 @@ if (code.includes('failed to find source route') && !code.includes('const _pr = 
 # Build with adapter
 export NEXT_ADAPTER_PATH="${ADAPTER_PATH}"
 log "Running next build..."
-npx next build >&2 2>&1
+npx next build --experimental-next-config-strip-types >&2 2>&1
 log "next build complete"
 
 # Save build metadata
 BUILD_ID=$(cat .next/BUILD_ID 2>/dev/null || echo "unknown")
 
-# Generate wrangler config for miniflare
+# Local test server runs the generated worker directly in Node to avoid
+# wrangler/miniflare buffering streamed action responses.
 ADAPTER_OUTPUT=".creek/adapter-output"
-cat > wrangler.json <<WRANGLER_EOF
-{
-  "name": "test-app",
-  "main": "${ADAPTER_OUTPUT}/server/worker.js",
-  "compatibility_date": "2026-03-28",
-  "compatibility_flags": ["nodejs_compat"],
-  "assets": {
-    "directory": "${ADAPTER_OUTPUT}/assets",
-    "binding": "ASSETS",
-    "html_handling": "none",
-    "not_found_handling": "none"
-  }
-}
-WRANGLER_EOF
+WORKER_SERVER="${ADAPTER_DIR}/scripts/worker-dev-server.mjs"
 
-# Resolve wrangler from the adapter's node_modules
-WRANGLER="${ADAPTER_DIR}/node_modules/.bin/wrangler"
-
-# Start miniflare/wrangler dev in background on a random port
+# Start local worker server in background on a random port
 PORT=$((3000 + RANDOM % 10000))
 log "Starting local server on port ${PORT}..."
-"${WRANGLER}" dev --port "${PORT}" --local > .adapter-server.log 2>&1 &
+node "${WORKER_SERVER}" \
+  --worker "${ADAPTER_OUTPUT}/server/worker.js" \
+  --assets "${ADAPTER_OUTPUT}/assets" \
+  --port "${PORT}" > .adapter-server.log 2>&1 &
 SERVER_PID=$!
 
 # Save PID for cleanup

@@ -85,11 +85,15 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
     )
     .join("\n");
 
-  // Collect client-reference-manifest JS files from build output.
-  // These set globalThis.__RSC_MANIFEST[page] = { ... } which the
-  // Next.js renderer needs for React Server Components.
-  const manifestImports = collectManifestPaths(opts.outputs)
-    .map((p) => `import ${JSON.stringify(p)};`)
+  // Boot manifests must run before edge runtime modules evaluate.
+  // Edge app wrappers read globals like __RSC_MANIFEST and
+  // __RSC_SERVER_MANIFEST at module-evaluation time.
+  const manifestImports = collectBootManifestPaths(opts.manifests)
+    .map((p, i) => `import * as __bootManifest${i} from ${JSON.stringify(p)};\nvoid __bootManifest${i};`)
+    .join("\n");
+
+  const edgeOtherChunkImports = (opts.edgeOtherChunkPaths || [])
+    .map((p: string, i: number) => `import * as __edgeChunk${i} from ${JSON.stringify(p)};\nvoid __edgeChunk${i};`)
     .join("\n");
 
   // Path to ALS polyfill — must be the FIRST import so it runs
@@ -134,10 +138,15 @@ import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import { IncrementalCache } from "next/dist/server/lib/incremental-cache/index.js";
 import { DurableObject } from "cloudflare:workers";
 
+// Boot manifest globals before importing edge runtime chunks.
+${manifestImports}
+
+// Edge runtime chunks must be imported so their module factories are present
+// before runtimeModuleIds are evaluated for middleware or edge pages/routes.
+${edgeOtherChunkImports}
+
 ${opts.outputs.middleware?.edgeRuntime ? `
-// Import edge middleware chunks and runtime.
-// otherChunks must be imported so their module factories are available.
-${(opts.edgeOtherChunkPaths || []).map((p: string, i: number) => `import * as __edgeChunk${i} from ${JSON.stringify(p)};\nvoid __edgeChunk${i};`).join("\n")}
+// Import edge middleware runtime.
 import * as __middleware_edge from ${JSON.stringify(opts.outputs.middleware.edgeRuntime.modulePath)};
 void __middleware_edge;
 
@@ -160,9 +169,6 @@ ${opts.turbopackRuntimePath ? `
 import * as __turbopack_runtime from ${JSON.stringify(opts.turbopackRuntimePath)};
 void __turbopack_runtime;
 ` : ""}
-// Import client-reference manifests — these set globalThis.__RSC_MANIFEST[page]
-// which the Next.js renderer needs for React Server Components.
-${manifestImports}
 
 // DO class stubs — required by control-plane for Next.js ISR bindings.
 export class DOQueueHandler extends DurableObject {}
@@ -204,6 +210,94 @@ function __findManifestEntry(manifestName) {
   });
   return topLevel || matches[0];
 }
+
+function __getServerFilesManifest() {
+  try {
+    const raw = __findManifestEntry("required-server-files.json");
+    if (raw) return JSON.parse(raw[1]);
+  } catch {}
+  return null;
+}
+
+function __parseJsonManifest(manifestName, fallbackValue = null) {
+  try {
+    const raw = __findManifestEntry(manifestName);
+    if (raw) return JSON.parse(raw[1]);
+  } catch {}
+  return fallbackValue;
+}
+
+function __extractAssignedManifest(manifestName, globalName) {
+  try {
+    const raw = __findManifestEntry(manifestName);
+    if (!raw) return null;
+
+    const content = raw[1].trim();
+    const patterns = [
+      \`globalThis.\${globalName} =\`,
+      \`globalThis.\${globalName}=\`,
+      \`self.\${globalName} =\`,
+      \`self.\${globalName}=\`,
+    ];
+    const pattern = patterns.find((candidate) => content.startsWith(candidate));
+    if (!pattern) return null;
+
+    let value = content.slice(pattern.length).trim();
+    if (value.endsWith(";")) value = value.slice(0, -1).trim();
+    return JSON.parse(value);
+  } catch {}
+  return null;
+}
+
+function __getStringifiedManifest(manifestBaseName, globalName, fallbackValue) {
+  const assigned = __extractAssignedManifest(manifestBaseName + ".js", globalName);
+  if (typeof assigned === "string") return assigned;
+  if (assigned !== null && assigned !== undefined) return JSON.stringify(assigned);
+
+  const parsed = __parseJsonManifest(manifestBaseName + ".json");
+  if (parsed !== null && parsed !== undefined) return JSON.stringify(parsed);
+
+  return JSON.stringify(fallbackValue);
+}
+
+globalThis.__SERVER_FILES_MANIFEST =
+  globalThis.__SERVER_FILES_MANIFEST || __getServerFilesManifest();
+globalThis.__BUILD_MANIFEST =
+  globalThis.__BUILD_MANIFEST ||
+  __parseJsonManifest("build-manifest.json") ||
+  __extractAssignedManifest("middleware-build-manifest.js", "__BUILD_MANIFEST") ||
+  {
+    pages: { "/_app": [] },
+    devFiles: [],
+    polyfillFiles: [],
+    lowPriorityFiles: [],
+    rootMainFiles: [],
+  };
+globalThis.__REACT_LOADABLE_MANIFEST =
+  globalThis.__REACT_LOADABLE_MANIFEST ||
+  __getStringifiedManifest("react-loadable-manifest", "__REACT_LOADABLE_MANIFEST", {});
+globalThis.__NEXT_FONT_MANIFEST =
+  globalThis.__NEXT_FONT_MANIFEST ||
+  __getStringifiedManifest("next-font-manifest", "__NEXT_FONT_MANIFEST", {
+    app: {},
+    appUsingSizeAdjust: false,
+    pages: {},
+    pagesUsingSizeAdjust: false,
+  });
+globalThis.__RSC_SERVER_MANIFEST =
+  globalThis.__RSC_SERVER_MANIFEST ||
+  __getStringifiedManifest("server-reference-manifest", "__RSC_SERVER_MANIFEST", {
+    node: {},
+    edge: {},
+    encryptionKey: "",
+  });
+globalThis.__INTERCEPTION_ROUTE_REWRITE_MANIFEST =
+  globalThis.__INTERCEPTION_ROUTE_REWRITE_MANIFEST ||
+  __getStringifiedManifest(
+    "interception-route-rewrite-manifest",
+    "__INTERCEPTION_ROUTE_REWRITE_MANIFEST",
+    [],
+  );
 
 function __getPrerenderManifest() {
   try {
@@ -463,40 +557,31 @@ const middlewareHandler = async (mwCtx) => {
 // --- Node.js bridge ---
 ${NODE_BRIDGE_CODE}
 
-const __INTERNAL_FETCH_CONTEXT = new AsyncLocalStorage();
 const __nativeFetch = globalThis.fetch.bind(globalThis);
 function __asByteStream(stream) {
   if (!stream) return stream;
-  if (stream.supportsBYOB) return stream;
   try {
     const byobReader = stream.getReader({ mode: "byob" });
     byobReader.releaseLock();
     return stream;
   } catch {}
-
   const reader = stream.getReader();
   return new ReadableStream({
     type: "bytes",
     async pull(controller) {
       const { done, value } = await reader.read();
-      if (done) {
-        controller.close();
-        return;
-      }
+      if (done) { controller.close(); return; }
       controller.enqueue(value);
     },
-    cancel(reason) {
-      return reader.cancel(reason);
-    },
+    cancel(reason) { return reader.cancel(reason); },
   });
 }
 
+const __INTERNAL_FETCH_CONTEXT = new AsyncLocalStorage();
 globalThis.fetch = function(input, init) {
   const store = __INTERNAL_FETCH_CONTEXT.getStore();
   if (!store) return __nativeFetch(input, init);
-  const request = input instanceof Request && init === undefined
-    ? input
-    : new Request(input, init);
+  const request = input instanceof Request && init === undefined ? input : new Request(input, init);
   try {
     if (new URL(request.url).origin === store.origin) {
       return __nativeFetch(request).then((response) => {
@@ -707,6 +792,20 @@ async function __handleRequest(request, env, ctx) {
       if (handler.runtime === "edge") {
         // CF Workers IS edge — try _ENTRIES first, then fall through to Node.js.
         // (Per opennext research: edge runtime is redundant on CF Workers.)
+        if (
+          handler.runtimeModuleId &&
+          handler.entryKey &&
+          !self._ENTRIES?.[handler.entryKey] &&
+          typeof globalThis.TURBOPACK?.push === "function"
+        ) {
+          try {
+            globalThis.TURBOPACK.push([
+              "__creek_edge_handler_init",
+              { otherChunks: [], runtimeModuleIds: [handler.runtimeModuleId] },
+            ]);
+          } catch {}
+        }
+
         if (handler.entryKey && self._ENTRIES?.[handler.entryKey]) {
           try {
             const entry = self._ENTRIES[handler.entryKey];
@@ -744,8 +843,11 @@ export default {
 
 function collectHandlers(outputs: BuildContext["outputs"]): HandlerEntry[] {
   const handlers: HandlerEntry[] = [];
-  const seen = new Set<string>();
+  const handlerIndexes = new Map<string, number>();
   let idx = 0;
+
+  const isParallelSlotPath = (value: string | undefined) =>
+    typeof value === "string" && /(^|[\\/])@[^\\/]+([\\/]|$)/.test(value);
 
   const addOutput = (
     output: {
@@ -757,12 +859,30 @@ function collectHandlers(outputs: BuildContext["outputs"]): HandlerEntry[] {
     type: string,
   ) => {
     if (output.pathname.endsWith(".rsc")) return;
-    if (seen.has(output.pathname)) return;
-    seen.add(output.pathname);
+    const importPath = output.edgeRuntime?.modulePath || output.filePath;
+    const slotIdentity =
+      output.edgeRuntime?.entryKey ||
+      output.filePath ||
+      importPath;
+    const existingIndex = handlerIndexes.get(output.pathname);
+    if (existingIndex !== undefined) {
+      const existing = handlers[existingIndex];
+      const existingIsSlot = isParallelSlotPath(
+        existing.edgeRuntime?.entryKey || existing.importPath,
+      );
+      const nextIsSlot = isParallelSlotPath(slotIdentity);
+
+      // Parallel route slot pages (e.g. @modal/page) can share the same
+      // pathname as the canonical page route but should not win top-level
+      // request dispatch for that pathname.
+      if (!(existingIsSlot && !nextIsSlot)) {
+        return;
+      }
+    }
 
     const entry: HandlerEntry = {
       pathname: output.pathname,
-      importPath: output.edgeRuntime?.modulePath || output.filePath,
+      importPath,
       varName: `_h${idx++}`,
       runtime: output.runtime,
       type,
@@ -774,7 +894,12 @@ function collectHandlers(outputs: BuildContext["outputs"]): HandlerEntry[] {
         runtimeModuleId: (output.edgeRuntime as Record<string, unknown>).runtimeModuleId as number | undefined,
       };
     }
-    handlers.push(entry);
+    if (existingIndex !== undefined) {
+      handlers[existingIndex] = entry;
+    } else {
+      handlerIndexes.set(output.pathname, handlers.length);
+      handlers.push(entry);
+    }
   };
 
   for (const page of outputs.appPages) addOutput(page, "APP_PAGE");
@@ -786,31 +911,31 @@ function collectHandlers(outputs: BuildContext["outputs"]): HandlerEntry[] {
 }
 
 /**
- * Find client-reference-manifest JS files in the build output.
- * These are generated per-page in .next/server/app/<page>/page_client-reference-manifest.js
- * and set globalThis.__RSC_MANIFEST[page] when executed.
+ * Find JS manifests that need to execute before edge runtime modules evaluate.
+ * This includes top-level manifest globals and all per-page client-reference manifests.
  */
-function collectManifestPaths(outputs: BuildContext["outputs"]): string[] {
-  const paths: string[] = [];
-  const seen = new Set<string>();
+function collectBootManifestPaths(manifests: Record<string, string>): string[] {
+  const priority = (manifestPath: string) => {
+    const normalized = manifestPath.replaceAll("\\", "/");
+    if (normalized.endsWith("/server/middleware-build-manifest.js")) return 0;
+    if (normalized.endsWith("/server/next-font-manifest.js")) return 1;
+    if (normalized.endsWith("/server/server-reference-manifest.js")) return 2;
+    if (normalized.endsWith("/server/interception-route-rewrite-manifest.js")) return 3;
+    if (normalized.endsWith("client-reference-manifest.js")) return 4;
+    return 5;
+  };
 
-  for (const page of outputs.appPages) {
-    if (page.pathname.endsWith(".rsc")) continue;
-    // Skip edge runtime pages — their manifest paths use a different structure
-    // (.next/server/edge/chunks/ssr/...) that doesn't contain manifest files.
-    if (page.runtime === "edge") continue;
-
-    // The manifest file is next to the page handler:
-    // .next/server/app/<page>/page.js → page_client-reference-manifest.js
-    const dir = page.filePath.replace(/\/page\.js$/, "");
-    const manifestPath = dir + "/page_client-reference-manifest.js";
-    if (!seen.has(manifestPath) && existsSync(manifestPath)) {
-      seen.add(manifestPath);
-      paths.push(manifestPath);
-    }
-  }
-
-  return paths;
+  return Object.keys(manifests)
+    .filter((manifestPath) => {
+      const normalized = manifestPath.replaceAll("\\", "/");
+      return normalized.endsWith("/server/middleware-build-manifest.js") ||
+        normalized.endsWith("/server/next-font-manifest.js") ||
+        normalized.endsWith("/server/server-reference-manifest.js") ||
+        normalized.endsWith("/server/interception-route-rewrite-manifest.js") ||
+        normalized.endsWith("client-reference-manifest.js");
+    })
+    .filter((manifestPath) => existsSync(manifestPath))
+    .sort((a, b) => priority(a) - priority(b) || a.localeCompare(b));
 }
 
 /**
@@ -961,14 +1086,15 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
 
   // Build ServerResponse with streaming output
   const res = new ServerResponse(req);
-  const { readable, writable } = new TransformStream();
-  const writer = writable.getWriter();
-  const origEmit = res.emit.bind(res);
-  let allowCloseEvent = false;
-  res.emit = function(event, ...args) {
-    if (event === "close" && !allowCloseEvent) return false;
-    return origEmit(event, ...args);
-  };
+  let streamController;
+  let streamClosed = false;
+  const readable = new ReadableStream({
+    type: "bytes",
+    start(controller) {
+      streamController = controller;
+    },
+  });
+  // Note: emit("close") guard was removed — it caused prerender-crawler regression
   // IncrementalCache is available via CreekCacheHandler but NOT injected
   // into handler modules directly — doing so breaks Pages Router ISR
   // fallback behavior (isFallback: true). The cache is populated by
@@ -979,10 +1105,17 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
   let resolveResponse;
   const responsePromise = new Promise((resolve) => { resolveResponse = resolve; });
   let headersFlushed = false;
+  let responseDisallowsBody = false;
+
+  function disallowsBody(status) {
+    return status === 204 || status === 205 || status === 304;
+  }
 
   function flushHeaders() {
     if (headersFlushed) return;
     headersFlushed = true;
+    const status = routeResult?.status || res.statusCode;
+    responseDisallowsBody = disallowsBody(status);
     // Build Headers manually to handle multi-value headers (Set-Cookie).
     const h = new Headers();
     for (const [key, val] of Object.entries(res.getHeaders())) {
@@ -1003,12 +1136,16 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
         }
       });
     }
-    resolveResponse(new Response(readable, {
-      status: routeResult?.status || res.statusCode,
+    const body = responseDisallowsBody ? null : readable;
+    const init = {
+      status,
       statusText: res.statusMessage || "",
       headers: h,
-      encodeBody: "manual",
-    }));
+    };
+    if (!responseDisallowsBody) {
+      init.encodeBody = "manual";
+    }
+    resolveResponse(new Response(body, init));
   }
 
   // Track pending writes to prevent writer.close() racing with writes.
@@ -1020,11 +1157,13 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
     if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
     if (res.finished) { if (cb) cb(); return false; }
     if (!headersFlushed) flushHeaders();
-    if (chunk) {
+    if (chunk && !responseDisallowsBody) {
       if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
       else if (chunk instanceof Buffer) chunk = new Uint8Array(chunk);
       pendingWrites = pendingWrites
-        .then(() => writer.write(chunk))
+        .then(() => {
+          if (!streamClosed) streamController.enqueue(chunk);
+        })
         .catch(() => {});
     }
     if (cb) pendingWrites.then(() => cb(), () => cb());
@@ -1039,19 +1178,25 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
     if (res.finished) { if (cb) cb(); return res; }
     clearTimeout(bodyTimeout);
     if (!headersFlushed) flushHeaders();
-    if (chunk) {
+    if (chunk && !responseDisallowsBody) {
       if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
       else if (chunk instanceof Buffer) chunk = new Uint8Array(chunk);
       pendingWrites = pendingWrites
-        .then(() => writer.write(chunk))
+        .then(() => {
+          if (!streamClosed) streamController.enqueue(chunk);
+        })
         .catch(() => {});
     }
     pendingWrites
-      .then(() => writer.close())
+      .then(() => {
+        if (!streamClosed && !responseDisallowsBody) {
+          streamClosed = true;
+          streamController.close();
+        }
+      })
       .catch(() => {})
       .then(() => {
         res.finished = true;
-        allowCloseEvent = true;
         res.emit("finish");
         res.emit("close");
         if (cb) cb();
@@ -1085,7 +1230,10 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
     try {
       const edgeResult = await handlerFn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
       if (edgeResult instanceof Response) {
-        writer.close().catch(() => {});
+        if (!streamClosed) {
+          streamClosed = true;
+          streamController.close();
+        }
         return edgeResult;
       }
     } catch {}
@@ -1093,7 +1241,10 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
   }
 
   if (typeof handlerFn !== "function") {
-    writer.close().catch(() => {});
+    if (!streamClosed) {
+      streamClosed = true;
+      streamController.close();
+    }
     throw new Error("No handler function found on module (keys: " + Object.keys(mod).join(",") + ")");
   }
 
@@ -1103,7 +1254,12 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
     if (!res.finished) {
       res.finished = true;
       pendingWrites
-        .then(() => writer.close())
+        .then(() => {
+          if (!streamClosed) {
+            streamClosed = true;
+            streamController.close();
+          }
+        })
         .catch(() => {});
     }
   }, 30000);
@@ -1151,7 +1307,10 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
   const response = await Promise.race([
     responsePromise,
     new Promise((_, reject) => setTimeout(() => {
-      writer.close().catch(() => {});
+      if (!streamClosed) {
+        streamClosed = true;
+        streamController.close();
+      }
       reject(new Error("SSR timeout: no response headers within 60s"));
     }, 60000)),
   ]);
