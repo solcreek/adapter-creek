@@ -134,41 +134,28 @@ import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import { DurableObject } from "cloudflare:workers";
 
 ${opts.outputs.middleware?.edgeRuntime ? `
-// IMPORTANT: Edge middleware must be imported BEFORE the SSR Turbopack runtime.
-// Both runtimes replace globalThis.TURBOPACK with a processing object.
-// The edge runtime checks Array.isArray(TURBOPACK) and bails out if it's not
-// an array. If the SSR runtime runs first, it replaces TURBOPACK with an object,
-// causing the edge runtime to never initialize.
-// Import edge otherChunks FIRST so their module factories are in the
-// TURBOPACK array before the edge runtime processes it.
-// Use import * + void to prevent esbuild from tree-shaking.
+// Import edge middleware chunks and runtime.
+// otherChunks must be imported so their module factories are available.
 ${(opts.edgeOtherChunkPaths || []).map((p: string, i: number) => `import * as __edgeChunk${i} from ${JSON.stringify(p)};\nvoid __edgeChunk${i};`).join("\n")}
-
-// Then import the edge runtime (processes the queue and sets up _ENTRIES).
 import * as __middleware_edge from ${JSON.stringify(opts.outputs.middleware.edgeRuntime.modulePath)};
-import * as __middleware_file from ${JSON.stringify(opts.outputs.middleware.filePath)};
 void __middleware_edge;
 
-// Trigger edge middleware module evaluation.
-// The Turbopack edge runtime's chunk dependency tracking may not resolve
-// during initialization (timing issue with otherChunks loading).
-// We manually trigger runtimeModuleIds evaluation via TURBOPACK.push.
-${opts.edgeRuntimeModuleIds && opts.edgeRuntimeModuleIds.length > 0 ? `
-let __edgeModulesInitialized = false;
+// Initialize _ENTRIES for middleware — trigger runtimeModuleIds evaluation.
 function __initEdgeModules() {
-  if (__edgeModulesInitialized) return;
-  __edgeModulesInitialized = true;
-  if (typeof globalThis.TURBOPACK?.push === "function" && !self._ENTRIES?.middleware_middleware) {
+  if (self._ENTRIES?.middleware_middleware) return;
+  self._ENTRIES = self._ENTRIES || {};
+  ${opts.edgeRuntimeModuleIds && opts.edgeRuntimeModuleIds.length > 0 ? `
+  if (typeof globalThis.TURBOPACK?.push === "function") {
     try {
-      globalThis.TURBOPACK.push(["__creek_edge_init", {otherChunks: [], runtimeModuleIds: ${JSON.stringify(opts.edgeRuntimeModuleIds)}}]);
+      globalThis.TURBOPACK.push(["__creek_mw_init", {otherChunks: [], runtimeModuleIds: ${JSON.stringify(opts.edgeRuntimeModuleIds)}}]);
     } catch {}
-  }
+  }` : ""}
 }
+` : opts.outputs.middleware ? `
+import * as __middleware_file from ${JSON.stringify(opts.outputs.middleware.filePath)};
+function __initEdgeModules() {}
 ` : `function __initEdgeModules() {}`}
-` : ""}
 ${opts.turbopackRuntimePath ? `
-// Import Turbopack SSR runtime — AFTER edge middleware to avoid replacing
-// TURBOPACK before edge runtime initializes.
 import * as __turbopack_runtime from ${JSON.stringify(opts.turbopackRuntimePath)};
 void __turbopack_runtime;
 ` : ""}
@@ -323,42 +310,30 @@ ${handlerEntries}
 ${opts.outputs.middleware?.edgeRuntime ? `
 const middlewareHandler = async (mwCtx) => {
   try {
-    // Initialize edge modules
     __initEdgeModules();
 
-    // Try multiple sources for the middleware handler:
-    // 1. Bridge module (pre-evaluated Turbopack module via build.ts)
-    // 2. _ENTRIES (populated by edge module initialization)
+    // Look up middleware handler from _ENTRIES (populated by Turbopack runtime)
+    const _mwEntry = self._ENTRIES?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.entryKey)}];
     let handler;
+    if (_mwEntry) {
+      // _ENTRIES entry is a Proxy around a Promise — try await then direct access
+      try {
+        const resolved = await _mwEntry;
+        handler = resolved?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}] || resolved?.default;
+      } catch {}
+      if (!handler) {
+        handler = typeof _mwEntry[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}] === "function"
+          ? _mwEntry[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}]
+          : undefined;
+      }
+    }
+    if (typeof handler !== "function") return {};
 
-    // Bridge: __middleware_file exports the pre-evaluated handler module
-    const bridgeMod = typeof __middleware_file !== "undefined" ? __middleware_file : null;
-    if (bridgeMod) {
-      const h = bridgeMod.default?.default || bridgeMod.default || bridgeMod;
-      if (typeof h === "function") handler = h;
-    }
-
-    // _ENTRIES fallback
-    if (!handler) {
-      const _mwEntry = globalThis._ENTRIES?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.entryKey)}];
-      handler = typeof _mwEntry?.[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}] === "function"
-        ? _mwEntry[${JSON.stringify(opts.outputs.middleware.edgeRuntime.handlerExport)}]
-        : _mwEntry?.default;
-    }
-    if (typeof handler !== "function") {
-      return {};
-    }
     const mwReq = new Request(mwCtx.url, {
       method: mwCtx.requestBody ? "POST" : "GET",
       headers: mwCtx.headers,
       body: mwCtx.requestBody,
     });
-    // Ensure AsyncLocalStorage is available for the middleware handler.
-    // Turbopack edge modules may check globalThis.AsyncLocalStorage.
-    if (!globalThis.AsyncLocalStorage) {
-      const { AsyncLocalStorage: ALS } = await import("node:async_hooks");
-      globalThis.AsyncLocalStorage = ALS;
-    }
     let response;
     try {
       response = await handler(mwReq, {});
@@ -597,19 +572,19 @@ export default {
       const mod = await handler.load();
 
       if (handler.runtime === "edge") {
-        // Edge runtime handlers register in globalThis._ENTRIES via Turbopack
-        // chunk evaluation. Try _ENTRIES first, then resolve the promise proxy.
+        // CF Workers IS edge — the "edge" runtime declaration is redundant.
+        // Try edge-specific invocation paths first, then fall through to
+        // the Node.js handler bridge which also works in CF Workers.
+
+        // 1. Try _ENTRIES (Turbopack edge chunk registration)
         if (handler.entryKey) {
-          // Trigger runtimeModuleIds evaluation for this handler
           if (handler.runtimeModuleId && typeof globalThis.TURBOPACK?.push === "function") {
             try {
               globalThis.TURBOPACK.push(["__creek_edge_" + handler.entryKey, {otherChunks: [], runtimeModuleIds: [handler.runtimeModuleId]}]);
             } catch {}
           }
-
           const entry = globalThis._ENTRIES?.[handler.entryKey];
           if (entry) {
-            // Entry might be a promise proxy — await it to get the actual module
             let edgeMod;
             try { edgeMod = await entry; } catch {}
             if (edgeMod) {
@@ -618,20 +593,22 @@ export default {
                 return fn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
               }
             }
-            // Direct property access (non-proxy case)
-            const fn = entry[handler.handlerExport || "handler"];
-            if (typeof fn === "function") {
-              return fn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
-            }
           }
         }
-        // Fallback: try direct module exports
-        const fn = typeof mod.default === "function" ? mod.default
+
+        // 2. Try direct module exports (Request/Response edge API)
+        const edgeFn = typeof mod.default === "function" ? mod.default
           : typeof mod.default?.default === "function" ? mod.default.default
           : mod.handler;
-        if (typeof fn === "function") {
-          return fn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
+        if (typeof edgeFn === "function") {
+          try {
+            const edgeResult = await edgeFn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
+            if (edgeResult instanceof Response) return edgeResult;
+          } catch {}
         }
+
+        // 3. Fall through to Node.js handler bridge — CF Workers supports
+        // nodejs_compat so Node.js handlers work at the edge too.
       }
 
       // Streaming SSR: use TransformStream so chunks flow to the client

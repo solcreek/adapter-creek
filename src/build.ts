@@ -142,72 +142,9 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
         }
       }
 
-      // Extract middleware handler at build time using Node.js.
-      // The edge-wrapper's factory calls e.i(handlerModuleId) which needs
-      // the full Turbopack module graph. We run a Node.js script to evaluate
-      // the chunk factories and serialize the middleware handler module.
-      if (edgeRegistrationChunkPath) {
-        const regContent = await fs.readFile(edgeRegistrationChunkPath, "utf-8");
-        const handlerIdMatch = regContent.match(/\.i\((\d+)\)/);
-        const rootChunkFile = files.find((f) =>
-          f.includes("[root-of-the-server]") && f.endsWith(".js") && !f.endsWith(".map")
-        );
-        if (handlerIdMatch && rootChunkFile) {
-          const handlerModuleId = handlerIdMatch[1];
-          const rootChunkPath = path.join(edgeChunksDir, rootChunkFile);
-          const bridgePath = path.join(edgeChunksDir, "__middleware_handler.js");
-
-          // Run a Node.js script to evaluate Turbopack chunks and extract the handler
-          const { execSync: exec } = await import("node:child_process");
-          try {
-            exec(`node -e '
-              const _mods = {}, _facs = {};
-              const items = [];
-              globalThis.TURBOPACK = { push: function(a) { items.push(a); } };
-              try { require(${JSON.stringify(JSON.stringify(rootChunkPath))}); } catch {}
-              try { require(${JSON.stringify(JSON.stringify(edgeRegistrationChunkPath))}); } catch {}
-              for (const item of items) {
-                if (!Array.isArray(item)) continue;
-                for (let i = 1; i < item.length; i += 2)
-                  if (typeof item[i] === "number" && typeof item[i+1] === "function")
-                    _facs[item[i]] = item[i+1];
-              }
-              function req(id) {
-                if (_mods[id]) return _mods[id].exports;
-                const f = _facs[id]; if (!f) return {};
-                const m = {exports:{}}; _mods[id] = m;
-                const ctx = {
-                  i: req, r: (e)=>{Object.defineProperty(e,"__esModule",{value:true})},
-                  s: (e,g)=>{Object.defineProperty(e,"__esModule",{value:true});for(let i=0;i<g.length;i+=2)Object.defineProperty(e,g[i],{get:g[i+1],enumerable:true})},
-                  t: require, x: (n,g)=>g(), n: (e)=>{m.exports=e}, v: (e)=>{m.exports=e},
-                  c: _mods, g: globalThis, M: _facs,
-                };
-                try { f(ctx, m, m.exports); } catch {}
-                return m.exports;
-              }
-              const handler = req(${handlerModuleId});
-              // Check if handler has the expected export
-              const hasDefault = typeof handler?.default === "function";
-              const hasHandler = typeof handler?.handler === "function";
-              if (hasDefault || hasHandler) {
-                require("fs").writeFileSync(${JSON.stringify(JSON.stringify(bridgePath))},
-                  "// Pre-evaluated middleware handler\\n" +
-                  "module.exports = require(" + ${JSON.stringify(JSON.stringify(rootChunkPath))} + ");\\n"
-                );
-                process.stdout.write("OK:" + (hasDefault ? "default" : "handler"));
-              } else {
-                process.stdout.write("FAIL:no-handler");
-              }
-            '`, { stdio: "pipe", timeout: 10000 }).toString();
-          } catch {}
-
-          // If bridge was created, point middleware to it
-          try {
-            await fs.access(bridgePath);
-            (ctx.outputs.middleware as { filePath: string }).filePath = bridgePath;
-          } catch {}
-        }
-      }
+      // Middleware handler extraction is handled by the Turbopack runtime
+      // patching and otherChunks import above. The edge runtime's _ENTRIES
+      // registration works via runtimeModuleIds push (see __initEdgeModules).
     } catch {}
   }
 
