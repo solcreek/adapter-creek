@@ -573,43 +573,21 @@ export default {
       const mod = await handler.load();
 
       if (handler.runtime === "edge") {
-        // CF Workers IS edge — the "edge" runtime declaration is redundant.
-        // Try edge-specific invocation paths first, then fall through to
-        // the Node.js handler bridge which also works in CF Workers.
-
-        // 1. Try _ENTRIES (Turbopack edge chunk registration)
-        if (handler.entryKey) {
-          if (handler.runtimeModuleId && typeof globalThis.TURBOPACK?.push === "function") {
-            try {
-              globalThis.TURBOPACK.push(["__creek_edge_" + handler.entryKey, {otherChunks: [], runtimeModuleIds: [handler.runtimeModuleId]}]);
-            } catch {}
-          }
-          const entry = globalThis._ENTRIES?.[handler.entryKey];
-          if (entry) {
-            let edgeMod;
-            try { edgeMod = await entry; } catch {}
+        // CF Workers IS edge — try _ENTRIES first, then fall through to Node.js.
+        // (Per opennext research: edge runtime is redundant on CF Workers.)
+        if (handler.entryKey && self._ENTRIES?.[handler.entryKey]) {
+          try {
+            const entry = self._ENTRIES[handler.entryKey];
+            const edgeMod = await entry;
             if (edgeMod) {
               const fn = edgeMod[handler.handlerExport || "handler"] || edgeMod.default;
               if (typeof fn === "function") {
                 return fn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
               }
             }
-          }
-        }
-
-        // 2. Try direct module exports (Request/Response edge API)
-        const edgeFn = typeof mod.default === "function" ? mod.default
-          : typeof mod.default?.default === "function" ? mod.default.default
-          : mod.handler;
-        if (typeof edgeFn === "function") {
-          try {
-            const edgeResult = await edgeFn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
-            if (edgeResult instanceof Response) return edgeResult;
           } catch {}
         }
-
-        // 3. Fall through to Node.js handler bridge — CF Workers supports
-        // nodejs_compat so Node.js handlers work at the edge too.
+        // Fall through to Node.js handler bridge
       }
 
       // Streaming SSR: use TransformStream so chunks flow to the client
