@@ -1029,6 +1029,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
       status: routeResult?.status || res.statusCode,
       statusText: res.statusMessage || "",
       headers: h,
+      encodeBody: "manual",
     }));
   }
 
