@@ -1,4 +1,5 @@
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import { existsSync, readFileSync } from "node:fs";
 import type { NextAdapter } from "next";
 import { handleBuild } from "./build.js";
@@ -29,6 +30,8 @@ function findRepoRoot(startDir: string): string {
   return startDir;
 }
 
+const cacheHandlerPath = fileURLToPath(new URL("./cache-handler.js", import.meta.url));
+
 const adapter: NextAdapter = {
   name: "adapter-creek",
 
@@ -38,11 +41,24 @@ const adapter: NextAdapter = {
     const projectDir = process.cwd();
     const repoRoot = findRepoRoot(projectDir);
     const isMonorepo = repoRoot !== projectDir;
+    const installedCacheHandlerPath = path.join(
+      projectDir,
+      "node_modules",
+      "@solcreek",
+      "adapter-creek",
+      "dist",
+      "cache-handler.js",
+    );
+    const resolvedCacheHandlerPath = existsSync(installedCacheHandlerPath)
+      ? installedCacheHandlerPath
+      : cacheHandlerPath;
 
     return {
       ...config,
       // Disable memory cache — CF Workers doesn't have persistent fs.
       cacheMaxMemorySize: 0,
+      // Route/ISR cache must avoid the default filesystem-backed handler.
+      cacheHandler: config.cacheHandler || resolvedCacheHandlerPath,
       // Skip TypeScript type checking during build — CF Workers adapter
       // builds run `next build` where TS errors block the build. Type
       // checking should happen before deployment, not during bundling.
