@@ -9,10 +9,19 @@
 set -euo pipefail
 
 ADAPTER_PATH="${ADAPTER_DIR}/dist/index.js"
+NPM_CACHE_DIR="${TMPDIR:-/tmp}/adapter-creek-npm-cache"
+PNPM_STORE_DIR="${TMPDIR:-/tmp}/adapter-creek-pnpm-store"
+mkdir -p "${NPM_CACHE_DIR}"
+mkdir -p "${PNPM_STORE_DIR}"
+
+log() {
+  printf '[adapter-creek] %s %s\n' "$(date '+%H:%M:%S')" "$*" >&2
+}
 
 # Install the adapter — use tarball if available (faster, avoids symlink issues),
 # otherwise fall back to file: dependency.
-echo "[adapter-creek] Installing adapter..." >&2
+log "pwd=${PWD}"
+log "Installing adapter..."
 if [ -n "${ADAPTER_TARBALL:-}" ] && [ -f "${ADAPTER_TARBALL}" ]; then
   node -e "
 const pkg = JSON.parse(require('fs').readFileSync('package.json','utf8'));
@@ -28,18 +37,21 @@ pkg.dependencies['@solcreek/adapter-creek'] = 'file:${ADAPTER_DIR}';
 require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 " >&2
 fi
-npm install --no-audit --no-fund --legacy-peer-deps >&2 2>&1
+log "Running pnpm install..."
+pnpm install --store-dir "${PNPM_STORE_DIR}" --no-frozen-lockfile >&2 2>&1
+log "pnpm install complete"
 
 # Patch Next.js: fix invariant error for dynamic metadata routes in handleBuildComplete.
 # Static metadata files (e.g., icon.png) inside dynamic route segments cause a
 # "failed to find source route" invariant because the prerender entry's srcRoute
 # points to a path not in appOutputMap. Allow missing parent and try parent dir.
 # Upstream issue: https://github.com/vercel/next.js/issues/XXXXX
+log "Patching build-complete.js if needed..."
 node -e "
 const fs = require('fs');
 const p = require.resolve('next/dist/build/adapter/build-complete.js');
 let code = fs.readFileSync(p, 'utf8');
-if (code.includes('failed to find source route')) {
+if (code.includes('failed to find source route') && !code.includes('const _pr = srcRoute.replace')) {
   // Replace the getParentOutput function to try parent directory as fallback
   // for metadata routes inside dynamic segments (Next.js bug).
   const old = 'if (!parentOutput && !allowMissing) {';
@@ -55,8 +67,9 @@ if (code.includes('failed to find source route')) {
 
 # Build with adapter
 export NEXT_ADAPTER_PATH="${ADAPTER_PATH}"
-echo "[adapter-creek] Building..." >&2
+log "Running next build..."
 npx next build >&2 2>&1
+log "next build complete"
 
 # Save build metadata
 BUILD_ID=$(cat .next/BUILD_ID 2>/dev/null || echo "unknown")
@@ -83,7 +96,7 @@ WRANGLER="${ADAPTER_DIR}/node_modules/.bin/wrangler"
 
 # Start miniflare/wrangler dev in background on a random port
 PORT=$((3000 + RANDOM % 10000))
-echo "[adapter-creek] Starting local server on port ${PORT}..." >&2
+log "Starting local server on port ${PORT}..."
 "${WRANGLER}" dev --port "${PORT}" --local > .adapter-server.log 2>&1 &
 SERVER_PID=$!
 
@@ -96,7 +109,7 @@ for i in $(seq 1 60); do
     break
   fi
   if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
-    echo "[adapter-creek] Server process died" >&2
+    log "Server process died"
     cat .adapter-server.log >&2
     exit 1
   fi
@@ -105,7 +118,7 @@ done
 
 # Verify server is responding
 if ! curl -s "http://127.0.0.1:${PORT}/" > /dev/null 2>&1; then
-  echo "[adapter-creek] Server failed to start within 60s" >&2
+  log "Server failed to start within 60s"
   cat .adapter-server.log >&2
   kill "${SERVER_PID}" 2>/dev/null || true
   exit 1
@@ -118,7 +131,7 @@ fi
   echo "IMMUTABLE_ASSET_TOKEN: undefined"
 } > .adapter-build.log
 
-echo "[adapter-creek] Ready at http://127.0.0.1:${PORT}" >&2
+log "Ready at http://127.0.0.1:${PORT}"
 
 # Print URL to stdout (test harness reads this)
 echo "http://127.0.0.1:${PORT}"
