@@ -10,7 +10,7 @@ set -euo pipefail
 
 ADAPTER_PATH="${ADAPTER_DIR}/dist/index.js"
 NPM_CACHE_DIR="${TMPDIR:-/tmp}/adapter-creek-npm-cache"
-PNPM_STORE_DIR="${TMPDIR:-/tmp}/adapter-creek-pnpm-store"
+PNPM_STORE_DIR="${TMPDIR:-/tmp}/adapter-creek-pnpm-store-$$-${RANDOM}"
 mkdir -p "${NPM_CACHE_DIR}"
 mkdir -p "${PNPM_STORE_DIR}"
 
@@ -38,7 +38,7 @@ require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 " >&2
 fi
 log "Running pnpm install..."
-pnpm install --store-dir "${PNPM_STORE_DIR}" --no-frozen-lockfile >&2 2>&1
+pnpm install --force --store-dir "${PNPM_STORE_DIR}" --no-frozen-lockfile >&2 2>&1
 log "pnpm install complete"
 
 # Patch Next.js: fix invariant error for dynamic metadata routes in handleBuildComplete.
