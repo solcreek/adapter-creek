@@ -178,6 +178,15 @@ export class BucketCachePurge extends DurableObject {}
 const BUILD_ID = ${JSON.stringify(opts.buildId)};
 const BASE_PATH = ${JSON.stringify(opts.basePath)};
 const ASSET_PREFIX = ${JSON.stringify(opts.assetPrefix || "")};
+const ASSET_PREFIX_PATH = (() => {
+  if (!ASSET_PREFIX) return "";
+  try {
+    if (ASSET_PREFIX.startsWith("http://") || ASSET_PREFIX.startsWith("https://")) {
+      return new URL(ASSET_PREFIX).pathname.replace(/\\/$/, "");
+    }
+  } catch {}
+  return ASSET_PREFIX.startsWith("/") ? ASSET_PREFIX.replace(/\\/$/, "") : "";
+})();
 const ROUTING = ${JSON.stringify(opts.routing)};
 const PATHNAMES = ${JSON.stringify(pathnames)};
 const I18N = ${JSON.stringify(opts.i18n)};
@@ -315,6 +324,61 @@ function __getPrerenderManifest() {
     },
     notFoundRoutes: [],
   };
+}
+
+function __getEdgeRouteEnvs() {
+  const manifest = __parseJsonManifest("middleware-manifest.json", null);
+  if (!manifest) return {};
+
+  const routeEnvs = {};
+  for (const collection of [manifest.middleware, manifest.functions]) {
+    if (!collection || typeof collection !== "object") continue;
+    for (const entry of Object.values(collection)) {
+      if (!entry || typeof entry !== "object") continue;
+      const entryName = entry.name;
+      if (!entryName || !entry.env || typeof entry.env !== "object") continue;
+      routeEnvs["middleware_" + entryName] = entry.env;
+    }
+  }
+  return routeEnvs;
+}
+
+const EDGE_ROUTE_ENVS = __getEdgeRouteEnvs();
+
+async function __withEdgeRouteEnv(entryKey, fn) {
+  const envOverrides = entryKey ? EDGE_ROUTE_ENVS[entryKey] : null;
+  if (!envOverrides || typeof process === "undefined") {
+    return await fn();
+  }
+
+  if (!process.env) process.env = {};
+
+  const previous = new Map();
+  const missing = new Set();
+  for (const [key, value] of Object.entries(envOverrides)) {
+    if (Object.prototype.hasOwnProperty.call(process.env, key)) {
+      previous.set(key, process.env[key]);
+    } else {
+      missing.add(key);
+    }
+    process.env[key] = String(value);
+  }
+
+  const hadNextRuntime = Object.prototype.hasOwnProperty.call(process.env, "NEXT_RUNTIME");
+  const previousNextRuntime = process.env.NEXT_RUNTIME;
+  process.env.NEXT_RUNTIME = "edge";
+
+  try {
+    return await fn();
+  } finally {
+    if (hadNextRuntime) {
+      process.env.NEXT_RUNTIME = previousNextRuntime;
+    } else {
+      delete process.env.NEXT_RUNTIME;
+    }
+    for (const key of missing) delete process.env[key];
+    for (const [key, value] of previous) process.env[key] = value;
+  }
 }
 
 class CreekCacheHandler {
@@ -517,7 +581,10 @@ const middlewareHandler = async (mwCtx) => {
     });
     let response;
     try {
-      response = await handler(mwReq, {});
+      response = await __withEdgeRouteEnv(
+        ${JSON.stringify(opts.outputs.middleware.edgeRuntime.entryKey)},
+        () => handler(mwReq, {})
+      );
     } catch (handlerErr) {
       console.error("[creek-mw] handler error:", handlerErr instanceof Error ? handlerErr.stack || handlerErr.message : String(handlerErr));
       return {};
@@ -601,7 +668,10 @@ async function __handleRequest(request, env, ctx) {
 
       // 1. Static assets via WfP ASSETS binding
       // /_next/data/ requests are Pages Router data fetches — must go through routing
-      const assetPath = ASSET_PREFIX ? url.pathname.replace(ASSET_PREFIX, "") : url.pathname;
+      const assetPath =
+        ASSET_PREFIX_PATH && url.pathname.startsWith(ASSET_PREFIX_PATH + "/")
+          ? url.pathname.slice(ASSET_PREFIX_PATH.length) || "/"
+          : url.pathname;
       if (assetPath.startsWith("/_next/") && !assetPath.startsWith("/_next/data/")) {
         try {
           // Strip asset prefix for ASSETS binding lookup
@@ -709,6 +779,12 @@ async function __handleRequest(request, env, ctx) {
           }
         }
       }
+      if (result.resolvedQuery) {
+        result = {
+          ...result,
+          resolvedQuery: getNormalizedResolvedQuery(result),
+        };
+      }
 
       // 4. Resolve handler pathname
       let resolvedPathname = result.resolvedPathname;
@@ -726,7 +802,6 @@ async function __handleRequest(request, env, ctx) {
       if (resolvedPathname && !HANDLERS[resolvedPathname]) {
         if (HANDLERS[resolvedPathname + "/index"]) resolvedPathname = resolvedPathname + "/index";
       }
-
       // 4a. Static pages — serve pre-rendered HTML from assets.
       // Pages Router static pages and auto-optimized pages are pre-rendered
       // at build time. Their handlers require filesystem access that CF Workers
@@ -741,6 +816,9 @@ async function __handleRequest(request, env, ctx) {
           if (assetRes.ok) {
             const headers = new Headers(assetRes.headers);
             headers.set("Content-Type", "text/html; charset=utf-8");
+            if (!headers.has("x-nextjs-cache") && (result.status || 200) === 200) {
+              headers.set("x-nextjs-cache", "HIT");
+            }
             // Apply middleware resolved headers if present
             if (result.resolvedHeaders) {
               result.resolvedHeaders.forEach((val, key) => {
@@ -792,6 +870,46 @@ async function __handleRequest(request, env, ctx) {
       if (handler.runtime === "edge") {
         // CF Workers IS edge — try _ENTRIES first, then fall through to Node.js.
         // (Per opennext research: edge runtime is redundant on CF Workers.)
+        const edgeRouteParams = getNormalizedRouteParams(result, handler.pathname, url);
+        const edgeRequestUrl = new URL(request.url);
+        if (result.invocationTarget?.pathname) {
+          edgeRequestUrl.pathname = result.invocationTarget.pathname;
+        }
+        if (handler.type === "APP_PAGE") {
+          for (const [key, value] of Object.entries(result.resolvedQuery || {})) {
+            if (value == null || value === "") continue;
+            if (!edgeRequestUrl.searchParams.has(key)) {
+              edgeRequestUrl.searchParams.set(key, String(value));
+            }
+          }
+        } else {
+          for (const [key, value] of Object.entries(edgeRouteParams)) {
+            if (/^\d+$/.test(key)) continue;
+            if (value == null || value === "") continue;
+            if (!edgeRequestUrl.searchParams.has(key)) {
+              edgeRequestUrl.searchParams.set(key, String(value));
+            }
+          }
+        }
+        const edgeRequestHeaders = new Headers(request.headers);
+        if (result.resolvedHeaders) {
+          result.resolvedHeaders.forEach((val, key) => {
+            if (key.toLowerCase() !== "set-cookie") {
+              edgeRequestHeaders.set(key, val);
+            }
+          });
+        }
+        const edgeRequest = new Request(edgeRequestUrl, {
+          method: request.method,
+          headers: edgeRequestHeaders,
+          body: request.body,
+          duplex: "half",
+          redirect: request.redirect,
+        });
+        const edgeHandlerContext = {
+          waitUntil: ctx.waitUntil.bind(ctx),
+          params: Promise.resolve(edgeRouteParams),
+        };
         if (
           handler.runtimeModuleId &&
           handler.entryKey &&
@@ -809,11 +927,40 @@ async function __handleRequest(request, env, ctx) {
         if (handler.entryKey && self._ENTRIES?.[handler.entryKey]) {
           try {
             const entry = self._ENTRIES[handler.entryKey];
+            const handlerName = handler.handlerExport || "handler";
+            const proxiedHandler =
+              typeof entry?.[handlerName] === "function"
+                ? entry[handlerName]
+                : null;
+            if (proxiedHandler) {
+              const edgeResult = await __withEdgeRouteEnv(
+                handler.entryKey,
+                () => proxiedHandler(edgeRequest, edgeHandlerContext),
+              );
+              if (edgeResult instanceof Response) return edgeResult;
+              if (edgeResult?.response instanceof Response) {
+                if (edgeResult.waitUntil) {
+                  ctx.waitUntil(Promise.resolve(edgeResult.waitUntil).catch(() => {}));
+                }
+                return edgeResult.response;
+              }
+            }
+
             const edgeMod = await entry;
             if (edgeMod) {
-              const fn = edgeMod[handler.handlerExport || "handler"] || edgeMod.default;
+              const fn = edgeMod[handlerName] || edgeMod.default;
               if (typeof fn === "function") {
-                return fn(request, { waitUntil: ctx.waitUntil.bind(ctx) });
+                const edgeResult = await __withEdgeRouteEnv(
+                  handler.entryKey,
+                  () => fn(edgeRequest, edgeHandlerContext),
+                );
+                if (edgeResult instanceof Response) return edgeResult;
+                if (edgeResult?.response instanceof Response) {
+                  if (edgeResult.waitUntil) {
+                    ctx.waitUntil(Promise.resolve(edgeResult.waitUntil).catch(() => {}));
+                  }
+                  return edgeResult.response;
+                }
               }
             }
           } catch {}
@@ -824,7 +971,7 @@ async function __handleRequest(request, env, ctx) {
       // Streaming SSR: use TransformStream so chunks flow to the client
       // as Next.js writes them, enabling Server Components streaming,
       // PPR shell delivery, and progressive HTML rendering.
-      return await invokeNodeHandler(request, mod, ctx, result);
+      return await invokeNodeHandler(request, mod, ctx, result, handler.pathname);
     } catch (err) {
       const msg = err instanceof Error ? (err.stack || err.message) : String(err);
       return new Response(JSON.stringify({ error: "ssr_error", message: msg }), {
@@ -1014,6 +1161,83 @@ class IncomingMessage extends _IM {
 }
 const ServerResponse = _SR;
 
+function decodeRouteParam(value) {
+  if (typeof value !== "string") return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+function fillRouteParamsFromPath(routePattern, pathname, params) {
+  if (!routePattern || !pathname) return params;
+
+  const patternSegments = routePattern.split("?")[0].split("/").filter(Boolean);
+  const pathSegments = pathname.split("?")[0].split("/").filter(Boolean);
+  let pathIndex = 0;
+
+  for (const segment of patternSegments) {
+    if (segment.startsWith("[[...") && segment.endsWith("]]")) {
+      const key = segment.slice(5, -2);
+      if (!(key in params)) {
+        const rest = pathSegments.slice(pathIndex).map(decodeRouteParam);
+        if (rest.length > 0) params[key] = rest;
+      }
+      pathIndex = pathSegments.length;
+      continue;
+    }
+
+    if (segment.startsWith("[...") && segment.endsWith("]")) {
+      const key = segment.slice(4, -1);
+      if (!(key in params)) {
+        params[key] = pathSegments.slice(pathIndex).map(decodeRouteParam);
+      }
+      pathIndex = pathSegments.length;
+      continue;
+    }
+
+    if (segment.startsWith("[") && segment.endsWith("]")) {
+      const key = segment.slice(1, -1);
+      if (!(key in params) && pathIndex < pathSegments.length) {
+        params[key] = decodeRouteParam(pathSegments[pathIndex]);
+      }
+    }
+
+    pathIndex += 1;
+  }
+
+  return params;
+}
+
+function getNormalizedRouteParams(routeResult, handlerPathname, fallbackUrl) {
+  const normalizedRouteParams = {};
+  for (const [key, value] of Object.entries(routeResult?.routeMatches || {})) {
+    if (value === "$nxtPrest" || value === "%24nxtPrest") continue;
+    if (/^\d+$/.test(key)) continue;
+    const normalizedKey = key.startsWith("nxtP") ? key.slice(4) : key;
+    if (/^\d+$/.test(normalizedKey)) continue;
+    normalizedRouteParams[normalizedKey] = value;
+  }
+  fillRouteParamsFromPath(
+    handlerPathname,
+    routeResult?.invocationTarget?.pathname || fallbackUrl?.pathname,
+    normalizedRouteParams,
+  );
+  return normalizedRouteParams;
+}
+
+function getNormalizedResolvedQuery(routeResult) {
+  const normalizedResolvedQuery = {};
+  for (const [key, value] of Object.entries(routeResult?.resolvedQuery || {})) {
+    if (value === "$nxtPrest" || value === "%24nxtPrest") continue;
+    const normalizedKey = key.startsWith("nxtP") ? key.slice(4) : key;
+    if (/^\d+$/.test(normalizedKey)) continue;
+    normalizedResolvedQuery[normalizedKey] = value;
+  }
+  return normalizedResolvedQuery;
+}
+
 /**
  * Streaming SSR bridge: Web Request -> IncomingMessage/ServerResponse -> Web Response.
  *
@@ -1021,15 +1245,9 @@ const ServerResponse = _SR;
  * The Response is returned as soon as headers are sent (writeHead/first write),
  * enabling Server Components streaming, PPR, and progressive rendering.
  */
-async function invokeNodeHandler(request, mod, ctx, routeResult) {
+async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname) {
   const url = new URL(request.url);
-  const normalizedRouteParams = {};
-  for (const [key, value] of Object.entries(routeResult?.routeMatches || {})) {
-    if (value === "$nxtPrest" || value === "%24nxtPrest") continue;
-    if (/^\d+$/.test(key)) continue;
-    const normalizedKey = key.startsWith("nxtP") ? key.slice(4) : key;
-    normalizedRouteParams[normalizedKey] = value;
-  }
+  const normalizedRouteParams = getNormalizedRouteParams(routeResult, handlerPathname, url);
 
   // Read entire body first — async piping to IncomingMessage causes
   // timing issues where the handler reads before chunks arrive.
@@ -1061,11 +1279,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
   // this internally but the handler should receive the path without it.
   let targetUrl = routeResult?.invocationTarget?.pathname || url.pathname;
   targetUrl = targetUrl.replace(/\\/\\$nxtPrest/g, "").replace(/%24nxtPrest/gi, "") || targetUrl;
-  const resolvedQuery = routeResult?.resolvedQuery || {};
-  // Also strip sentinel from query params
-  for (const [k, v] of Object.entries(resolvedQuery)) {
-    if (v === "$nxtPrest" || v === "%24nxtPrest") resolvedQuery[k] = "";
-  }
+  const resolvedQuery = getNormalizedResolvedQuery(routeResult);
   const targetQuery = Object.keys(resolvedQuery).length > 0
     ? "?" + new URLSearchParams(resolvedQuery).toString()
     : url.search;
@@ -1135,6 +1349,9 @@ async function invokeNodeHandler(request, mod, ctx, routeResult) {
           h.set(key, val);
         }
       });
+    }
+    if (!h.has("x-nextjs-cache") && h.get("x-nextjs-prerender") === "1") {
+      h.set("x-nextjs-cache", "PRERENDER");
     }
     const body = responseDisallowsBody ? null : readable;
     const init = {
