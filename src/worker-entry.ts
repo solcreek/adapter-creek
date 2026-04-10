@@ -971,6 +971,34 @@ async function __handleRequest(request, env, ctx) {
         // Fall through to routing for _next/image etc.
       }
 
+      // \`_next/data/{buildId}/{path}.json\` is the Pages Router prefetch entry
+      // point. Two cases land us at an App Router route:
+      //   (a) the requested path itself maps to an APP_PAGE handler
+      //   (b) middleware rewrites the request to an APP_PAGE route
+      // In both cases the upstream Next.js server returns 200 with
+      // \`x-nextjs-matched-path\` set to the app pathname, which the Pages
+      // Router client uses to record the route in window.next.router.components
+      // and to follow the rewrite on click. (a) we can answer up front; (b)
+      // we have to defer until after resolveRoutes, but to skip routing on
+      // (a) we evaluate it eagerly.
+      let nextDataAppRouterPath = null;
+      if (assetPath.startsWith("/_next/data/")) {
+        const dataMatch = assetPath.match(/^\\/_next\\/data\\/([^/]+)\\/(.+)\\.json$/);
+        if (dataMatch && dataMatch[1] === BUILD_ID) {
+          const candidate = "/" + dataMatch[2].replace(/\\/index$/, "");
+          const lookup = candidate === "/" ? "/index" : candidate;
+          const handler = HANDLERS[lookup] || HANDLERS[candidate];
+          if (handler && handler.type === "APP_PAGE") {
+            const headers = new Headers();
+            headers.set("content-type", "application/json");
+            headers.set("x-nextjs-matched-path", candidate);
+            headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
+            return new Response("{}", { status: 200, headers });
+          }
+          nextDataAppRouterPath = candidate;
+        }
+      }
+
       // 1b. Public files (e.g. /test1.js, /favicon.ico, /robots.txt). Anything
       // with a file extension that isn't a known route gets a chance at the
       // ASSETS binding (which serves files copied from /public). On miss, we
@@ -1037,7 +1065,6 @@ async function __handleRequest(request, env, ctx) {
         routes: ROUTING,
         invokeMiddleware: middlewareHandler,
       });
-
       if (result.redirect) {
         return new Response(null, {
           status: result.redirect.status,
@@ -1062,6 +1089,30 @@ async function __handleRequest(request, env, ctx) {
         return new Response(null, { status: 204 });
       }
       if (result.externalRewrite) {
+        // Special case: middleware on a \`_next/data/{buildId}/X.json\` request
+        // can rewrite to an app-router pathname. @next/routing's data-URL
+        // re-normalization then makes the rewrite target look "external" to
+        // the local routing layer (it's flagged externalRewrite even though
+        // the host matches — middleware uses request.headers.host which can
+        // be \`localhost\` while the worker URL is \`127.0.0.1\`). Detect that
+        // and answer with the x-nextjs-matched-path response that the Pages
+        // Router client expects so it can follow the rewrite client-side.
+        // We treat any externalRewrite whose pathname maps to one of our
+        // app-router handlers as "this was actually local".
+        if (nextDataAppRouterPath) {
+          try {
+            const rewriteUrl = new URL(result.externalRewrite.toString());
+            const rewritePath = rewriteUrl.pathname;
+            const rewriteHandler = HANDLERS[rewritePath];
+            if (rewriteHandler && rewriteHandler.type === "APP_PAGE") {
+              const headers = new Headers();
+              headers.set("content-type", "application/json");
+              headers.set("x-nextjs-matched-path", rewritePath);
+              headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
+              return new Response("{}", { status: 200, headers });
+            }
+          } catch {}
+        }
         return fetch(result.externalRewrite.toString(), {
           method: request.method,
           headers: request.headers,
@@ -1180,6 +1231,18 @@ async function __handleRequest(request, env, ctx) {
       }
 
       const handler = HANDLERS[resolvedPathname];
+
+      // \`_next/data\` request that middleware rewrote to an app-router route:
+      // short-circuit with x-nextjs-matched-path so the Pages Router client
+      // can follow the rewrite (see the matching block earlier in this fn).
+      if (nextDataAppRouterPath && handler.type === "APP_PAGE") {
+        const headers = new Headers();
+        headers.set("content-type", "application/json");
+        headers.set("x-nextjs-matched-path", resolvedPathname);
+        headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
+        return new Response("{}", { status: 200, headers });
+      }
+
       const mod = handler.runtime === "nodejs" && handler.type === "APP_PAGE"
         ? await __withMinimalWorkStore(handler.pathname, ctx, () => handler.load())
         : await handler.load();
