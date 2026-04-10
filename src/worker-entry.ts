@@ -490,11 +490,12 @@ class CreekComposableCacheHandler {
     const entry = globalThis.__CREEK_CC_STORE.get(cacheKey);
     if (!entry) return undefined;
 
-    // If any tag attached to this entry has been expired since the entry
-    // was written, treat as a cache miss so the cached function re-runs.
+    // If any tag attached to this entry has an expire timestamp newer than
+    // the entry's write time, the tag was invalidated AFTER this entry was
+    // written → treat as cache miss so the cached function re-runs.
     for (const tag of entry.tags) {
       const state = globalThis.__CREEK_CC_TAG_STATE.get(tag);
-      if (state && state.expire !== undefined && state.expire <= entry.timestamp) {
+      if (state && state.expire !== undefined && state.expire > entry.timestamp) {
         return undefined;
       }
     }
