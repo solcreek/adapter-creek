@@ -1026,21 +1026,24 @@ async function __handleRequest(request, env, ctx) {
         });
       }
 
-      // Strip Next.js internal sentinel values from route matches.
-      // $nxtPrest is used for optional catch-all [[...rest]] when no params present.
+      // Strip Next.js internal sentinel values from route matches. The
+      // sentinel format is \`$nxtP{paramName}\` (e.g. \`$nxtPslug\`,
+      // \`$nxtPrest\`), used for empty optional catch-all segments. Match by
+      // prefix so all variants are handled regardless of the param name.
       if (result.routeMatches) {
         for (const [key, val] of Object.entries(result.routeMatches)) {
-          if (val === "$nxtPrest" || val === "%24nxtPrest") {
+          if (typeof val === "string" && (val.startsWith("$nxtP") || val.startsWith("%24nxtP"))) {
             result = { ...result, routeMatches: { ...result.routeMatches, [key]: "" } };
           }
         }
       }
-      if (result.resolvedQuery) {
-        result = {
-          ...result,
-          resolvedQuery: getNormalizedResolvedQuery(result),
-        };
-      }
+      // NOTE: do NOT normalize resolvedQuery here. Next.js's app router
+      // identifies dynamic route params by their nxtP-prefixed encoding in
+      // the query string and strips them before exposing searchParams.
+      // If we normalize (strip prefix) before Next.js sees the URL, the route
+      // params look like real search params and leak into the searchParams
+      // prop. The downstream getNormalizedResolvedQuery() callers that need
+      // the unprefixed form do their own normalization.
 
       // 4. Resolve handler pathname
       let resolvedPathname = result.resolvedPathname;
@@ -1549,26 +1552,23 @@ function fillRouteParamsFromPath(routePattern, pathname, params) {
   for (const segment of patternSegments) {
     if (segment.startsWith("[[...") && segment.endsWith("]]")) {
       const key = segment.slice(5, -2);
-      if (!(key in params)) {
-        const rest = pathSegments.slice(pathIndex).map(decodeRouteParam);
-        if (rest.length > 0) params[key] = rest;
-      }
+      const rest = pathSegments.slice(pathIndex).map(decodeRouteParam);
+      if (rest.length > 0) params[key] = rest;
+      else delete params[key];
       pathIndex = pathSegments.length;
       continue;
     }
 
     if (segment.startsWith("[...") && segment.endsWith("]")) {
       const key = segment.slice(4, -1);
-      if (!(key in params)) {
-        params[key] = pathSegments.slice(pathIndex).map(decodeRouteParam);
-      }
+      params[key] = pathSegments.slice(pathIndex).map(decodeRouteParam);
       pathIndex = pathSegments.length;
       continue;
     }
 
     if (segment.startsWith("[") && segment.endsWith("]")) {
       const key = segment.slice(1, -1);
-      if (!(key in params) && pathIndex < pathSegments.length) {
+      if (pathIndex < pathSegments.length) {
         params[key] = decodeRouteParam(pathSegments[pathIndex]);
       }
     }
@@ -1583,9 +1583,9 @@ function getNormalizedRouteParams(routeResult, handlerPathname, fallbackUrl) {
   const normalizedRouteParams = {};
   for (const [key, value] of Object.entries(routeResult?.routeMatches || {})) {
     if (value === "$nxtPrest" || value === "%24nxtPrest") continue;
-    if (/^\d+$/.test(key)) continue;
+    if (/^[0-9]+$/.test(key)) continue;
     const normalizedKey = key.startsWith("nxtP") ? key.slice(4) : key;
-    if (/^\d+$/.test(normalizedKey)) continue;
+    if (/^[0-9]+$/.test(normalizedKey)) continue;
     normalizedRouteParams[normalizedKey] = value;
   }
   fillRouteParamsFromPath(
@@ -1601,10 +1601,31 @@ function getNormalizedResolvedQuery(routeResult) {
   for (const [key, value] of Object.entries(routeResult?.resolvedQuery || {})) {
     if (value === "$nxtPrest" || value === "%24nxtPrest") continue;
     const normalizedKey = key.startsWith("nxtP") ? key.slice(4) : key;
-    if (/^\d+$/.test(normalizedKey)) continue;
+    if (/^[0-9]+$/.test(normalizedKey)) continue;
     normalizedResolvedQuery[normalizedKey] = value;
   }
   return normalizedResolvedQuery;
+}
+
+/**
+ * Build the URL query string for the IncomingMessage from the routing layer's
+ * resolvedQuery, **preserving** the nxtP-prefixed encoding of dynamic route
+ * params. Next.js's app router identifies route params by that prefix and
+ * strips them from \`searchParams\` itself — if we strip the prefix here, they
+ * leak into the page's searchParams prop. Filters out positional captures
+ * (numeric keys from regex match groups) and the \`$nxtP{paramName}\` sentinel
+ * values used for empty optional catch-all paths.
+ */
+function getRawResolvedQueryForUrl(routeResult) {
+  const result = {};
+  for (const [key, value] of Object.entries(routeResult?.resolvedQuery || {})) {
+    // Skip the \`$nxtP{paramName}\` sentinel values used for empty optional
+    // catch-all paths (e.g. \`$nxtPslug\`, \`$nxtPrest\`, plus URL-encoded forms).
+    if (typeof value === "string" && (value.startsWith("$nxtP") || value.startsWith("%24nxtP"))) continue;
+    if (/^[0-9]+$/.test(key)) continue;
+    result[key] = value;
+  }
+  return result;
 }
 
 function appendSearchParam(searchParams, key, value) {
@@ -1650,6 +1671,9 @@ function applyStaticAssetHeaders(headers, pathname) {
 async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname) {
   const url = new URL(request.url);
   const normalizedRouteParams = getNormalizedRouteParams(routeResult, handlerPathname, url);
+  const isRSCRequest = request.headers.has("rsc");
+  const isPrefetchRSCRequest = request.headers.get("next-router-prefetch") === "1";
+  const segmentPrefetchRSCRequest = request.headers.get("next-router-segment-prefetch");
 
   // Read entire body first — async piping to IncomingMessage causes
   // timing issues where the handler reads before chunks arrive.
@@ -1681,9 +1705,13 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   // this internally but the handler should receive the path without it.
   let targetUrl = routeResult?.invocationTarget?.pathname || url.pathname;
   targetUrl = targetUrl.replace(/\\/\\$nxtPrest/g, "").replace(/%24nxtPrest/gi, "") || targetUrl;
+  // For req.url we keep the nxtP-prefixed encoding so Next.js's app router
+  // can identify and strip route params from searchParams. The normalized
+  // form is still available for requestMeta.query (Pages Router compat).
+  const rawQueryForUrl = getRawResolvedQueryForUrl(routeResult);
   const resolvedQuery = getNormalizedResolvedQuery(routeResult);
-  const targetQuery = Object.keys(resolvedQuery).length > 0
-    ? "?" + new URLSearchParams(resolvedQuery).toString()
+  const targetQuery = Object.keys(rawQueryForUrl).length > 0
+    ? "?" + new URLSearchParams(rawQueryForUrl).toString()
     : url.search;
   req.url = targetUrl + targetQuery;
   req.headers = Object.fromEntries(request.headers);
@@ -1884,10 +1912,22 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   }, 30000);
 
   try {
+    // Do NOT set \`query\` here. Next.js's RouteModule.prepare() falls back to
+    // parsedUrl.query (parsed from req.url) when requestMeta.query is unset,
+    // and its own internal logic strips nxtP-prefixed route params from
+    // parsedUrl.query before it becomes searchParams. If we pre-populate
+    // \`query\` with our normalized (un-prefixed) version, Next.js sees those
+    // keys as real search params and they leak into the page's searchParams.
     const requestMeta = {
-      minimalMode: true,
+      minimalMode: false,
       params: normalizedRouteParams,
-      query: resolvedQuery,
+      resolvedPathname: routeResult?.resolvedPathname || handlerPathname,
+      initURL: request.url,
+      isRSCRequest,
+      ...(isPrefetchRSCRequest ? { isPrefetchRSCRequest: true } : {}),
+      ...(typeof segmentPrefetchRSCRequest === "string"
+        ? { segmentPrefetchRSCRequest }
+        : {}),
     };
     const handlerResult = handlerFn(req, res, {
       waitUntil: (p) => ctx.waitUntil(p.catch(() => {})),
