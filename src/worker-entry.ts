@@ -76,6 +76,7 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
       (h) => {
         const parts = [
           `load: () => import(${JSON.stringify(h.importPath)})`,
+          `pathname: ${JSON.stringify(h.pathname)}`,
           `runtime: ${JSON.stringify(h.runtime)}`,
           `type: ${JSON.stringify(h.type)}`,
         ];
@@ -142,6 +143,7 @@ if (typeof process !== "undefined") {
 
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import { IncrementalCache } from "next/dist/server/lib/incremental-cache/index.js";
+import { workAsyncStorage as __nextWorkAsyncStorage } from "next/dist/server/app-render/work-async-storage.external.js";
 import { DurableObject } from "cloudflare:workers";
 
 // Boot manifest globals before importing edge runtime chunks.
@@ -621,7 +623,6 @@ class CreekComposableCacheHandler {
 // Initialize manifests singleton — called lazily on first SSR request.
 function __initManifests() {
   const MANIFESTS_SINGLETON = Symbol.for('next.server.manifests');
-  if (globalThis[MANIFESTS_SINGLETON]) return;
 
   // Parse client-reference manifests from embedded data.
   // The JS files have format: globalThis.__RSC_MANIFEST=(...);globalThis.__RSC_MANIFEST["/page"]={...};
@@ -675,10 +676,38 @@ function __initManifests() {
             prop === "edgeRscModuleMapping" || prop === "edgeSSRModuleMapping") {
           return new Proxy({}, {
             get(__, id) {
-              for (const manifest of clientReferenceManifestsPerRoute.values()) {
-                if (manifest && manifest[prop] && manifest[prop][id]) return manifest[prop][id];
+              const readEntry = (manifest, allowNodeFallback = true) => {
+                if (!manifest) return undefined;
+                let entry = manifest[prop]?.[id];
+                if (entry === undefined && allowNodeFallback && prop === "edgeSSRModuleMapping") {
+                  entry = manifest.ssrModuleMapping?.[id];
+                }
+                if (entry === undefined && allowNodeFallback && prop === "edgeRscModuleMapping") {
+                  entry = manifest.rscModuleMapping?.[id];
+                }
+                return entry;
+              };
+
+              const workStore = typeof __nextWorkAsyncStorage?.getStore === "function"
+                ? __nextWorkAsyncStorage.getStore()
+                : undefined;
+              if (workStore?.route) {
+                const routeEntry = readEntry(clientReferenceManifestsPerRoute.get(workStore.route));
+                if (routeEntry !== undefined) return routeEntry;
               }
-              return undefined;
+
+              let nodeFallback;
+              for (const manifest of clientReferenceManifestsPerRoute.values()) {
+                const entry = readEntry(manifest, false);
+                if (entry !== undefined) return entry;
+                if (nodeFallback === undefined && prop === "edgeSSRModuleMapping") {
+                  nodeFallback = manifest.ssrModuleMapping?.[id];
+                }
+                if (nodeFallback === undefined && prop === "edgeRscModuleMapping") {
+                  nodeFallback = manifest.rscModuleMapping?.[id];
+                }
+              }
+              return nodeFallback;
             }
           });
         }
@@ -815,6 +844,43 @@ function __asByteStream(stream) {
     },
     cancel(reason) { return reader.cancel(reason); },
   });
+}
+
+async function __withMinimalWorkStore(pagePath, ctx, fn) {
+  if (!pagePath || typeof __nextWorkAsyncStorage?.run !== "function") {
+    return await fn();
+  }
+  try {
+    if (typeof __nextWorkAsyncStorage.getStore === "function" && __nextWorkAsyncStorage.getStore()) {
+      return await fn();
+    }
+  } catch {}
+
+  const store = {
+    page: pagePath,
+    route: pagePath,
+    isStaticGeneration: false,
+    isOnDemandRevalidate: false,
+    isDraftMode: false,
+    isPrefetchRequest: false,
+    buildId: BUILD_ID,
+    reactLoadableManifest: {},
+    assetPrefix: ASSET_PREFIX,
+    cacheComponentsEnabled: false,
+    incrementalCache: globalThis.__incrementalCache,
+    runInCleanSnapshot: (cb, ...args) => typeof cb === "function" ? cb(...args) : cb,
+    reactServerErrorsByDigest: new Map(),
+    afterContext: {
+      waitUntil: (promise) => {
+        if (!promise) return;
+        try {
+          ctx.waitUntil(Promise.resolve(promise).catch(() => {}));
+        } catch {}
+      },
+    },
+  };
+
+  return await __nextWorkAsyncStorage.run(store, fn);
 }
 
 const __INTERNAL_FETCH_CONTEXT = new AsyncLocalStorage();
@@ -1055,7 +1121,14 @@ async function __handleRequest(request, env, ctx) {
       }
 
       const handler = HANDLERS[resolvedPathname];
-      const mod = await handler.load();
+      const mod = handler.runtime === "nodejs" && handler.type === "APP_PAGE"
+        ? await __withMinimalWorkStore(handler.pathname, ctx, () => handler.load())
+        : await handler.load();
+      if (handler.type === "APP_PAGE") {
+        // Route module evaluation can install a singleton that assumes a
+        // filesystem-backed runtime. Rebuild our proxy after the module loads.
+        __initManifests();
+      }
 
       if (handler.runtime === "edge") {
         // CF Workers IS edge — try _ENTRIES first, then fall through to Node.js.
@@ -1161,6 +1234,13 @@ async function __handleRequest(request, env, ctx) {
       // Streaming SSR: use TransformStream so chunks flow to the client
       // as Next.js writes them, enabling Server Components streaming,
       // PPR shell delivery, and progressive HTML rendering.
+      if (handler.runtime === "nodejs" && handler.type === "APP_PAGE") {
+        return await __withMinimalWorkStore(
+          handler.pathname,
+          ctx,
+          () => invokeNodeHandler(request, mod, ctx, result, handler.pathname),
+        );
+      }
       return await invokeNodeHandler(request, mod, ctx, result, handler.pathname);
     } catch (err) {
       const msg = err instanceof Error ? (err.stack || err.message) : String(err);

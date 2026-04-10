@@ -45,19 +45,33 @@ async function patchTurbopackRuntime(distDir: string): Promise<void> {
     path.join(distDir, "server", "edge", "chunks"),
   ];
 
-  for (const dir of searchDirs) {
+  async function walkRuntimes(dir: string): Promise<void> {
+    let entries;
     try {
-      const files = await fs.readdir(dir);
-      for (const f of files) {
-        if (f.endsWith(".js") && (
-          f.includes("[turbopack]_runtime") ||
-          // Edge Turbopack runtimes are in turbopack-..._edge-wrapper files
-          (f.startsWith("turbopack-") && f.includes("edge-wrapper"))
-        )) {
-          runtimePaths.push(path.join(dir, f));
-        }
+      entries = await fs.readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+
+    for (const entry of entries) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walkRuntimes(full);
+        continue;
       }
-    } catch {}
+      if (!entry.name.endsWith(".js")) continue;
+      if (
+        entry.name.includes("[turbopack]_runtime") ||
+        (entry.name.startsWith("turbopack-") && entry.name.includes("edge-wrapper")) ||
+        entry.name.includes("edge-wrapper")
+      ) {
+        runtimePaths.push(full);
+      }
+    }
+  }
+
+  for (const dir of searchDirs) {
+    await walkRuntimes(dir);
   }
 
   if (runtimePaths.length === 0) return; // Not Turbopack
@@ -159,12 +173,149 @@ ${cases.join("\n")}
   }
 }
 
+async function patchAppPageManifestSingletons(distDir: string): Promise<void> {
+  const ssrDir = path.join(distDir, "server", "chunks", "ssr");
+  let entries: string[] = [];
+  try {
+    entries = await fs.readdir(ssrDir);
+  } catch {
+    return;
+  }
+
+  const manifestProxyPattern =
+    /case"moduleLoading":case"entryCSSFiles":case"entryJSFiles":\{if\(!(\w+)\)throw[\s\S]*?let (\w+)=(\w+)\.get\(\1\.route\);if\(!\2\)throw[\s\S]*?return \2\[(\w+)\]\}/g;
+
+  for (const entry of entries) {
+    if (!entry.endsWith(".js")) continue;
+    const filePath = path.join(ssrDir, entry);
+    let code: string;
+    try {
+      code = await fs.readFile(filePath, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!code.includes('entryCSSFiles') || !code.includes('without a work store')) {
+      continue;
+    }
+
+    const patched = code.replace(
+      manifestProxyPattern,
+      (_match, workStoreVar: string, manifestVar: string, manifestsVar: string, propVar: string) =>
+        `case"moduleLoading":case"entryCSSFiles":case"entryJSFiles":{if(!${workStoreVar}){for(let a of ${manifestsVar}.values()){let b=a[${propVar}];if(void 0!==b)return b}return}let ${manifestVar}=${manifestsVar}.get(${workStoreVar}.route);if(!${manifestVar}){for(let a of ${manifestsVar}.values()){let b=a[${propVar}];if(void 0!==b)return b}return}return ${manifestVar}[${propVar}]}`,
+    );
+
+    if (patched !== code) {
+      await fs.writeFile(filePath, patched);
+    }
+  }
+}
+
+function patchBundledManifestSingleton(workerCode: string): string {
+  const bundledManifestProxyPattern =
+    /case "moduleLoading":\s*case "entryCSSFiles":\s*case "entryJSFiles": \{\s*if \(!(\w+)\) throw[\s\S]*?let (\w+) = (\w+)\.get\(\1\.route\);\s*if \(!\2\) throw[\s\S]*?return \2\[(\w+)\];\s*\}/g;
+  const bundledManifestLookupPattern =
+    /if \((\w+)\) \{\s*let (\w+) = (\w+)\.get\(\1\.route\);\s*if \(null == \2 \? void 0 : \2\[(\w+)\]\[(\w+)\]\) return \2\[\4\]\[\5\];\s*\} else for \(let (\w+) of \3\.values\(\)\) \{\s*let (\w+) = \6\[\4\]\[\5\];\s*if \(void 0 !== \7\) return \7;\s*\}/g;
+
+  workerCode = workerCode.replace(
+    bundledManifestProxyPattern,
+    (_match, workStoreVar: string, manifestVar: string, manifestsVar: string, propVar: string) =>
+      `case "moduleLoading":
+              case "entryCSSFiles":
+              case "entryJSFiles": {
+                if (!${workStoreVar}) {
+                  for (const manifest of ${manifestsVar}.values()) {
+                    const entry = manifest[${propVar}];
+                    if (entry !== undefined) {
+                      return entry;
+                    }
+                  }
+                  return undefined;
+                }
+                let ${manifestVar} = ${manifestsVar}.get(${workStoreVar}.route);
+                if (!${manifestVar}) {
+                  for (const manifest of ${manifestsVar}.values()) {
+                    const entry = manifest[${propVar}];
+                    if (entry !== undefined) {
+                      return entry;
+                    }
+                  }
+                  return undefined;
+                }
+                return ${manifestVar}[${propVar}];
+              }`,
+  );
+
+  workerCode = workerCode.replace(
+    bundledManifestLookupPattern,
+    (
+      _match,
+      workStoreVar: string,
+      manifestVar: string,
+      manifestsVar: string,
+      propVar: string,
+      idVar: string,
+      iterManifestVar: string,
+      iterEntryVar: string,
+    ) =>
+      `if (${workStoreVar}) {
+                    let ${manifestVar} = ${manifestsVar}.get(${workStoreVar}.route);
+                    let ${iterEntryVar} = null == ${manifestVar} ? void 0 : ${manifestVar}[${propVar}][${idVar}];
+                    if (void 0 === ${iterEntryVar} && ${propVar} === "edgeSSRModuleMapping") ${iterEntryVar} = null == ${manifestVar} ? void 0 : ${manifestVar}.ssrModuleMapping[${idVar}];
+                    if (void 0 === ${iterEntryVar} && ${propVar} === "edgeRscModuleMapping") ${iterEntryVar} = null == ${manifestVar} ? void 0 : ${manifestVar}.rscModuleMapping[${idVar}];
+                    if (typeof process !== "undefined" && process.env.CREEK_DEBUG_MANIFESTS === "1" && (${idVar} === "99807" || ${idVar} === 99807 || String(${workStoreVar}.route || "").includes("basic-edge"))) {
+                      console.error("[creek:bundled-manifest:route]", JSON.stringify({
+                        route: ${workStoreVar}.route,
+                        prop: ${propVar},
+                        id: ${idVar},
+                        routeHit: !!${manifestVar},
+                        entryId: ${iterEntryVar} && typeof ${iterEntryVar} === "object" ? ${iterEntryVar}.id ?? (typeof ${iterEntryVar}["*"] === "object" ? ${iterEntryVar}["*"].id : undefined) : undefined,
+                      }));
+                    }
+                    if (void 0 !== ${iterEntryVar}) return ${iterEntryVar};
+                  }
+                  let __creekNodeFallback;
+                  for (let ${iterManifestVar} of ${manifestsVar}.values()) {
+                    let ${iterEntryVar} = ${iterManifestVar}[${propVar}][${idVar}];
+                    if (typeof process !== "undefined" && process.env.CREEK_DEBUG_MANIFESTS === "1" && (${idVar} === "99807" || ${idVar} === 99807) && void 0 !== ${iterEntryVar}) {
+                      console.error("[creek:bundled-manifest:scan-hit]", JSON.stringify({
+                        prop: ${propVar},
+                        id: ${idVar},
+                        entryId: ${iterEntryVar} && typeof ${iterEntryVar} === "object" ? ${iterEntryVar}.id ?? (typeof ${iterEntryVar}["*"] === "object" ? ${iterEntryVar}["*"].id : undefined) : undefined,
+                      }));
+                    }
+                    if (void 0 !== ${iterEntryVar}) return ${iterEntryVar};
+                    if (void 0 === __creekNodeFallback && ${propVar} === "edgeSSRModuleMapping") __creekNodeFallback = ${iterManifestVar}.ssrModuleMapping[${idVar}];
+                    if (void 0 === __creekNodeFallback && ${propVar} === "edgeRscModuleMapping") __creekNodeFallback = ${iterManifestVar}.rscModuleMapping[${idVar}];
+                  }
+                  if (typeof process !== "undefined" && process.env.CREEK_DEBUG_MANIFESTS === "1" && (${idVar} === "99807" || ${idVar} === 99807) && void 0 !== __creekNodeFallback) {
+                    console.error("[creek:bundled-manifest:node-fallback]", JSON.stringify({
+                      prop: ${propVar},
+                      id: ${idVar},
+                      entryId: __creekNodeFallback && typeof __creekNodeFallback === "object" ? __creekNodeFallback.id ?? (typeof __creekNodeFallback["*"] === "object" ? __creekNodeFallback["*"].id : undefined) : undefined,
+                    }));
+                  }
+                  if (void 0 !== __creekNodeFallback) return __creekNodeFallback;`,
+  );
+
+  // Cloudflare Workers executes the bundled app through the edge runtime path,
+  // but many app pages only populate the node/RSC module maps. Keep true edge
+  // routes on the edge maps when they exist, otherwise fall back to the node
+  // maps so React Server Consumer Manifest lookups can still resolve.
+  workerCode = workerCode.replace(
+    /moduleMap: j2, serverModuleMap:/g,
+    "moduleMap: Object.keys(i2 || {}).length ? i2 : j2, serverModuleMap:",
+  );
+
+  return workerCode;
+}
+
 export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   // Patch Turbopack runtime BEFORE wrangler bundles.
   // Turbopack's R.c() dynamically loads chunks from the filesystem.
   // CF Workers has no filesystem, so we replace R.c() with a switch
   // statement that maps chunk paths to static require() calls.
   await patchTurbopackRuntime(opts.distDir);
+  await patchAppPageManifestSingletons(opts.distDir);
 
   // Write the generated worker entry
   const entryPath = path.join(opts.outputDir, "__entry.mjs");
@@ -290,6 +441,8 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       /err\.code !== "ENOENT" && err\.code !== "MODULE_NOT_FOUND" && err\.code !== "ERR_MODULE_NOT_FOUND"/g,
       'err.code !== "ENOENT" && err.code !== "MODULE_NOT_FOUND" && err.code !== "ERR_MODULE_NOT_FOUND" && !err.message?.includes("is not supported")',
     );
+
+    workerCode = patchBundledManifestSingleton(workerCode);
 
     await fs.writeFile(workerPath, workerCode);
   } catch {}
