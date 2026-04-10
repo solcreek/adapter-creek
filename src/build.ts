@@ -32,8 +32,8 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
 
   console.log(`\n  [Creek Adapter] Preparing deployment output...`);
 
-  // Step 1: Collect static files
-  const assetCount = await collectStaticFiles(ctx.outputs, assetsDir);
+  // Step 1: Collect static files (including public/*)
+  const assetCount = await collectStaticFiles(ctx.outputs, assetsDir, ctx.projectDir);
   console.log(`  [Creek Adapter] ${assetCount} static files collected`);
 
   // Step 2: Collect WASM files from all outputs
@@ -246,6 +246,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
 async function collectStaticFiles(
   outputs: BuildContext["outputs"],
   assetsDir: string,
+  projectDir?: string,
 ): Promise<number> {
   let count = 0;
   const allPathnames = new Set(outputs.staticFiles.map((f) => f.pathname));
@@ -277,6 +278,39 @@ async function collectStaticFiles(
         await fs.copyFile(prerender.fallback.filePath, destPath);
         count++;
       } catch {}
+    }
+  }
+
+  // Public files (\`<projectDir>/public/*\`). Next.js's adapter API does not
+  // expose these via outputs.staticFiles (only \`_next/static/*\` lands there),
+  // so we walk the directory ourselves and copy each file to the deployment
+  // assets root. Without this, root-level scripts like \`/test1.js\` and
+  // \`/favicon.ico\` 404 because the worker has nothing to serve.
+  if (projectDir) {
+    const publicDir = path.join(projectDir, "public");
+    try {
+      await fs.access(publicDir);
+      const walk = async (dir: string): Promise<void> => {
+        const entries = await fs.readdir(dir, { withFileTypes: true });
+        for (const entry of entries) {
+          const srcPath = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            await walk(srcPath);
+            continue;
+          }
+          if (!entry.isFile()) continue;
+          const relativeFromPublic = path.relative(publicDir, srcPath);
+          const destPath = path.join(assetsDir, relativeFromPublic);
+          await fs.mkdir(path.dirname(destPath), { recursive: true });
+          try {
+            await fs.copyFile(srcPath, destPath);
+            count++;
+          } catch {}
+        }
+      };
+      await walk(publicDir);
+    } catch {
+      // No public dir — skip silently
     }
   }
 

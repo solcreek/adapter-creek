@@ -862,6 +862,23 @@ async function __handleRequest(request, env, ctx) {
         // Fall through to routing for _next/image etc.
       }
 
+      // 1b. Public files (e.g. /test1.js, /favicon.ico, /robots.txt). Anything
+      // with a file extension that isn't a known route gets a chance at the
+      // ASSETS binding (which serves files copied from /public). On miss, we
+      // fall through to routing so user-defined routes with extensions still
+      // work (rare, but valid).
+      if (
+        request.method === "GET" &&
+        !assetPath.startsWith("/_next/") &&
+        !assetPath.startsWith("/api/") &&
+        /\\.[a-zA-Z0-9]+$/.test(assetPath)
+      ) {
+        try {
+          const assetRes = await env.ASSETS.fetch(request);
+          if (assetRes.ok) return assetRes;
+        } catch {}
+      }
+
       // Debug endpoint
       if (url.pathname === "/__debug") {
         return new Response("OK");
