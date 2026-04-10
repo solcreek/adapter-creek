@@ -1064,7 +1064,15 @@ async function __handleRequest(request, env, ctx) {
       // doesn't have, so we serve the HTML directly from assets.
       const servePath = resolvedPathname || url.pathname;
       const staticAssetPath = STATIC_PAGES[servePath];
-      if (staticAssetPath) {
+      const isAppRouterRSCRequest =
+        request.headers.has("rsc") ||
+        request.headers.has("next-router-state-tree") ||
+        url.searchParams.has("_rsc");
+      const canServeStaticPage =
+        (request.method === "GET" || request.method === "HEAD") &&
+        !request.headers.has("next-action") &&
+        !isAppRouterRSCRequest;
+      if (staticAssetPath && canServeStaticPage) {
         try {
           const assetRes = await env.ASSETS.fetch(
             new Request(new URL(staticAssetPath, url.origin), { headers: request.headers })
@@ -1098,7 +1106,12 @@ async function __handleRequest(request, env, ctx) {
           const assetRes = await env.ASSETS.fetch(
             new Request(new URL(url.pathname, url.origin), { headers: request.headers })
           );
-          if (assetRes.ok) return assetRes;
+          if (assetRes.ok) {
+            return new Response(assetRes.body, {
+              status: assetRes.status,
+              headers: applyStaticAssetHeaders(new Headers(assetRes.headers), url.pathname),
+            });
+          }
         } catch {}
 
         // Fall back to SSR _not-found handler or static 404
@@ -1378,6 +1391,24 @@ function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, 
       }
     }
   }
+  for (const prerender of outputs.prerenders) {
+    if (!prerender.fallback?.filePath) continue;
+    if (prerender.pathname.startsWith("/_next/")) continue;
+    // PPR/postponed prerenders need the route handler so the shell can
+    // stream and later resolve its dynamic segments. Serving their fallback
+    // HTML directly from assets leaves the client stuck on the loading shell.
+    if (prerender.fallback.postponedState || prerender.pprChain?.headers) continue;
+
+    const assetPath = !path.extname(prerender.pathname)
+      ? path.join(prerender.pathname, "index.html")
+      : prerender.pathname;
+
+    map[prerender.pathname] = assetPath;
+    if (prerender.pathname.endsWith("/index")) {
+      const parent = prerender.pathname.slice(0, -6) || "/";
+      map[parent] = assetPath;
+    }
+  }
   return map;
 }
 
@@ -1506,6 +1537,27 @@ function getNormalizedResolvedQuery(routeResult) {
     normalizedResolvedQuery[normalizedKey] = value;
   }
   return normalizedResolvedQuery;
+}
+
+function applyStaticAssetHeaders(headers, pathname) {
+  const lowerPath = pathname.toLowerCase();
+
+  if (lowerPath === "/robots.txt" || lowerPath.endsWith("/robots.txt")) {
+    headers.set("content-type", "text/plain");
+  } else if (lowerPath === "/sitemap.xml" || lowerPath.endsWith("/sitemap.xml")) {
+    headers.set("content-type", "application/xml");
+  } else if (
+    lowerPath === "/manifest.webmanifest" ||
+    lowerPath.endsWith("/manifest.webmanifest")
+  ) {
+    headers.set("content-type", "application/manifest+json");
+  }
+
+  if (/\.(png|jpg|jpeg|svg|ico|webp|avif)$/i.test(lowerPath)) {
+    headers.set("cache-control", "public, max-age=0, must-revalidate");
+  }
+
+  return headers;
 }
 
 /**
