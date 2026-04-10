@@ -2,12 +2,53 @@
 
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { createReadStream, openSync, writeSync } from "node:fs";
 import { access, stat } from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { Readable } from "node:stream";
 import { Buffer } from "node:buffer";
+
+// Mirror all stdout/stderr from the worker (including console.log inside the
+// bundled worker.js) to a stable path under /tmp so the e2e harness can't
+// nuke it during cleanup. Set CREEK_WORKER_LOG to override the default.
+//
+// The double-write is done at process.stdout._write level rather than via
+// shell tee because:
+//   - shell tee + bash backgrounding (`> >(tee ...) &`) is fragile
+//   - the test harness deletes the test app dir (including .adapter-server.log)
+//     before any post-mortem inspection is possible
+// With this in place, /tmp/creek-worker.log accumulates output across runs;
+// truncate it manually if you need to isolate a single test.
+{
+  const logPath = process.env.CREEK_WORKER_LOG || "/tmp/creek-worker.log";
+  let logFd;
+  try {
+    logFd = openSync(logPath, "a");
+  } catch {
+    logFd = null;
+  }
+  if (logFd !== null) {
+    const installMirror = (stream) => {
+      const origWrite = stream.write.bind(stream);
+      stream.write = (chunk, encoding, cb) => {
+        try {
+          if (typeof chunk === "string") {
+            writeSync(logFd, chunk);
+          } else if (chunk instanceof Uint8Array) {
+            writeSync(logFd, chunk);
+          }
+        } catch {}
+        return origWrite(chunk, encoding, cb);
+      };
+    };
+    installMirror(process.stdout);
+    installMirror(process.stderr);
+    // Write a session boundary so successive runs in the same log are easy
+    // to tell apart.
+    writeSync(logFd, `\n=== creek-worker session ${new Date().toISOString()} pid=${process.pid} ===\n`);
+  }
+}
 
 function parseArgs(argv) {
   const out = {};
