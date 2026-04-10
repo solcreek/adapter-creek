@@ -3,6 +3,32 @@
 
 const cache = new Map();
 
+// Manifests that Next.js loads with `handleMissing: true` or that are
+// conditionally generated and may not exist in every build. Returning {} for
+// these matches the upstream Node fs behavior — without this, dynamic routes
+// 500 when the build-time glob scan didn't pick them up.
+//
+// Source: next/dist/server/route-modules/route-module.ts
+// Aligned with opennextjs-cloudflare#1151 + #1160.
+const KNOWN_OPTIONAL_MANIFESTS = new Set([
+  "react-loadable-manifest",          // Turbopack: only routes with dynamic imports
+  "subresource-integrity-manifest",   // only when experimental.sri configured
+  "server-reference-manifest",        // App Router only
+  "dynamic-css-manifest",             // Pages Router + Webpack only
+  "fallback-build-manifest",          // only for /_error
+  "prefetch-hints",                   // Next 16.2+
+  "_client-reference-manifest",       // optional for static metadata routes (evalManifest)
+]);
+
+function isKnownOptional(manifestPath) {
+  // Compare against the basename without trailing extension. Some Next.js
+  // constants omit the extension (e.g. SUBRESOURCE_INTEGRITY_MANIFEST), so we
+  // strip .json / .js before matching.
+  const base = manifestPath.split("/").pop() || manifestPath;
+  const stripped = base.replace(/\.(json|js)$/, "");
+  return KNOWN_OPTIONAL_MANIFESTS.has(stripped);
+}
+
 function findInManifests(path) {
   const manifests = globalThis.__MANIFESTS;
   if (!manifests) return undefined;
@@ -34,7 +60,7 @@ function loadManifest(path, shouldCache = true, _cache = cache, skipParse = fals
   const content = findInManifests(path);
 
   if (content === undefined) {
-    if (handleMissing) {
+    if (handleMissing || isKnownOptional(path)) {
       const result = {};
       if (shouldCache) cache.set(path, result);
       return result;
@@ -54,7 +80,7 @@ function evalManifest(path, shouldCache = true, _cache = cache, handleMissing) {
   const content = findInManifests(path);
 
   if (content === undefined) {
-    if (handleMissing) {
+    if (handleMissing || isKnownOptional(path)) {
       const result = {};
       if (shouldCache) cache.set(path, result);
       return result;
