@@ -14,6 +14,16 @@ PNPM_STORE_DIR="${TMPDIR:-/tmp}/adapter-creek-pnpm-store-$$-${RANDOM}"
 mkdir -p "${NPM_CACHE_DIR}"
 mkdir -p "${PNPM_STORE_DIR}"
 
+cleanup() {
+  rm -rf "${PNPM_STORE_DIR}" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+# The deploy harness is exercising a preview-style deployment. Several metadata
+# behaviors in Next.js key off Vercel preview env vars rather than next.config.
+export VERCEL_ENV="${VERCEL_ENV:-preview}"
+export VERCEL="${VERCEL:-1}"
+
 log() {
   printf '[adapter-creek] %s %s\n' "$(date '+%H:%M:%S')" "$*" >&2
 }
@@ -73,6 +83,7 @@ log "next build complete"
 
 # Save build metadata
 BUILD_ID=$(cat .next/BUILD_ID 2>/dev/null || echo "unknown")
+HEALTHCHECK_PATH="/_next/static/${BUILD_ID}/_buildManifest.js"
 
 # Local test server runs the generated worker directly in Node to avoid
 # wrangler/miniflare buffering streamed action responses.
@@ -96,9 +107,11 @@ echo "${SERVER_PID}" > .adapter-server.pid
   echo "APP_DIR=${PWD}"
 } > .adapter-runtime.env
 
-# Wait for server to be ready (poll health)
+# Wait for server to be ready. Poll a static asset instead of `/`, because some
+# fixtures intentionally have no root route and hitting `/` can trigger an app
+# render invariant before the real test even starts.
 for i in $(seq 1 60); do
-  if curl -s "http://127.0.0.1:${PORT}/" > /dev/null 2>&1; then
+  if curl -fsS "http://127.0.0.1:${PORT}${HEALTHCHECK_PATH}" > /dev/null 2>&1; then
     break
   fi
   if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
@@ -110,7 +123,7 @@ for i in $(seq 1 60); do
 done
 
 # Verify server is responding
-if ! curl -s "http://127.0.0.1:${PORT}/" > /dev/null 2>&1; then
+if ! curl -fsS "http://127.0.0.1:${PORT}${HEALTHCHECK_PATH}" > /dev/null 2>&1; then
   log "Server failed to start within 60s"
   cat .adapter-server.log >&2
   kill "${SERVER_PID}" 2>/dev/null || true
