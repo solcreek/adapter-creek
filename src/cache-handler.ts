@@ -17,6 +17,25 @@ interface CacheEntry {
 
 const cache = new Map<string, CacheEntry>();
 const tagToKeys = new Map<string, Set<string>>();
+// When a tag is invalidated via revalidateTag(), we record the wall-clock
+// timestamp here. Subsequent get() calls compare this against the entry's
+// lastModified — if the tag was invalidated AFTER the entry was written,
+// the entry is treated as stale (cacheState: "stale") rather than missing.
+//
+// This implements stale-while-revalidate semantics: Next.js receives the
+// old value plus the stale signal and decides to serve it while triggering
+// a background re-render. Aligned with opennextjs-cloudflare#1168.
+const tagInvalidatedAt = new Map<string, number>();
+
+function isStaleByTags(entry: CacheEntry): boolean {
+  for (const tag of entry.tags) {
+    const invalidatedAt = tagInvalidatedAt.get(tag);
+    if (invalidatedAt !== undefined && invalidatedAt > entry.lastModified) {
+      return true;
+    }
+  }
+  return false;
+}
 
 export default class CacheHandler {
   constructor(_ctx?: unknown) {
@@ -28,25 +47,29 @@ export default class CacheHandler {
     const entry = cache.get(key);
     if (!entry) return null;
 
-    // Check if stale (time-based revalidation)
-    // revalidate: 0 means always stale (revalidate on every request)
-    if (entry.revalidate !== undefined && entry.revalidate !== false) {
-      const age = (Date.now() - entry.lastModified) / 1000;
-      if (entry.revalidate === 0 || age > entry.revalidate) {
-        // Stale — return data but signal revalidation needed
-        return {
-          value: entry.value,
-          lastModified: entry.lastModified,
-          age: Math.floor(age),
-          cacheState: "stale" as const,
-        };
-      }
+    const age = (Date.now() - entry.lastModified) / 1000;
+
+    // Stale if either (a) any of its tags was invalidated since write, or
+    // (b) time-based revalidate has elapsed.
+    const staleByTag = isStaleByTags(entry);
+    const staleByTime =
+      entry.revalidate !== undefined &&
+      entry.revalidate !== false &&
+      (entry.revalidate === 0 || age > entry.revalidate);
+
+    if (staleByTag || staleByTime) {
+      return {
+        value: entry.value,
+        lastModified: entry.lastModified,
+        age: Math.floor(age),
+        cacheState: "stale" as const,
+      };
     }
 
     return {
       value: entry.value,
       lastModified: entry.lastModified,
-      age: Math.floor((Date.now() - entry.lastModified) / 1000),
+      age: Math.floor(age),
       cacheState: "fresh" as const,
     };
   }
@@ -84,15 +107,13 @@ export default class CacheHandler {
 
   async revalidateTag(tag: string | string[]) {
     const tags = Array.isArray(tag) ? tag : [tag];
-
+    const now = Date.now();
+    // Mark each tag as invalidated NOW. Existing entries become stale on
+    // the next get(); fresh writes (lastModified > now) are unaffected.
+    // We do NOT delete entries — Next.js wants to serve them as stale
+    // while it re-renders in the background.
     for (const t of tags) {
-      const keys = tagToKeys.get(t);
-      if (keys) {
-        for (const key of keys) {
-          cache.delete(key);
-        }
-        tagToKeys.delete(t);
-      }
+      tagInvalidatedAt.set(t, now);
     }
   }
 

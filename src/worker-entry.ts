@@ -385,26 +385,46 @@ class CreekCacheHandler {
   constructor() {
     if (!globalThis.__CREEK_CACHE) globalThis.__CREEK_CACHE = new Map();
     if (!globalThis.__CREEK_TAG_TO_KEYS) globalThis.__CREEK_TAG_TO_KEYS = new Map();
+    // Map<tag, ms timestamp>: when revalidateTag() was called for this tag.
+    // get() compares against entry.lastModified to mark stale instead of
+    // delete — see opennextjs-cloudflare#1168 for the SWR rationale.
+    if (!globalThis.__CREEK_TAG_INVALIDATED_AT) globalThis.__CREEK_TAG_INVALIDATED_AT = new Map();
   }
 
   async get(key) {
     const entry = globalThis.__CREEK_CACHE.get(key);
     if (!entry) return null;
-    if (entry.revalidate !== undefined && entry.revalidate !== false) {
-      const age = (Date.now() - entry.lastModified) / 1000;
-      if (entry.revalidate === 0 || age > entry.revalidate) {
-        return {
-          value: entry.value,
-          lastModified: entry.lastModified,
-          age: Math.floor(age),
-          cacheState: "stale",
-        };
+
+    const age = (Date.now() - entry.lastModified) / 1000;
+
+    // Stale by tag invalidation
+    let staleByTag = false;
+    for (const tag of entry.tags) {
+      const invalidatedAt = globalThis.__CREEK_TAG_INVALIDATED_AT.get(tag);
+      if (invalidatedAt !== undefined && invalidatedAt > entry.lastModified) {
+        staleByTag = true;
+        break;
       }
+    }
+
+    // Stale by time-based revalidate
+    const staleByTime =
+      entry.revalidate !== undefined &&
+      entry.revalidate !== false &&
+      (entry.revalidate === 0 || age > entry.revalidate);
+
+    if (staleByTag || staleByTime) {
+      return {
+        value: entry.value,
+        lastModified: entry.lastModified,
+        age: Math.floor(age),
+        cacheState: "stale",
+      };
     }
     return {
       value: entry.value,
       lastModified: entry.lastModified,
-      age: Math.floor((Date.now() - entry.lastModified) / 1000),
+      age: Math.floor(age),
       cacheState: "fresh",
     };
   }
@@ -434,11 +454,11 @@ class CreekCacheHandler {
 
   async revalidateTag(tag) {
     const tags = Array.isArray(tag) ? tag : [tag];
+    const now = Date.now();
+    // Mark stale, do not delete. Next.js will receive cacheState: "stale"
+    // on the next get() and trigger SWR (serve old, revalidate in background).
     for (const t of tags) {
-      const keys = globalThis.__CREEK_TAG_TO_KEYS.get(t);
-      if (!keys) continue;
-      for (const key of keys) globalThis.__CREEK_CACHE.delete(key);
-      globalThis.__CREEK_TAG_TO_KEYS.delete(t);
+      globalThis.__CREEK_TAG_INVALIDATED_AT.set(t, now);
     }
   }
 
