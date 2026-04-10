@@ -693,12 +693,41 @@ function __initManifests() {
                 : undefined;
               if (workStore?.route) {
                 const routeEntry = readEntry(clientReferenceManifestsPerRoute.get(workStore.route));
+                if (
+                  typeof process !== "undefined" &&
+                  process.env.CREEK_DEBUG_MANIFESTS === "1" &&
+                  (id === "99807" || id === 99807 || String(workStore.route || "").includes("basic-edge"))
+                ) {
+                  console.error("[creek:worker-manifest:route]", JSON.stringify({
+                    route: workStore.route,
+                    prop,
+                    id,
+                    routeHit: clientReferenceManifestsPerRoute.has(workStore.route),
+                    entryId: routeEntry && typeof routeEntry === "object"
+                      ? routeEntry.id ?? (typeof routeEntry["*"] === "object" ? routeEntry["*"].id : undefined)
+                      : undefined,
+                  }));
+                }
                 if (routeEntry !== undefined) return routeEntry;
               }
 
               let nodeFallback;
               for (const manifest of clientReferenceManifestsPerRoute.values()) {
                 const entry = readEntry(manifest, false);
+                if (
+                  typeof process !== "undefined" &&
+                  process.env.CREEK_DEBUG_MANIFESTS === "1" &&
+                  (id === "99807" || id === 99807) &&
+                  entry !== undefined
+                ) {
+                  console.error("[creek:worker-manifest:scan-hit]", JSON.stringify({
+                    prop,
+                    id,
+                    entryId: entry && typeof entry === "object"
+                      ? entry.id ?? (typeof entry["*"] === "object" ? entry["*"].id : undefined)
+                      : undefined,
+                  }));
+                }
                 if (entry !== undefined) return entry;
                 if (nodeFallback === undefined && prop === "edgeSSRModuleMapping") {
                   nodeFallback = manifest.ssrModuleMapping?.[id];
@@ -706,6 +735,20 @@ function __initManifests() {
                 if (nodeFallback === undefined && prop === "edgeRscModuleMapping") {
                   nodeFallback = manifest.rscModuleMapping?.[id];
                 }
+              }
+              if (
+                typeof process !== "undefined" &&
+                process.env.CREEK_DEBUG_MANIFESTS === "1" &&
+                (id === "99807" || id === 99807) &&
+                nodeFallback !== undefined
+              ) {
+                console.error("[creek:worker-manifest:node-fallback]", JSON.stringify({
+                  prop,
+                  id,
+                  entryId: nodeFallback && typeof nodeFallback === "object"
+                    ? nodeFallback.id ?? (typeof nodeFallback["*"] === "object" ? nodeFallback["*"].id : undefined)
+                    : undefined,
+                }));
               }
               return nodeFallback;
             }
@@ -1613,8 +1656,8 @@ function getNormalizedResolvedQuery(routeResult) {
  * params. Next.js's app router identifies route params by that prefix and
  * strips them from \`searchParams\` itself — if we strip the prefix here, they
  * leak into the page's searchParams prop. Filters out positional captures
- * (numeric keys from regex match groups) and the \`$nxtP{paramName}\` sentinel
- * values used for empty optional catch-all paths.
+ * (numeric keys from regex match groups) and the $nxtPrest sentinel used
+ * for empty optional catch-all paths.
  */
 function getRawResolvedQueryForUrl(routeResult) {
   const result = {};
