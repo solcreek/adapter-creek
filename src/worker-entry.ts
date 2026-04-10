@@ -65,8 +65,8 @@ interface HandlerEntry {
  * All handler modules are statically imported so esbuild bundles them.
  */
 export function generateWorkerEntry(opts: WorkerEntryOptions): string {
-  const handlers = collectHandlers(opts.outputs);
-  const pathnames = collectPathnames(opts.outputs);
+  const handlers = collectHandlers(opts.outputs, opts.manifests);
+  const pathnames = collectPathnames(opts.outputs, opts.manifests);
   const staticPageMap = collectStaticPageMap(opts.outputs);
 
   // Lazy imports — used at request time, not module evaluation.
@@ -1278,10 +1278,65 @@ export default {
 `;
 }
 
-function collectHandlers(outputs: BuildContext["outputs"]): HandlerEntry[] {
+interface SupplementalRouteOutput {
+  pathname: string;
+  filePath: string;
+  runtime: "nodejs" | "edge";
+  edgeRuntime?: { modulePath: string; entryKey: string; handlerExport: string; runtimeModuleId?: number };
+}
+
+function collectSupplementalMetadataRoutes(
+  outputs: BuildContext["outputs"],
+  manifests: Record<string, string>,
+): SupplementalRouteOutput[] {
+  const existing = new Set(outputs.appRoutes.map((route) => route.pathname));
+  const manifestEntry = Object.entries(manifests).find(([manifestPath]) =>
+    manifestPath.replaceAll("\\", "/").endsWith("/server/app-paths-manifest.json"),
+  );
+  if (!manifestEntry) return [];
+
+  const [manifestPath, manifestContent] = manifestEntry;
+  let appPathsManifest: Record<string, string>;
+  try {
+    appPathsManifest = JSON.parse(manifestContent) as Record<string, string>;
+  } catch {
+    return [];
+  }
+
+  const supplemental: SupplementalRouteOutput[] = [];
+  const serverDir = path.dirname(manifestPath);
+
+  for (const [routeKey, relativeFilePath] of Object.entries(appPathsManifest)) {
+    if (!routeKey.endsWith("/route")) continue;
+
+    const pathname = routeKey.slice(0, -"/route".length);
+    // Only synthesize file-based metadata routes (e.g. icon.png, sitemap.xml).
+    // Standard app route handlers are already present in outputs.appRoutes.
+    if (!path.extname(pathname)) continue;
+    if (existing.has(pathname)) continue;
+
+    const filePath = path.join(serverDir, relativeFilePath);
+    if (!existsSync(filePath)) continue;
+
+    supplemental.push({
+      pathname,
+      filePath,
+      runtime: "nodejs",
+    });
+    existing.add(pathname);
+  }
+
+  return supplemental;
+}
+
+function collectHandlers(
+  outputs: BuildContext["outputs"],
+  manifests: Record<string, string>,
+): HandlerEntry[] {
   const handlers: HandlerEntry[] = [];
   const handlerIndexes = new Map<string, number>();
   let idx = 0;
+  const supplementalMetadataRoutes = collectSupplementalMetadataRoutes(outputs, manifests);
 
   const isParallelSlotPath = (value: string | undefined) =>
     typeof value === "string" && /(^|[\\/])@[^\\/]+([\\/]|$)/.test(value);
@@ -1341,6 +1396,7 @@ function collectHandlers(outputs: BuildContext["outputs"]): HandlerEntry[] {
 
   for (const page of outputs.appPages) addOutput(page, "APP_PAGE");
   for (const route of outputs.appRoutes) addOutput(route, "APP_ROUTE");
+  for (const route of supplementalMetadataRoutes) addOutput(route, "APP_ROUTE");
   for (const page of outputs.pages) addOutput(page, "PAGES");
   for (const api of outputs.pagesApi) addOutput(api, "PAGES_API");
 
@@ -1419,10 +1475,15 @@ function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, 
   return map;
 }
 
-function collectPathnames(outputs: BuildContext["outputs"]): string[] {
+function collectPathnames(
+  outputs: BuildContext["outputs"],
+  manifests: Record<string, string>,
+): string[] {
   const pathnames = new Set<string>();
+  const supplementalMetadataRoutes = collectSupplementalMetadataRoutes(outputs, manifests);
   for (const p of outputs.appPages) pathnames.add(p.pathname);
   for (const r of outputs.appRoutes) pathnames.add(r.pathname);
+  for (const r of supplementalMetadataRoutes) pathnames.add(r.pathname);
   for (const p of outputs.pages) pathnames.add(p.pathname);
   for (const a of outputs.pagesApi) pathnames.add(a.pathname);
   for (const s of outputs.staticFiles) pathnames.add(s.pathname);
