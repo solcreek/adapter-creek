@@ -1147,24 +1147,24 @@ async function __handleRequest(request, env, ctx) {
         // CF Workers IS edge — try _ENTRIES first, then fall through to Node.js.
         // (Per opennext research: edge runtime is redundant on CF Workers.)
         const edgeRouteParams = getNormalizedRouteParams(result, handler.pathname, url);
+        const edgeRequestQuery =
+          handler.type === "APP_PAGE"
+            ? { ...(result.resolvedQuery || {}), ...edgeRouteParams }
+            : edgeRouteParams;
         const edgeRequestUrl = new URL(request.url);
         if (result.invocationTarget?.pathname) {
           edgeRequestUrl.pathname = result.invocationTarget.pathname;
         }
         if (handler.type === "APP_PAGE") {
-          for (const [key, value] of Object.entries(result.resolvedQuery || {})) {
-            if (value == null || value === "") continue;
-            if (!edgeRequestUrl.searchParams.has(key)) {
-              edgeRequestUrl.searchParams.set(key, String(value));
-            }
+          for (const [key, value] of Object.entries(edgeRequestQuery)) {
+            if (edgeRequestUrl.searchParams.has(key)) continue;
+            appendSearchParam(edgeRequestUrl.searchParams, key, value);
           }
         } else {
           for (const [key, value] of Object.entries(edgeRouteParams)) {
-            if (/^\d+$/.test(key)) continue;
-            if (value == null || value === "") continue;
-            if (!edgeRequestUrl.searchParams.has(key)) {
-              edgeRequestUrl.searchParams.set(key, String(value));
-            }
+            if (/^[0-9]+$/.test(key)) continue;
+            if (edgeRequestUrl.searchParams.has(key)) continue;
+            appendSearchParam(edgeRequestUrl.searchParams, key, value);
           }
         }
         const edgeRequestHeaders = new Headers(request.headers);
@@ -1185,6 +1185,13 @@ async function __handleRequest(request, env, ctx) {
         const edgeHandlerContext = {
           waitUntil: ctx.waitUntil.bind(ctx),
           params: Promise.resolve(edgeRouteParams),
+          requestMeta: {
+            minimalMode: true,
+            params: edgeRouteParams,
+            query: edgeRequestQuery,
+            relativeProjectDir: ".",
+            hostname: request.headers.get("host") || "localhost",
+          },
         };
         if (
           handler.runtimeModuleId &&
@@ -1537,6 +1544,18 @@ function getNormalizedResolvedQuery(routeResult) {
     normalizedResolvedQuery[normalizedKey] = value;
   }
   return normalizedResolvedQuery;
+}
+
+function appendSearchParam(searchParams, key, value) {
+  if (value == null || value === "") return;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      if (item == null || item === "") continue;
+      searchParams.append(key, String(item));
+    }
+    return;
+  }
+  searchParams.set(key, String(value));
 }
 
 function applyStaticAssetHeaders(headers, pathname) {
