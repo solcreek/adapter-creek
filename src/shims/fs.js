@@ -4,7 +4,32 @@
 const noop = () => {};
 const noopSync = () => undefined;
 
+// Look up a path in __USER_FILES (user-side text files like data.json that
+// route handlers read via fs.readFileSync). Embedded keys are paths relative
+// to outputFileTracingRoot; runtime requests come through process.cwd()
+// joined with a relative path. We do bidirectional suffix matching so both
+// single-app and monorepo setups resolve correctly.
+function findInUserFiles(filePath) {
+  const files = globalThis.__USER_FILES;
+  if (!files) return undefined;
+  if (files[filePath] !== undefined) return files[filePath];
+  // Normalize the requested path to a relative form for comparison.
+  const requestedTail = filePath.replace(/^\/+/, "");
+  for (const key in files) {
+    // Embedded key is a suffix of the requested path:
+    //   key  = "app/dashboard/data.json"
+    //   req  = "/app/dashboard/data.json"  (cwd "/" + relative)
+    if (filePath.endsWith("/" + key) || filePath === key) return files[key];
+    // Requested tail is a suffix of the embedded key (monorepo case):
+    //   key  = "apps/www/app/data.json"
+    //   req  = "/app/data.json"  (page used a project-relative path)
+    if (key.endsWith("/" + requestedTail) || key === requestedTail) return files[key];
+  }
+  return undefined;
+}
+
 export const existsSync = (filePath) => {
+  if (findInUserFiles(filePath) !== undefined) return true;
   if (typeof globalThis.__MANIFESTS === "undefined") return false;
   for (const key of Object.keys(globalThis.__MANIFESTS)) {
     if (key === filePath || key.endsWith(filePath)) return true;
@@ -32,6 +57,9 @@ export const readFileSync = (filePath, enc) => {
       if (filePath.split("/").pop() === key.split("/").pop()) return val;
     }
   }
+  // Then try user-side data files (data.json, fixtures, etc.)
+  const userContent = findInUserFiles(filePath);
+  if (userContent !== undefined) return userContent;
   // Throw ENOENT like real fs — Next.js loadManifest relies on this
   // to distinguish between missing and empty files.
   const err = new Error(`ENOENT: no such file or directory, open '${filePath}'`);

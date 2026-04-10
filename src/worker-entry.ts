@@ -21,6 +21,12 @@ export interface WorkerEntryOptions {
   i18n: unknown;
   /** Embedded manifests: absolute path → file content */
   manifests: Record<string, string>;
+  /**
+   * User-side text files (data.json, fixtures, i18n messages, etc.) keyed by
+   * path relative to outputFileTracingRoot. Read by the fs shim at runtime when
+   * route handlers call fs.readFileSync. See build.ts:collectUserFiles().
+   */
+  userFiles: Record<string, string>;
   /** Path to Turbopack runtime file (for static import to trigger chunk bundling) */
   turbopackRuntimePath?: string;
   /** Prerender entries for ISR cache seeding */
@@ -199,6 +205,13 @@ const STATIC_PAGES = ${JSON.stringify(staticPageMap)};
 // Embedded manifests — Next.js route modules call loadManifest() which
 // normally uses fs.readFileSync(). Expose on globalThis so the shim can access it.
 globalThis.__MANIFESTS = ${JSON.stringify(opts.manifests)};
+
+// Embedded user data files (.json, .yaml, etc.) — route handlers may call
+// fs.readFileSync to read project files at runtime. The fs shim falls back
+// to this map when a path isn't in __MANIFESTS. Keys are paths relative to
+// outputFileTracingRoot; the shim does suffix matching to handle the cwd
+// mismatch in workerd.
+globalThis.__USER_FILES = ${JSON.stringify(opts.userFiles)};
 
 // Prerender entries for ISR cache seeding (PPR shells + static prerenders)
 const __PRERENDER_ENTRIES = ${JSON.stringify(opts.prerenderEntries)};

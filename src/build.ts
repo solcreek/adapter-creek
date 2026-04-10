@@ -190,6 +190,15 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     }
   } catch {}
 
+  // Step 3e: Collect non-code user files (data.json, etc.) that route
+  // handlers may read at runtime via fs.readFileSync. Next.js's adapter API
+  // exposes these per-output as `output.assets` (the result of file tracing).
+  // We embed them in __USER_FILES so the fs shim can serve them in workerd.
+  const userFiles = await collectUserFiles(ctx.outputs);
+  if (Object.keys(userFiles).length > 0) {
+    console.log(`  [Creek Adapter] ${Object.keys(userFiles).length} user data files embedded`);
+  }
+
   // Step 4: Generate worker entry
   const workerSource = generateWorkerEntry({
     buildId: ctx.buildId,
@@ -199,6 +208,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     assetPrefix: ctx.config.assetPrefix || "",
     i18n: ctx.config.i18n || null,
     manifests,
+    userFiles,
     prerenderEntries,
     turbopackRuntimePath,
     edgeRegistrationChunkPath,
@@ -375,6 +385,74 @@ async function collectManifests(distDir: string): Promise<Record<string, string>
   } catch {}
 
   return manifests;
+}
+
+/**
+ * Collect non-code user files that route handlers may read via fs.readFileSync.
+ *
+ * Walks every output's `assets` map (Next.js file-trace results), filters out
+ * node_modules and code files, and reads the remainder as utf-8 strings into
+ * a record keyed by fileOutputPath (which is relative to outputFileTracingRoot).
+ *
+ * Binary files are skipped — supporting them would require base64 encoding and
+ * a separate worker-entry path. Most use cases (test fixtures, CMS data, i18n
+ * messages) only need text files.
+ *
+ * Size cap (2MB total) prevents accidentally bloating the worker bundle when a
+ * project has large data assets — the user can hit it explicitly to force a
+ * different deployment strategy.
+ */
+async function collectUserFiles(
+  outputs: BuildContext["outputs"],
+): Promise<Record<string, string>> {
+  const TEXT_EXTENSIONS = new Set([
+    ".json", ".txt", ".yaml", ".yml", ".md", ".csv", ".xml",
+    ".html", ".htm", ".sql", ".graphql", ".gql", ".env",
+  ]);
+  const MAX_TOTAL_BYTES = 2 * 1024 * 1024; // 2MB cap
+
+  const files: Record<string, string> = {};
+  let totalBytes = 0;
+
+  const allOutputs = [
+    ...outputs.appPages,
+    ...outputs.appRoutes,
+    ...outputs.pages,
+    ...outputs.pagesApi,
+  ];
+
+  for (const output of allOutputs) {
+    const assets = (output as { assets?: Record<string, string> }).assets;
+    if (!assets) continue;
+
+    for (const [fileOutputPath, sourceFile] of Object.entries(assets)) {
+      // Skip already-collected (different outputs may share the same asset)
+      if (files[fileOutputPath]) continue;
+
+      // Skip dependencies — esbuild already bundles JS deps; we only need
+      // user-side data files that get read at runtime via fs.
+      if (fileOutputPath.includes("node_modules/")) continue;
+
+      const ext = path.extname(fileOutputPath).toLowerCase();
+      if (!TEXT_EXTENSIONS.has(ext)) continue;
+
+      try {
+        const content = await fs.readFile(sourceFile, "utf-8");
+        if (totalBytes + content.length > MAX_TOTAL_BYTES) {
+          console.warn(
+            `  [Creek Adapter] User-files size cap reached (${MAX_TOTAL_BYTES} bytes); skipping ${fileOutputPath}`,
+          );
+          continue;
+        }
+        files[fileOutputPath] = content;
+        totalBytes += content.length;
+      } catch {
+        // Skip files we can't read — they may have been excluded by tracing
+      }
+    }
+  }
+
+  return files;
 }
 
 /** Prerender entry for ISR cache seeding */
