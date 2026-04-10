@@ -445,6 +445,145 @@ class CreekCacheHandler {
   resetRequestCache() {}
 }
 
+// =====================================================================
+// Composable cache handler (Next 16+ "use cache" directive)
+// =====================================================================
+// Next.js 16 introduced a separate cache subsystem for the "use cache"
+// directive. At runtime, cached functions look up handlers via:
+//   globalThis[Symbol.for('@next/cache-handlers-map')].get("default")
+//
+// If no handlers are registered, "use cache" silently no-ops and tests
+// that exercise it fail. opennextjs-cloudflare#1177 patches Next.js source
+// (ast-grep) to inject the registration into NextNodeServer. We don't need
+// the source patch because we never instantiate NextNodeServer — we just
+// register the symbols at module load.
+//
+// This is an in-memory implementation matching the phase-1 CreekCacheHandler.
+// Phase-2 will swap both in for a Durable Object backed implementation.
+class CreekComposableCacheHandler {
+  constructor() {
+    if (!globalThis.__CREEK_CC_STORE) globalThis.__CREEK_CC_STORE = new Map();
+    if (!globalThis.__CREEK_CC_TAG_STATE) globalThis.__CREEK_CC_TAG_STATE = new Map();
+  }
+
+  async get(cacheKey) {
+    const entry = globalThis.__CREEK_CC_STORE.get(cacheKey);
+    if (!entry) return undefined;
+
+    // If any tag attached to this entry has been expired since the entry
+    // was written, treat as a cache miss so the cached function re-runs.
+    for (const tag of entry.tags) {
+      const state = globalThis.__CREEK_CC_TAG_STATE.get(tag);
+      if (state && state.expire !== undefined && state.expire <= entry.timestamp) {
+        return undefined;
+      }
+    }
+
+    // The composable cache contract says \`value\` is a fresh ReadableStream.
+    // We stored bytes — wrap them in a new stream every read so multiple
+    // consumers can read the same entry without exhausting it.
+    const bytes = entry.value;
+    return {
+      value: new ReadableStream({
+        start(controller) {
+          controller.enqueue(bytes);
+          controller.close();
+        },
+      }),
+      tags: entry.tags,
+      stale: entry.stale,
+      timestamp: entry.timestamp,
+      expire: entry.expire,
+      revalidate: entry.revalidate,
+    };
+  }
+
+  async set(cacheKey, pendingEntry) {
+    const entry = await pendingEntry;
+    // Drain the ReadableStream into a Uint8Array for storage.
+    const reader = entry.value.getReader();
+    const chunks = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      total += value.byteLength;
+    }
+    const buf = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+      buf.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    globalThis.__CREEK_CC_STORE.set(cacheKey, {
+      value: buf,
+      tags: entry.tags || [],
+      stale: entry.stale,
+      timestamp: entry.timestamp != null ? entry.timestamp : Date.now(),
+      expire: entry.expire,
+      revalidate: entry.revalidate,
+    });
+  }
+
+  async refreshTags() {
+    // In-memory backend has no remote tag state to refresh.
+  }
+
+  /**
+   * Next.js 16 calls with a single array; pre-16 used rest args.
+   * Returning the most recent stale timestamp matches the upstream contract:
+   * Next.js compares this against the entry timestamp to decide validity.
+   */
+  async getExpiration(...tags) {
+    const flat = tags.flat();
+    let max = 0;
+    for (const tag of flat) {
+      const state = globalThis.__CREEK_CC_TAG_STATE.get(tag);
+      if (state && state.stale != null && state.stale > max) max = state.stale;
+    }
+    return max;
+  }
+
+  /** Pre-Next-16 path. Forwarded to updateTags with no duration. */
+  async expireTags(...tags) {
+    return this.updateTags(tags, undefined);
+  }
+
+  /** Legacy. Intentional no-op. */
+  async receiveExpiredTags() {}
+
+  /**
+   * Next 16+ entry point. Marks tags stale immediately. If \`durations.expire\`
+   * is provided (seconds), schedules hard expiry; otherwise expires now.
+   */
+  async updateTags(tags, durations) {
+    const now = Date.now();
+    for (const tag of tags) {
+      globalThis.__CREEK_CC_TAG_STATE.set(tag, {
+        stale: now,
+        expire: durations && durations.expire !== undefined ? now + durations.expire * 1000 : now,
+      });
+    }
+  }
+}
+
+// Register the composable cache handler under both "default" and "remote"
+// names — opennextjs-cloudflare#1177 added "remote" to support \`use cache: remote\`.
+// Worker module-load runs once per isolate, so this is effectively a singleton.
+{
+  const handlersMapSymbol = Symbol.for('@next/cache-handlers-map');
+  const handlersSetSymbol = Symbol.for('@next/cache-handlers-set');
+  if (!globalThis[handlersMapSymbol]) {
+    const ccHandler = new CreekComposableCacheHandler();
+    const map = new Map();
+    map.set("default", ccHandler);
+    map.set("remote", ccHandler);
+    globalThis[handlersMapSymbol] = map;
+    globalThis[handlersSetSymbol] = new Set(map.values());
+  }
+}
+
 // Initialize manifests singleton — called lazily on first SSR request.
 function __initManifests() {
   const MANIFESTS_SINGLETON = Symbol.for('next.server.manifests');
