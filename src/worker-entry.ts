@@ -969,6 +969,13 @@ const middlewareHandler = async (mwCtx) => {
     }
     console.error("[creek-mw]", mwCtx.url?.pathname, "status:", response.status, "location:", response.headers.get("location"), "x-mw-rewrite:", response.headers.get("x-middleware-rewrite"));
     const mwResult = responseToMiddlewareResult(response, mwHeaders, mwCtx.url);
+    // Stash the original response on the result so the worker can return
+    // its body verbatim when middleware handles the request itself (e.g.
+    // returns \`Response.json(...)\`). responseToMiddlewareResult flags that
+    // via \`bodySent\` which the routing layer translates into
+    // \`middlewareResponded: true\`, losing the actual body bytes. Keeping a
+    // reference lets \`__handleRequest\` return the original response.
+    mwResult.__mwResponse = response;
     // Restore flight headers from the original request. The user middleware
     // never saw them (we stripped them), so they're not in the override list,
     // which means responseToMiddlewareResult would either drop them or never
@@ -1042,6 +1049,7 @@ const middlewareHandler = async (mwCtx) => {
     });
     const response = await handler(mwReq, {});
     const mwResult = responseToMiddlewareResult(response, mwHeaders, mwCtx.url);
+    mwResult.__mwResponse = response;
     // See edge variant for rationale: restore flight headers so the page
     // handler still sees them and treats client-nav requests as RSC.
     if (mwResult.requestHeaders) {
@@ -1291,11 +1299,21 @@ async function __handleRequest(request, env, ctx) {
       // \`NextResponse.next({ request: { headers } })\`, those overridden
       // headers must reach the page handler so that \`headers().get(...)\`
       // returns the override value.
+      //
+      // Also capture the original middleware Response object so the worker
+      // can return its body verbatim when middleware handles the request
+      // itself (e.g. returns \`Response.json(...)\`). The routing layer
+      // translates that into \`middlewareResponded: true\` and discards the
+      // body.
       let mwModifiedRequestHeaders = null;
+      let mwCapturedResponse = null;
       const wrappedMiddlewareHandler = async (mwCtx) => {
         const mwRes = await middlewareHandler(mwCtx);
         if (mwRes && mwRes.requestHeaders) {
           mwModifiedRequestHeaders = mwRes.requestHeaders;
+        }
+        if (mwRes && mwRes.__mwResponse) {
+          mwCapturedResponse = mwRes.__mwResponse;
         }
         return mwRes;
       };
@@ -1335,6 +1353,13 @@ async function __handleRequest(request, env, ctx) {
         }
       }
       if (result.middlewareResponded) {
+        // Middleware returned a final response (e.g. \`Response.json(...)\`)
+        // instead of \`NextResponse.next()\`. The routing layer only tells us
+        // bodySent was true — we need the captured original response to
+        // return its body and headers to the client.
+        if (mwCapturedResponse instanceof Response) {
+          return mwCapturedResponse;
+        }
         return new Response(null, { status: 204 });
       }
       if (result.externalRewrite) {
