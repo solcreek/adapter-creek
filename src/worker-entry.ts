@@ -1409,6 +1409,33 @@ async function __handleRequest(request, env, ctx) {
       if (mwModifiedRequestHeaders) {
         result = { ...result, mwRequestHeaders: mwModifiedRequestHeaders };
       }
+      // @next/routing's \`checkDynamicRoutes\` helper is called from inside
+      // the afterFiles loop with an already-rewritten URL and iterates
+      // through ROUTING.dynamicRoutes before checking the exact-match
+      // pathnames list. Pages Router i18n builds emit a catch-all dynamic
+      // pattern \`/[id]\` with a regex (\`^[/]?(?<nextLocale>[^/]{1,})/(?<nxtPid>[^/]+?)(?:/)?\$\`)
+      // that also matches fully-resolved static routes like \`/en/ssr-page\`
+      // — so an afterFiles rewrite from \`/en/rewrite-1\` to \`/en/ssr-page\`
+      // ends up being re-matched as \`/[id]\` with nxtPid=ssr-page, which is
+      // not what the test expects. Detect the case where
+      // \`invocationTarget.pathname\` is itself a known PATHNAME and prefer
+      // it over \`resolvedPathname\` — the literal target is always right.
+      if (
+        result.resolvedPathname &&
+        result.invocationTarget?.pathname &&
+        result.invocationTarget.pathname !== result.resolvedPathname &&
+        PATHNAMES.includes(result.invocationTarget.pathname) &&
+        HANDLERS[result.invocationTarget.pathname]
+      ) {
+        result = {
+          ...result,
+          resolvedPathname: result.invocationTarget.pathname,
+          // Drop the bogus dynamic-route params captured for the wrong
+          // handler — they carry the rewrite source's segments, not the
+          // target's params.
+          routeMatches: undefined,
+        };
+      }
       if (result.redirect) {
         return new Response(null, {
           status: result.redirect.status,
@@ -1625,9 +1652,27 @@ async function __handleRequest(request, env, ctx) {
             new Request(new URL(url.pathname, url.origin), { headers: request.headers })
           );
           if (assetRes.ok) {
+            const assetHeaders = applyStaticAssetHeaders(
+              new Headers(assetRes.headers),
+              url.pathname,
+            );
+            // Merge middleware response headers — tests like
+            // middleware-general's "should keep non data requests in their
+            // original shape" depend on headers set by
+            // \`NextResponse.next({ headers })\` reaching static asset
+            // responses.
+            if (result.resolvedHeaders) {
+              result.resolvedHeaders.forEach((val, key) => {
+                if (key.toLowerCase() === "set-cookie") {
+                  assetHeaders.append(key, val);
+                } else {
+                  assetHeaders.set(key, val);
+                }
+              });
+            }
             return new Response(assetRes.body, {
               status: assetRes.status,
-              headers: applyStaticAssetHeaders(new Headers(assetRes.headers), url.pathname),
+              headers: assetHeaders,
             });
           }
         } catch {}
