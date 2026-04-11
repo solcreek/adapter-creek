@@ -1009,7 +1009,7 @@ async function __handleRequest(request, env, ctx) {
   // Reset patch state so Next.js will re-wrap fetch for this request.
   globalThis.fetch = __ourFetchWrapper;
   globalThis[__NEXT_PATCH_SYMBOL] = false;
-  return __INTERNAL_FETCH_CONTEXT.run({ origin: new URL(request.url).origin, env, ctx }, async () => {
+  const response = await __INTERNAL_FETCH_CONTEXT.run({ origin: new URL(request.url).origin, env, ctx }, async () => {
     try {
       __initManifests();
       const url = new URL(request.url);
@@ -1483,6 +1483,29 @@ async function __handleRequest(request, env, ctx) {
       });
     }
   });
+  // Skew protection: every \`/_next/data/*\` response advertises a deployment
+  // identifier so the Pages Router client can detect deploy boundaries and
+  // hard-navigate when the BUILD_ID changes underneath it. We piggyback on
+  // BUILD_ID since CF Workers don't have a separate deployment ID and the
+  // upstream test only checks for header presence (truthy).
+  try {
+    const url = new URL(request.url);
+    if (
+      response &&
+      typeof response.headers?.has === "function" &&
+      url.pathname.startsWith("/_next/data/") &&
+      !response.headers.has("x-nextjs-deployment-id")
+    ) {
+      const headers = new Headers(response.headers);
+      headers.set("x-nextjs-deployment-id", BUILD_ID);
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    }
+  } catch {}
+  return response;
 }
 
 export default {
