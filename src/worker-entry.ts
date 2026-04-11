@@ -1365,8 +1365,16 @@ async function __handleRequest(request, env, ctx) {
         url: new URL(request.url),
         buildId: BUILD_ID,
         basePath: BASE_PATH,
-        // i18n disabled — causes not-found regression without fixing matchers
-        // TODO: implement locale-aware handler matching
+        // Pass i18n so the routing layer prepends the default locale to
+        // incoming paths before matching. Pages Router builds with i18n
+        // emit PATHNAMES and ROUTING.dynamicRoutes that only match
+        // locale-prefixed URLs (e.g. \`/[id]\` → regex
+        // \`^[/]?(?<nextLocale>[^/]{1,})/(?<nxtPid>[^/]+?)(?:/)?$\`), so a
+        // request for \`/static\` can't resolve unless we first rewrite it
+        // to \`/<defaultLocale>/static\`. Without this, middleware-general
+        // tests that hit paths like \`/global\` and \`/static\` 404 instead
+        // of running middleware → handler.
+        i18n: I18N,
         headers: routingClone.headers,
         requestBody: routingClone.body,
         pathnames: PATHNAMES,
