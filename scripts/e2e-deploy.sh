@@ -84,8 +84,31 @@ if (code.includes('failed to find source route') && !code.includes('const _pr = 
 
 # Build with adapter
 export NEXT_ADAPTER_PATH="${ADAPTER_PATH}"
-log "Running next build..."
-npx next build --experimental-next-config-strip-types >&2 2>&1
+# The test harness writes a custom \`build\` script into package.json when the
+# test fixture configures a setup step (e.g. middleware-general copies a mock
+# workspace package into ./node_modules via a \`setup\` script before calling
+# \`next build\`). Running \`npx next build\` directly here would skip that
+# setup and the build would fail to resolve the mock package. Patch the
+# existing build script to carry our \`--experimental-next-config-strip-types\`
+# flag and delegate to it via \`pnpm run build\`.
+log "Running next build via pnpm..."
+node -e "
+const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('package.json','utf8'));
+const script = pkg.scripts && pkg.scripts.build;
+if (script && !script.includes('--experimental-next-config-strip-types')) {
+  pkg.scripts.build = script.replace(
+    /\\bnext build\\b/,
+    'next build --experimental-next-config-strip-types'
+  );
+  fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+}
+" >&2 2>&1
+if node -e "const p=JSON.parse(require('fs').readFileSync('package.json','utf8'));process.exit(p.scripts&&p.scripts.build?0:1);" 2>/dev/null; then
+  pnpm run build >&2 2>&1
+else
+  npx next build --experimental-next-config-strip-types >&2 2>&1
+fi
 log "next build complete"
 
 # Save build metadata
