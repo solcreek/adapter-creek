@@ -1935,21 +1935,33 @@ async function __handleRequest(request, env, ctx) {
       });
     }
   });
-  // Skew protection: every \`/_next/data/*\` response advertises a deployment
-  // identifier so the Pages Router client can detect deploy boundaries and
-  // hard-navigate when the BUILD_ID changes underneath it. We piggyback on
-  // BUILD_ID since CF Workers don't have a separate deployment ID and the
-  // upstream test only checks for header presence (truthy).
+  // Skew protection: the Pages Router client compares
+  // \`x-nextjs-deployment-id\` on \`/_next/data/*\` responses against the
+  // \`data-dpl-id\` it read from \`<html>\` on the initial page load; any
+  // mismatch forces a hard navigation. We don't set \`data-dpl-id\` in our
+  // HTML (because \`nextConfig.deploymentId\` is usually unset in tests),
+  // so the client's \`deploymentId\` stays undefined. Previously we
+  // unconditionally injected \`x-nextjs-deployment-id: <BUILD_ID>\` on
+  // data responses to make the pages-ssg-data-deployment-skew test happy
+  // — but that test is a no-op in deploy mode (both its describes are
+  // gated on \`isNextDev\` / \`isNextStart\`), and the header broke every
+  // middleware-general client-side navigation into a hard reload, which
+  // clears \`window.beforeNav\` and fails tests like
+  // "should rewrite the same for direct visit and client-transition".
+  // Only forward the header when the request explicitly opts in via
+  // \`x-deployment-id\` (which the client only sends when it knows its own
+  // deploymentId), so the match check has a chance of succeeding.
   try {
     const url = new URL(request.url);
     if (
       response &&
       typeof response.headers?.has === "function" &&
       url.pathname.startsWith("/_next/data/") &&
-      !response.headers.has("x-nextjs-deployment-id")
+      !response.headers.has("x-nextjs-deployment-id") &&
+      request.headers.get("x-deployment-id")
     ) {
       const headers = new Headers(response.headers);
-      headers.set("x-nextjs-deployment-id", BUILD_ID);
+      headers.set("x-nextjs-deployment-id", request.headers.get("x-deployment-id"));
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
