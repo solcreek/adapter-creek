@@ -10,14 +10,16 @@ set -euo pipefail
 
 ADAPTER_PATH="${ADAPTER_DIR}/dist/index.js"
 NPM_CACHE_DIR="${TMPDIR:-/tmp}/adapter-creek-npm-cache"
-PNPM_STORE_DIR="${TMPDIR:-/tmp}/adapter-creek-pnpm-store-$$-${RANDOM}"
+# Shared pnpm store across all test runs. pnpm handles concurrent access
+# to the store via per-package file locks, so multiple tests can install
+# in parallel without corruption. Keeping the store across runs means
+# we only pay the download cost for each package once — subsequent
+# installs become a near-instant link operation. The earlier per-run
+# random store (\$\$-\${RANDOM}) blew the 240s hook timeout because every
+# beforeAll() re-downloaded esbuild/sharp binaries from npm.
+PNPM_STORE_DIR="${TMPDIR:-/tmp}/adapter-creek-pnpm-store-shared"
 mkdir -p "${NPM_CACHE_DIR}"
 mkdir -p "${PNPM_STORE_DIR}"
-
-cleanup() {
-  rm -rf "${PNPM_STORE_DIR}" 2>/dev/null || true
-}
-trap cleanup EXIT
 
 # The deploy harness is exercising a preview-style deployment. Several metadata
 # behaviors in Next.js key off Vercel preview env vars rather than next.config.
@@ -48,7 +50,12 @@ require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 " >&2
 fi
 log "Running pnpm install..."
-pnpm install --force --store-dir "${PNPM_STORE_DIR}" --no-frozen-lockfile >&2 2>&1
+# --prefer-offline: use the store whenever possible, only hit the network
+# for packages that aren't already cached. This is what turns a ~3min
+# install into a ~5s link operation once the store is warm.
+# Dropping --force so pnpm can actually use the cached store. --force
+# would re-download every package.
+pnpm install --store-dir "${PNPM_STORE_DIR}" --no-frozen-lockfile --prefer-offline >&2 2>&1
 log "pnpm install complete"
 
 # Patch Next.js: fix invariant error for dynamic metadata routes in handleBuildComplete.
