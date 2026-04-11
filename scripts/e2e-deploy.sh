@@ -141,7 +141,7 @@ echo "${SERVER_PID}" > .adapter-server.pid
 # fixtures intentionally have no root route and hitting `/` can trigger an app
 # render invariant before the real test even starts.
 for i in $(seq 1 60); do
-  if curl -fsS "http://127.0.0.1:${PORT}${HEALTHCHECK_PATH}" > /dev/null 2>&1; then
+  if curl -fsS "http://localhost:${PORT}${HEALTHCHECK_PATH}" > /dev/null 2>&1; then
     break
   fi
   if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
@@ -153,7 +153,7 @@ for i in $(seq 1 60); do
 done
 
 # Verify server is responding
-if ! curl -fsS "http://127.0.0.1:${PORT}${HEALTHCHECK_PATH}" > /dev/null 2>&1; then
+if ! curl -fsS "http://localhost:${PORT}${HEALTHCHECK_PATH}" > /dev/null 2>&1; then
   log "Server failed to start within 60s"
   cat .adapter-server.log >&2
   kill "${SERVER_PID}" 2>/dev/null || true
@@ -167,7 +167,12 @@ fi
   echo "IMMUTABLE_ASSET_TOKEN: undefined"
 } > .adapter-build.log
 
-log "Ready at http://127.0.0.1:${PORT}"
+log "Ready at http://localhost:${PORT}"
 
-# Print URL to stdout (test harness reads this)
-echo "http://127.0.0.1:${PORT}"
+# Print URL to stdout (test harness reads this). Use \`localhost\` rather than
+# \`127.0.0.1\` so that \`next.url\` matches what Next.js normalizes internally
+# via NextURL.parseURL() — that function rewrites any loopback hostname to
+# "localhost", which means middleware code like
+# \`new URL('/dest', request.url)\` always produces localhost URLs. Tests that
+# compare against \`next.url + '/dest'\` would otherwise see a hostname mismatch.
+echo "http://localhost:${PORT}"

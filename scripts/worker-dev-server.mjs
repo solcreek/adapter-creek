@@ -177,8 +177,14 @@ const env = {
   ASSETS: createAssetsBinding(path.resolve(assetsDir)),
 };
 
+// Use `localhost` rather than `127.0.0.1` so Request URLs match what Next.js
+// normalizes internally — NextURL.parseURL() (see next-url.ts) rewrites any
+// loopback hostname (127.0.0.1, ::1, localhost) to "localhost", so middleware
+// code like `new URL('/dest', request.url)` always produces localhost URLs.
+// Keeping the binding and the origin on "localhost" lets test assertions that
+// compare against `next.url` match without a hostname mismatch.
 const server = createServer(async (req, res) => {
-  const origin = `http://127.0.0.1:${port}`;
+  const origin = `http://localhost:${port}`;
   const url = new URL(req.url || "/", origin);
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {
@@ -246,6 +252,6 @@ const server = createServer(async (req, res) => {
   }
 });
 
-server.listen(port, "127.0.0.1", () => {
-  console.error(`[worker-dev-server] Ready on http://127.0.0.1:${port}`);
+server.listen(port, "localhost", () => {
+  console.error(`[worker-dev-server] Ready on http://localhost:${port}`);
 });
