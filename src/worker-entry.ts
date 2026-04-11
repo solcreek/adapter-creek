@@ -857,6 +857,18 @@ const middlewareHandler = async (mwCtx) => {
     }
     console.error("[creek-mw]", mwCtx.url?.pathname, "status:", response.status, "location:", response.headers.get("location"), "x-mw-rewrite:", response.headers.get("x-middleware-rewrite"));
     const mwResult = responseToMiddlewareResult(response, mwHeaders, mwCtx.url);
+    // Restore flight headers from the original request. The user middleware
+    // never saw them (we stripped them), so they're not in the override list,
+    // which means responseToMiddlewareResult would either drop them or never
+    // re-add them. The downstream page handler still needs them to detect
+    // RSC requests (otherwise it returns HTML instead of an RSC payload and
+    // the client falls back to a full-page reload).
+    if (mwResult.requestHeaders) {
+      for (const h of FLIGHT_HEADERS) {
+        const v = mwCtx.headers.get(h);
+        if (v != null) mwResult.requestHeaders.set(h, v);
+      }
+    }
     return mwResult;
   } catch (err) {
     console.error("[creek-mw] Error:", err instanceof Error ? err.stack || err.message : String(err));
@@ -889,7 +901,16 @@ const middlewareHandler = async (mwCtx) => {
       body: mwCtx.requestBody,
     });
     const response = await handler(mwReq, {});
-    return responseToMiddlewareResult(response, mwHeaders, mwCtx.url);
+    const mwResult = responseToMiddlewareResult(response, mwHeaders, mwCtx.url);
+    // See edge variant for rationale: restore flight headers so the page
+    // handler still sees them and treats client-nav requests as RSC.
+    if (mwResult.requestHeaders) {
+      for (const h of FLIGHT_HEADERS) {
+        const v = mwCtx.headers.get(h);
+        if (v != null) mwResult.requestHeaders.set(h, v);
+      }
+    }
+    return mwResult;
   } catch {
     return {};
   }
@@ -1083,6 +1104,20 @@ async function __handleRequest(request, env, ctx) {
       // Clone request for routing — middleware may read the body, but the
       // original must remain available for the handler (server actions, POST).
       const routingClone = request.body ? request.clone() : request;
+      // Capture middleware-modified request headers via closure. The routing
+      // layer uses \`L.requestHeaders\` internally for downstream matching but
+      // does NOT expose them in its result. When user middleware calls
+      // \`NextResponse.next({ request: { headers } })\`, those overridden
+      // headers must reach the page handler so that \`headers().get(...)\`
+      // returns the override value.
+      let mwModifiedRequestHeaders = null;
+      const wrappedMiddlewareHandler = async (mwCtx) => {
+        const mwRes = await middlewareHandler(mwCtx);
+        if (mwRes && mwRes.requestHeaders) {
+          mwModifiedRequestHeaders = mwRes.requestHeaders;
+        }
+        return mwRes;
+      };
       let result = await resolveRoutes({
         url: new URL(request.url),
         buildId: BUILD_ID,
@@ -1093,8 +1128,11 @@ async function __handleRequest(request, env, ctx) {
         requestBody: routingClone.body,
         pathnames: PATHNAMES,
         routes: ROUTING,
-        invokeMiddleware: middlewareHandler,
+        invokeMiddleware: wrappedMiddlewareHandler,
       });
+      if (mwModifiedRequestHeaders) {
+        result = { ...result, mwRequestHeaders: mwModifiedRequestHeaders };
+      }
       if (result.redirect) {
         return new Response(null, {
           status: result.redirect.status,
@@ -1306,7 +1344,11 @@ async function __handleRequest(request, env, ctx) {
             appendSearchParam(edgeRequestUrl.searchParams, key, value);
           }
         }
-        const edgeRequestHeaders = new Headers(request.headers);
+        // Prefer middleware-overridden request headers (NextResponse.next({
+        // request: { headers } })) when present.
+        const edgeRequestHeaders = result.mwRequestHeaders
+          ? new Headers(result.mwRequestHeaders)
+          : new Headers(request.headers);
         if (result.resolvedHeaders) {
           result.resolvedHeaders.forEach((val, key) => {
             if (key.toLowerCase() !== "set-cookie") {
@@ -1850,7 +1892,17 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     ? "?" + new URLSearchParams(rawQueryForUrl).toString()
     : url.search;
   req.url = targetUrl + targetQuery;
-  req.headers = Object.fromEntries(request.headers);
+  // Prefer middleware-overridden request headers when available. These come
+  // from \`NextResponse.next({ request: { headers } })\` and are required for
+  // \`headers().get()\` to return the override value inside the page handler.
+  if (routeResult?.mwRequestHeaders) {
+    req.headers = {};
+    routeResult.mwRequestHeaders.forEach((val, key) => {
+      req.headers[key.toLowerCase()] = val;
+    });
+  } else {
+    req.headers = Object.fromEntries(request.headers);
+  }
   // Merge resolved headers from middleware into request headers
   if (routeResult?.resolvedHeaders) {
     routeResult.resolvedHeaders.forEach((val, key) => {
