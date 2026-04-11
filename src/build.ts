@@ -32,8 +32,8 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
 
   console.log(`\n  [Creek Adapter] Preparing deployment output...`);
 
-  // Step 1: Collect static files (including public/*)
-  const assetCount = await collectStaticFiles(ctx.outputs, assetsDir, ctx.projectDir);
+  // Step 1: Collect static files (including public/* and edge-chunks/*)
+  const assetCount = await collectStaticFiles(ctx.outputs, assetsDir, ctx.projectDir, ctx.distDir);
   console.log(`  [Creek Adapter] ${assetCount} static files collected`);
 
   // Step 2: Collect WASM files from all outputs
@@ -260,6 +260,7 @@ async function collectStaticFiles(
   outputs: BuildContext["outputs"],
   assetsDir: string,
   projectDir?: string,
+  distDir?: string,
 ): Promise<number> {
   let count = 0;
   const allPathnames = new Set(outputs.staticFiles.map((f) => f.pathname));
@@ -291,6 +292,35 @@ async function collectStaticFiles(
         await fs.copyFile(prerender.fallback.filePath, destPath);
         count++;
       } catch {}
+    }
+  }
+
+  // Edge asset bindings (\`.next/server/edge-chunks/asset_*\`). Edge routes
+  // that do \`fetch(new URL('../../assets/foo', import.meta.url))\` get
+  // rewritten by next's middleware-asset-loader to \`fetch('blob:foo')\` at
+  // build time, with the actual bytes emitted to
+  // \`.next/server/edge-chunks/asset_foo\`. The upstream edge sandbox has a
+  // \`fetchInlineAsset\` shim that intercepts \`blob:\` URLs and reads the
+  // file from disk; since CF Workers have no fs access, we copy the
+  // chunks into the static assets binding under \`/_next/edge-chunks/\`
+  // and the runtime fetch wrapper maps \`blob:NAME\` →
+  // \`/_next/edge-chunks/asset_NAME\`.
+  if (distDir) {
+    const edgeChunksDir = path.join(distDir, "server", "edge-chunks");
+    try {
+      const entries = await fs.readdir(edgeChunksDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const srcPath = path.join(edgeChunksDir, entry.name);
+        const destPath = path.join(assetsDir, "_next", "edge-chunks", entry.name);
+        await fs.mkdir(path.dirname(destPath), { recursive: true });
+        try {
+          await fs.copyFile(srcPath, destPath);
+          count++;
+        } catch {}
+      }
+    } catch {
+      // No edge-chunks dir — no edge asset bindings in this build.
     }
   }
 

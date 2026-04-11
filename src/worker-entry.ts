@@ -1028,6 +1028,32 @@ async function __withMinimalWorkStore(pagePath, ctx, fn) {
 
 const __INTERNAL_FETCH_CONTEXT = new AsyncLocalStorage();
 globalThis.fetch = function(input, init) {
+  // Edge asset bindings: Next.js's middleware-asset-loader rewrites
+  // \`fetch(new URL('../assets/foo.ttf', import.meta.url))\` into
+  // \`fetch('blob:foo.{hash}.ttf')\` and emits the file bytes to
+  // \`.next/server/edge-chunks/asset_foo.{hash}.ttf\`. The upstream edge
+  // sandbox has a \`fetchInlineAsset\` shim that reads the file from disk;
+  // CF Workers have no fs, so at build time we copy the chunks under
+  // \`_next/edge-chunks/\` in the assets binding, and here we translate
+  // the blob URL into an ASSETS fetch.
+  const inputUrl =
+    typeof input === "string"
+      ? input
+      : input instanceof URL
+        ? input.toString()
+        : input && typeof input === "object" && "url" in input
+          ? input.url
+          : String(input);
+  if (typeof inputUrl === "string" && inputUrl.startsWith("blob:")) {
+    const name = inputUrl.slice("blob:".length);
+    const store = __INTERNAL_FETCH_CONTEXT.getStore();
+    const env = store?.env;
+    if (env?.ASSETS && store?.origin) {
+      const assetUrl = new URL("/_next/edge-chunks/asset_" + name, store.origin);
+      return env.ASSETS.fetch(new Request(assetUrl));
+    }
+    return new Response(null, { status: 404 });
+  }
   const store = __INTERNAL_FETCH_CONTEXT.getStore();
   if (!store) return __nativeFetch(input, init);
   const request = input instanceof Request && init === undefined ? input : new Request(input, init);
