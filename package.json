@@ -44,7 +44,7 @@
     "url": "https://github.com/solcreek/adapter-creek.git"
   },
   "dependencies": {
-    "@next/routing": "16.2.1",
+    "@next/routing": "16.2.3",
     "wrangler": "^4.0.0"
   },
   "peerDependencies": {
