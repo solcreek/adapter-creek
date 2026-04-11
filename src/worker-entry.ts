@@ -1287,27 +1287,6 @@ async function __handleRequest(request, env, ctx) {
       if (resolvedPathname && !HANDLERS[resolvedPathname]) {
         if (HANDLERS[resolvedPathname + "/index"]) resolvedPathname = resolvedPathname + "/index";
       }
-      // Dynamic-route fallback. The @next/routing layer only does exact-match
-      // resolution against PATHNAMES (or via config rewrites/redirects); it
-      // does not expand app-router dynamic patterns. So a request to
-      // \`/catch-all/hello/world\` lands here with no resolvedPathname even
-      // though there's a \`/catch-all/[...slug]\` handler in HANDLERS. Compile
-      // routes-manifest.json's dynamicRoutes into a regex table at module
-      // init and try them now. On match, set resolvedPathname to the
-      // handler's bracketed pathname and merge the captured params into
-      // routeMatches so getNormalizedRouteParams() picks them up.
-      if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
-        const dyn = __matchDynamicRoute(url.pathname);
-        if (dyn && HANDLERS[dyn.page]) {
-          resolvedPathname = dyn.page;
-          if (Object.keys(dyn.params).length > 0) {
-            result = {
-              ...result,
-              routeMatches: { ...(result.routeMatches || {}), ...dyn.params },
-            };
-          }
-        }
-      }
       // 4a. Static pages — serve pre-rendered HTML from assets.
       // Pages Router static pages and auto-optimized pages are pre-rendered
       // at build time. Their handlers require filesystem access that CF Workers
@@ -1381,22 +1360,49 @@ async function __handleRequest(request, env, ctx) {
           }
         } catch {}
 
-        // Fall back to SSR _not-found handler or static 404
-        if (HANDLERS["/_not-found"]) {
-          resolvedPathname = "/_not-found";
-          // Force 404 status — the handler renders the not-found boundary
-          // but doesn't know the original request was unmatched.
-          if (!result.status) result = { ...result, status: 404 };
-        } else {
-          // Try static 404 page from assets
-          const notFoundPath = STATIC_PAGES["/404"]?.assetPath || "/404/index.html";
-          try {
-            const notFound = await env.ASSETS.fetch(new Request(new URL(notFoundPath, url.origin)));
-            if (notFound.ok) {
-              return new Response(notFound.body, { status: 404, headers: notFound.headers });
-            }
-          } catch {}
-          return new Response("Not Found", { status: 404 });
+        // Dynamic-route fallback for Pages Router. The @next/routing layer only
+        // does exact-match resolution against PATHNAMES; it won't expand
+        // Pages Router dynamic patterns like \`/catch-all/[...slug]\`, so a
+        // request for \`/catch-all/hello/world\` lands here with no
+        // resolvedPathname. Compile routes-manifest.json's dynamicRoutes and
+        // try them — on match, route to the Pages Router handler.
+        //
+        // Important: we do NOT use this fallback for App Router (APP_PAGE)
+        // handlers. App Router enforces \`dynamicParams = false\` and similar
+        // framework-level constraints by explicitly NOT running the handler
+        // for disallowed params — instead the request falls through to
+        // /_not-found. Letting the fallback re-route to the bracketed
+        // App Router handler would bypass that enforcement and turn 404s
+        // into 200s with the wrong content.
+        const dyn = __matchDynamicRoute(url.pathname);
+        if (dyn && HANDLERS[dyn.page] && HANDLERS[dyn.page].type === "PAGES") {
+          resolvedPathname = dyn.page;
+          if (Object.keys(dyn.params).length > 0) {
+            result = {
+              ...result,
+              routeMatches: { ...(result.routeMatches || {}), ...dyn.params },
+            };
+          }
+        }
+
+        // If still no handler, fall back to SSR _not-found handler or static 404.
+        if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
+          if (HANDLERS["/_not-found"]) {
+            resolvedPathname = "/_not-found";
+            // Force 404 status — the handler renders the not-found boundary
+            // but doesn't know the original request was unmatched.
+            if (!result.status) result = { ...result, status: 404 };
+          } else {
+            // Try static 404 page from assets
+            const notFoundPath = STATIC_PAGES["/404"]?.assetPath || "/404/index.html";
+            try {
+              const notFound = await env.ASSETS.fetch(new Request(new URL(notFoundPath, url.origin)));
+              if (notFound.ok) {
+                return new Response(notFound.body, { status: 404, headers: notFound.headers });
+              }
+            } catch {}
+            return new Response("Not Found", { status: 404 });
+          }
         }
       }
 
@@ -1794,7 +1800,7 @@ function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, 
     // HTML directly from assets leaves the client stuck on the loading shell.
     if (prerender.fallback.postponedState || prerender.pprChain?.headers) continue;
 
-    const assetPath = !path.extname(prerender.pathname)
+    const assetPath = __isStaticPagePathname(prerender.pathname)
       ? path.join(prerender.pathname, "index.html")
       : prerender.pathname;
 
