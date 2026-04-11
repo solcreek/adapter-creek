@@ -2410,6 +2410,91 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   // Track pending writes to prevent writer.close() racing with writes.
   let pendingWrites = Promise.resolve();
 
+  // Quirks-mode guard: Next.js's \`createHeadInsertionTransformStream\`
+  // (stream-utils/node-web-streams-helper.ts) has a latent bug where the
+  // server-inserted HTML (polyfills + metadata) is prepended to the stream
+  // when \`</head>\` is not found in the first chunk. The comment in the
+  // "else" branch says this only happens during PPR resume — but with
+  // Suspense wrapping the entire \`<html>\` element (e.g. the
+  // autoscroll-with-css-modules test), React emits a small first chunk that
+  // can land before \`</head>\` is produced. Next's transformer then prepends
+  // the polyfill \`<script noModule>\` to the very start of the response,
+  // placing it BEFORE \`<!DOCTYPE html>\`. When the browser parses this, the
+  // doctype isn't the first token, so the document enters **quirks mode**,
+  // which causes \`document.documentElement.scrollTop\` to always report 0
+  // (scroll moves to \`document.body\` instead).
+  //
+  // We detect that shape and rewrite the first few chunks to move any stray
+  // pre-doctype markup into the \`<head>\` of the doctype chunk, right before
+  // \`</head>\`. This restores standards mode without altering the behavior
+  // of any other test that already produced well-formed HTML.
+  let __streamStarted = false;
+  let __preDoctypeBuffer = null;  // Uint8Array of stray pre-doctype bytes, or null
+  const __DOCTYPE_BYTES = new TextEncoder().encode("<!DOCTYPE");
+  const __HEAD_CLOSE_BYTES = new TextEncoder().encode("</head>");
+  function __indexOfBytes(haystack, needle) {
+    if (needle.length === 0) return 0;
+    const max = haystack.length - needle.length;
+    outer: for (let i = 0; i <= max; i++) {
+      for (let j = 0; j < needle.length; j++) {
+        if (haystack[i + j] !== needle[j]) continue outer;
+      }
+      return i;
+    }
+    return -1;
+  }
+  function __mergeBytes(a, b) {
+    const out = new Uint8Array(a.length + b.length);
+    out.set(a, 0);
+    out.set(b, a.length);
+    return out;
+  }
+  function __rewriteFirstChunk(chunk) {
+    // Fast path: this chunk alone already starts with <!DOCTYPE and no
+    // stray pre-doctype buffer is pending. Emit unchanged.
+    if (
+      !__preDoctypeBuffer &&
+      __indexOfBytes(chunk.slice(0, 16), __DOCTYPE_BYTES) === 0
+    ) {
+      return chunk;
+    }
+    // Locate the doctype anywhere in the current chunk.
+    const doctypeIdx = __indexOfBytes(chunk, __DOCTYPE_BYTES);
+    if (doctypeIdx === -1) {
+      // Still no doctype — buffer and wait for the next chunk.
+      __preDoctypeBuffer = __preDoctypeBuffer
+        ? __mergeBytes(__preDoctypeBuffer, chunk)
+        : chunk;
+      return null;
+    }
+    // Doctype found: split current chunk into the stray prefix and the
+    // doctype-onwards remainder. Combine any previously buffered stray
+    // bytes (from earlier chunks) with this chunk's stray prefix.
+    const strayInChunk = chunk.slice(0, doctypeIdx);
+    const rest = chunk.slice(doctypeIdx);
+    const combinedStray = __preDoctypeBuffer
+      ? __mergeBytes(__preDoctypeBuffer, strayInChunk)
+      : strayInChunk;
+    __preDoctypeBuffer = null;
+    if (combinedStray.length === 0) {
+      // No stray content to re-insert — just return the doctype-onwards bytes.
+      return rest;
+    }
+    // Inject the stray content right before </head> in the remainder.
+    const headCloseIdx = __indexOfBytes(rest, __HEAD_CLOSE_BYTES);
+    if (headCloseIdx === -1) {
+      // No </head> yet — append the stray content at the end of the chunk
+      // as a fallback. Standards mode is preserved (doctype leads the stream)
+      // and any referenced polyfill still loads, just later than ideal.
+      return __mergeBytes(rest, combinedStray);
+    }
+    const out = new Uint8Array(rest.length + combinedStray.length);
+    out.set(rest.slice(0, headCloseIdx), 0);
+    out.set(combinedStray, headCloseIdx);
+    out.set(rest.slice(headCloseIdx), headCloseIdx + combinedStray.length);
+    return out;
+  }
+
   // Intercept write — stream chunks to the client.
   // Chain writes through pendingWrites to avoid race conditions.
   res.write = function(chunk, encoding, cb) {
@@ -2419,6 +2504,18 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     if (chunk && !responseDisallowsBody) {
       if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
       else if (chunk instanceof Buffer) chunk = new Uint8Array(chunk);
+      // Only rewrite text/html responses — JSON/RSC payloads don't need this.
+      const isHtml = String(res.getHeader("content-type") || "").toLowerCase().includes("text/html");
+      if (isHtml && !__streamStarted) {
+        const rewritten = __rewriteFirstChunk(chunk);
+        if (rewritten === null) {
+          // Buffered — defer until we see the doctype.
+          if (cb) pendingWrites.then(() => cb(), () => cb());
+          return true;
+        }
+        __streamStarted = true;
+        chunk = rewritten;
+      }
       pendingWrites = pendingWrites
         .then(() => {
           if (!streamClosed) streamController.enqueue(chunk);
@@ -2428,6 +2525,8 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     if (cb) pendingWrites.then(() => cb(), () => cb());
     return true;
   };
+
+
 
   // Intercept end — flush final chunk and close the stream.
   // Wait for all pending writes before closing.
@@ -2440,9 +2539,39 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     if (chunk && !responseDisallowsBody) {
       if (typeof chunk === "string") chunk = new TextEncoder().encode(chunk);
       else if (chunk instanceof Buffer) chunk = new Uint8Array(chunk);
+      // Apply the same quirks-mode guard rewrite as \`res.write\`.
+      const isHtml = String(res.getHeader("content-type") || "").toLowerCase().includes("text/html");
+      if (isHtml && !__streamStarted) {
+        const rewritten = __rewriteFirstChunk(chunk);
+        if (rewritten !== null) {
+          __streamStarted = true;
+          chunk = rewritten;
+        } else {
+          // Buffered but never saw a doctype — flush the buffer as-is.
+          if (__preDoctypeBuffer) {
+            chunk = __preDoctypeBuffer;
+            __preDoctypeBuffer = null;
+            __streamStarted = true;
+          } else {
+            chunk = null;
+          }
+        }
+      }
+      if (chunk) {
+        pendingWrites = pendingWrites
+          .then(() => {
+            if (!streamClosed) streamController.enqueue(chunk);
+          })
+          .catch(() => {});
+      }
+    } else if (!__streamStarted && __preDoctypeBuffer) {
+      // No final chunk but we have buffered pre-doctype bytes — flush them.
+      const buffered = __preDoctypeBuffer;
+      __preDoctypeBuffer = null;
+      __streamStarted = true;
       pendingWrites = pendingWrites
         .then(() => {
-          if (!streamClosed) streamController.enqueue(chunk);
+          if (!streamClosed) streamController.enqueue(buffered);
         })
         .catch(() => {});
     }
