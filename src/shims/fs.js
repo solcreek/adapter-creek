@@ -4,6 +4,34 @@
 const noop = () => {};
 const noopSync = () => undefined;
 
+// Binary files in __USER_FILES are base64-encoded with a sentinel prefix
+// so readFile callers (e.g. next/og node-runtime routes reading font
+// files) receive real Uint8Array/Buffer bytes instead of a UTF-8 string.
+const BINARY_SENTINEL = "__CREEK_B64__";
+
+function decodeBase64(b64) {
+  // CF Workers and Node.js both support atob; the result is a binary
+  // string that we map to a Uint8Array byte-by-byte.
+  const binStr = atob(b64);
+  const out = new Uint8Array(binStr.length);
+  for (let i = 0; i < binStr.length; i++) out[i] = binStr.charCodeAt(i);
+  return out;
+}
+
+function maybeDecodeBinary(value, enc) {
+  if (typeof value !== "string" || !value.startsWith(BINARY_SENTINEL)) {
+    return value;
+  }
+  const bytes = decodeBase64(value.slice(BINARY_SENTINEL.length));
+  if (!enc) return bytes;
+  if (enc === "utf8" || enc === "utf-8" || enc === "UTF-8") {
+    return new TextDecoder("utf-8").decode(bytes);
+  }
+  if (enc === "base64") return value.slice(BINARY_SENTINEL.length);
+  if (typeof enc === "object" && enc.encoding) return maybeDecodeBinary(value, enc.encoding);
+  return bytes;
+}
+
 // Look up a path in __USER_FILES (user-side text files like data.json that
 // route handlers read via fs.readFileSync). Embedded keys are paths relative
 // to outputFileTracingRoot; runtime requests come through process.cwd()
@@ -57,9 +85,11 @@ export const readFileSync = (filePath, enc) => {
       if (filePath.split("/").pop() === key.split("/").pop()) return val;
     }
   }
-  // Then try user-side data files (data.json, fixtures, etc.)
+  // Then try user-side data files (data.json, fixtures, fonts, etc.).
+  // Binary files are stored as base64 with a sentinel prefix — decode
+  // them lazily based on the caller's requested encoding.
   const userContent = findInUserFiles(filePath);
-  if (userContent !== undefined) return userContent;
+  if (userContent !== undefined) return maybeDecodeBinary(userContent, enc);
   // Throw ENOENT like real fs — Next.js loadManifest relies on this
   // to distinguish between missing and empty files.
   const err = new Error(`ENOENT: no such file or directory, open '${filePath}'`);

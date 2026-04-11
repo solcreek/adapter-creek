@@ -1165,12 +1165,14 @@ const __INTERNAL_FETCH_CONTEXT = new AsyncLocalStorage();
 globalThis.fetch = function(input, init) {
   // Edge asset bindings: Next.js's middleware-asset-loader rewrites
   // \`fetch(new URL('../assets/foo.ttf', import.meta.url))\` into
-  // \`fetch('blob:foo.{hash}.ttf')\` and emits the file bytes to
-  // \`.next/server/edge-chunks/asset_foo.{hash}.ttf\`. The upstream edge
-  // sandbox has a \`fetchInlineAsset\` shim that reads the file from disk;
-  // CF Workers have no fs, so at build time we copy the chunks under
-  // \`_next/edge-chunks/\` in the assets binding, and here we translate
-  // the blob URL into an ASSETS fetch.
+  // \`fetch('blob:<name>')\` and emits the file bytes to either
+  //   (a) \`.next/server/edge-chunks/asset_<name>\` (webpack + middleware path), or
+  //   (b) \`.next/server/edge/assets/<name>\` (Turbopack + edge route path)
+  // The upstream edge sandbox has a \`fetchInlineAsset\` shim that reads the
+  // file from disk; CF Workers have no fs, so at build time we copy the
+  // files into the assets binding under \`/_next/edge-chunks/\` (a) and
+  // \`/_next/edge-assets/\` (b) respectively, and here we translate the
+  // blob URL to the matching ASSETS fetch.
   const inputUrl =
     typeof input === "string"
       ? input
@@ -1184,7 +1186,13 @@ globalThis.fetch = function(input, init) {
     const store = __INTERNAL_FETCH_CONTEXT.getStore();
     const env = store?.env;
     if (env?.ASSETS && store?.origin) {
-      const assetUrl = new URL("/_next/edge-chunks/asset_" + name, store.origin);
+      // Turbopack emits \`blob:server/edge/assets/<filename>\` for edge-route
+      // \`new URL(..., import.meta.url)\` imports.
+      const edgeAssetsPrefix = "server/edge/assets/";
+      const assetPath = name.startsWith(edgeAssetsPrefix)
+        ? "/_next/edge-assets/" + name.slice(edgeAssetsPrefix.length)
+        : "/_next/edge-chunks/asset_" + name;
+      const assetUrl = new URL(assetPath, store.origin);
       return env.ASSETS.fetch(new Request(assetUrl));
     }
     return new Response(null, { status: 404 });

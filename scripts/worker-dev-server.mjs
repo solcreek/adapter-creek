@@ -159,10 +159,46 @@ if (!workerPath || !assetsDir) {
 globalThis.self = globalThis;
 
 const workerSource = await readFile(path.resolve(workerPath), "utf8");
-const patchedWorkerSource = workerSource.replace(
+let patchedWorkerSource = workerSource.replace(
   'import { DurableObject } from "cloudflare:workers";',
   "class DurableObject {}",
 );
+
+// WebAssembly module bindings for local dev:
+// When Next.js's edge route handlers use `next/og` (or any other `?module`
+// wasm imports), Turbopack compiles them into closures like
+// `() => wasm_<hash>`. The wasm bytes are dropped next to worker.js by
+// wrangler as `wasm_<hash>` (no extension), but wrangler never emits the
+// top-level `import wasm_<hash> from ...` binding that would make those
+// identifiers resolvable. In a real CF Workers deploy the wasm files are
+// picked up via the module-deploy format; for the local Node dev server
+// we can't use CF's ESM wasm import, so instead compile each wasm file
+// eagerly and prepend a `const wasm_<hash> = globalThis.__creek_wasm_<hash>`
+// binding that pulls from a process-global map we set up here.
+const workerDir = path.dirname(path.resolve(workerPath));
+const wasmHashes = new Set();
+for (const m of patchedWorkerSource.matchAll(/\bwasm_[0-9a-f]{32}\b/g)) {
+  wasmHashes.add(m[0]);
+}
+if (wasmHashes.size > 0) {
+  const bindingLines = [];
+  for (const ident of wasmHashes) {
+    const wasmPath = path.join(workerDir, ident);
+    try {
+      const buf = await readFile(wasmPath);
+      globalThis[`__creek_${ident}`] = new WebAssembly.Module(buf);
+      bindingLines.push(`const ${ident} = globalThis.__creek_${ident};`);
+    } catch (err) {
+      console.error(
+        `[worker-dev-server] Failed to load wasm module ${ident}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+  if (bindingLines.length > 0) {
+    patchedWorkerSource = bindingLines.join("\n") + "\n" + patchedWorkerSource;
+  }
+}
+
 const workerModule = await import(
   `data:text/javascript;base64,${Buffer.from(patchedWorkerSource).toString("base64")}`
 );

@@ -324,6 +324,36 @@ async function collectStaticFiles(
     }
   }
 
+  // Turbopack edge assets (\`.next/server/edge/assets/*\`). These are files
+  // referenced by edge route handlers via
+  // \`fetch(new URL('./asset.ttf', import.meta.url))\`. Turbopack rewrites
+  // the URL to \`blob:server/edge/assets/<hashed-filename>\` at build time;
+  // Next.js's edge sandbox uses \`fetchInlineAsset\` to translate the blob URL
+  // back to a filesystem read. CF Workers have no fs, so we mirror the
+  // files into the static assets binding under \`/_next/edge-assets/<name>\`
+  // and the runtime fetch wrapper in worker-entry.ts maps
+  // \`blob:server/edge/assets/<name>\` → \`/_next/edge-assets/<name>\`.
+  // \`next/og\` custom fonts (and any other \`new URL(..., import.meta.url)\`
+  // edge asset) goes through this path.
+  if (distDir) {
+    const edgeAssetsDir = path.join(distDir, "server", "edge", "assets");
+    try {
+      const entries = await fs.readdir(edgeAssetsDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const srcPath = path.join(edgeAssetsDir, entry.name);
+        const destPath = path.join(assetsDir, "_next", "edge-assets", entry.name);
+        await fs.mkdir(path.dirname(destPath), { recursive: true });
+        try {
+          await fs.copyFile(srcPath, destPath);
+          count++;
+        } catch {}
+      }
+    } catch {
+      // No edge assets dir — no Turbopack edge assets in this build.
+    }
+  }
+
   // Public files (\`<projectDir>/public/*\`). Next.js's adapter API does not
   // expose these via outputs.staticFiles (only \`_next/static/*\` lands there),
   // so we walk the directory ourselves and copy each file to the deployment
@@ -468,16 +498,18 @@ async function collectManifests(distDir: string): Promise<Record<string, string>
  * Collect non-code user files that route handlers may read via fs.readFileSync.
  *
  * Walks every output's `assets` map (Next.js file-trace results), filters out
- * node_modules and code files, and reads the remainder as utf-8 strings into
- * a record keyed by fileOutputPath (which is relative to outputFileTracingRoot).
+ * node_modules and code files, and reads the remainder into two maps:
+ *   - text files (.json, .txt, .yaml, etc.) are kept as utf-8 strings in the
+ *     `text` map, indexed by fileOutputPath (relative to outputFileTracingRoot).
+ *   - binary files (fonts, images, wasm, etc.) are base64-encoded into the
+ *     `binary` map with a `__CREEK_B64__` prefix so the fs shim can detect
+ *     them and decode to Uint8Array on read. This supports patterns like
+ *     `next/og` Node-runtime route handlers that do
+ *     `fs.readFile(join(cwd, 'assets/foo.ttf'))`.
  *
- * Binary files are skipped — supporting them would require base64 encoding and
- * a separate worker-entry path. Most use cases (test fixtures, CMS data, i18n
- * messages) only need text files.
- *
- * Size cap (2MB total) prevents accidentally bloating the worker bundle when a
- * project has large data assets — the user can hit it explicitly to force a
- * different deployment strategy.
+ * Size cap (2MB total across both maps) prevents accidentally bloating the
+ * worker bundle when a project has large data assets — the user can hit it
+ * explicitly to force a different deployment strategy.
  */
 async function collectUserFiles(
   outputs: BuildContext["outputs"],
@@ -486,7 +518,12 @@ async function collectUserFiles(
     ".json", ".txt", ".yaml", ".yml", ".md", ".csv", ".xml",
     ".html", ".htm", ".sql", ".graphql", ".gql", ".env",
   ]);
-  const MAX_TOTAL_BYTES = 2 * 1024 * 1024; // 2MB cap
+  const BINARY_EXTENSIONS = new Set([
+    ".ttf", ".otf", ".woff", ".woff2", ".eot",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico",
+    ".svg", ".wasm", ".pdf",
+  ]);
+  const MAX_TOTAL_BYTES = 4 * 1024 * 1024; // 4MB cap (base64 inflates binary)
 
   const files: Record<string, string> = {};
   let totalBytes = 0;
@@ -511,18 +548,35 @@ async function collectUserFiles(
       if (fileOutputPath.includes("node_modules/")) continue;
 
       const ext = path.extname(fileOutputPath).toLowerCase();
-      if (!TEXT_EXTENSIONS.has(ext)) continue;
+      const isText = TEXT_EXTENSIONS.has(ext);
+      const isBinary = BINARY_EXTENSIONS.has(ext);
+      if (!isText && !isBinary) continue;
 
       try {
-        const content = await fs.readFile(sourceFile, "utf-8");
-        if (totalBytes + content.length > MAX_TOTAL_BYTES) {
-          console.warn(
-            `  [Creek Adapter] User-files size cap reached (${MAX_TOTAL_BYTES} bytes); skipping ${fileOutputPath}`,
-          );
-          continue;
+        if (isText) {
+          const content = await fs.readFile(sourceFile, "utf-8");
+          if (totalBytes + content.length > MAX_TOTAL_BYTES) {
+            console.warn(
+              `  [Creek Adapter] User-files size cap reached (${MAX_TOTAL_BYTES} bytes); skipping ${fileOutputPath}`,
+            );
+            continue;
+          }
+          files[fileOutputPath] = content;
+          totalBytes += content.length;
+        } else {
+          // Binary path: base64-encode with a sentinel prefix so the fs
+          // shim can detect and decode.
+          const buffer = await fs.readFile(sourceFile);
+          const encoded = "__CREEK_B64__" + buffer.toString("base64");
+          if (totalBytes + encoded.length > MAX_TOTAL_BYTES) {
+            console.warn(
+              `  [Creek Adapter] User-files size cap reached (${MAX_TOTAL_BYTES} bytes); skipping ${fileOutputPath}`,
+            );
+            continue;
+          }
+          files[fileOutputPath] = encoded;
+          totalBytes += encoded.length;
         }
-        files[fileOutputPath] = content;
-        totalBytes += content.length;
       } catch {
         // Skip files we can't read — they may have been excluded by tracing
       }
