@@ -993,7 +993,22 @@ globalThis.fetch = function(input, init) {
   return __nativeFetch(input, init);
 };
 
+// Symbol used by Next.js's patch-fetch to track whether globalThis.fetch has
+// already been patched. The patch is one-shot per process — once set, future
+// patchFetch() calls short-circuit. On CF Workers a single isolate handles
+// many requests, which means the very first request "wins" the patch and
+// every subsequent request reuses the stale wrapper chain. The createDedupeFetch
+// layer in that chain holds a React.cache scope tied to the first render, so
+// repeat fetches in later requests bypass dedupe (val1 != val2 in the
+// "React fetch instrumentation" tests). Resetting both the symbol AND
+// globalThis.fetch back to our wrapper at the start of every request lets
+// patchFetch rebuild the chain fresh per-request.
+const __NEXT_PATCH_SYMBOL = Symbol.for("next-patch");
+const __ourFetchWrapper = globalThis.fetch;
 async function __handleRequest(request, env, ctx) {
+  // Reset patch state so Next.js will re-wrap fetch for this request.
+  globalThis.fetch = __ourFetchWrapper;
+  globalThis[__NEXT_PATCH_SYMBOL] = false;
   return __INTERNAL_FETCH_CONTEXT.run({ origin: new URL(request.url).origin, env, ctx }, async () => {
     try {
       __initManifests();
