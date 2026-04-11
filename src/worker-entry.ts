@@ -1712,13 +1712,30 @@ async function __handleRequest(request, env, ctx) {
           } else {
             // Try static 404 page from assets
             const notFoundPath = STATIC_PAGES["/404"]?.assetPath || "/404/index.html";
+            const fallbackHeaders = new Headers();
+            // Merge middleware response headers so tests like
+            // middleware-general's "should keep non data requests in
+            // their original shape" still see \`req-url-path\` /
+            // \`req-url-pathname\` on 404 responses.
+            if (result.resolvedHeaders) {
+              result.resolvedHeaders.forEach((val, key) => {
+                if (key.toLowerCase() === "set-cookie") fallbackHeaders.append(key, val);
+                else fallbackHeaders.set(key, val);
+              });
+            }
             try {
               const notFound = await env.ASSETS.fetch(new Request(new URL(notFoundPath, url.origin)));
               if (notFound.ok) {
-                return new Response(notFound.body, { status: 404, headers: notFound.headers });
+                notFound.headers.forEach((val, key) => {
+                  if (!fallbackHeaders.has(key)) fallbackHeaders.set(key, val);
+                });
+                return new Response(notFound.body, { status: 404, headers: fallbackHeaders });
               }
             } catch {}
-            return new Response("Not Found", { status: 404 });
+            if (!fallbackHeaders.has("content-type")) {
+              fallbackHeaders.set("content-type", "text/plain; charset=utf-8");
+            }
+            return new Response("Not Found", { status: 404, headers: fallbackHeaders });
           }
         }
       }
