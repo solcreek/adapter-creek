@@ -223,6 +223,7 @@ const ASSET_PREFIX_PATH = (() => {
 const ROUTING = ${JSON.stringify(opts.routing)};
 const PATHNAMES = ${JSON.stringify(pathnames)};
 const I18N = ${JSON.stringify(opts.i18n)};
+const HAS_MIDDLEWARE = ${JSON.stringify(!!opts.outputs.middleware)};
 
 // Static page map: request pathname → asset file path.
 // Pages Router static pages and auto-statically-optimized pages don't work
@@ -1231,6 +1232,17 @@ async function __handleRequest(request, env, ctx) {
     try {
       __initManifests();
       const url = new URL(request.url);
+      // Reject URLs with malformed percent-encoding up front. Next.js
+      // normally responds with 400 "Bad Request" for these (e.g. \`/%2\`)
+      // — see middleware-general's "should respond with 400 on decode
+      // failure" test — but our routing layer ends up treating them as
+      // a regular unmatched path and returning 200 or 404. Validate the
+      // pathname with \`decodeURIComponent\` so we can short-circuit.
+      try {
+        decodeURIComponent(url.pathname);
+      } catch {
+        return new Response("Bad Request", { status: 400 });
+      }
 
       // 1. Static assets via WfP ASSETS binding
       // /_next/data/ requests are Pages Router data fetches — must go through routing
@@ -1238,7 +1250,20 @@ async function __handleRequest(request, env, ctx) {
         ASSET_PREFIX_PATH && url.pathname.startsWith(ASSET_PREFIX_PATH + "/")
           ? url.pathname.slice(ASSET_PREFIX_PATH.length) || "/"
           : url.pathname;
-      if (assetPath.startsWith("/_next/") && !assetPath.startsWith("/_next/data/")) {
+      // Skip the early \`/_next/\` short-circuit when middleware is present:
+      // middleware's default matcher covers every path (including
+      // \`/_next/static/*\`), and tests like middleware-general's
+      // "should keep non data requests in their original shape" depend on
+      // middleware observing asset fetches so it can attach
+      // \`req-url-path\` / \`req-url-pathname\` headers to the response.
+      // Routing falls through to the static-asset lookup in step 4b when
+      // no handler matches, so assets are still served — just with the
+      // middleware response headers merged in.
+      if (
+        !HAS_MIDDLEWARE &&
+        assetPath.startsWith("/_next/") &&
+        !assetPath.startsWith("/_next/data/")
+      ) {
         try {
           // Strip asset prefix for ASSETS binding lookup
           const assetReq = ASSET_PREFIX
@@ -1714,6 +1739,20 @@ async function __handleRequest(request, env, ctx) {
         const edgeRequestUrl = new URL(request.url);
         if (result.invocationTarget?.pathname) {
           edgeRequestUrl.pathname = result.invocationTarget.pathname;
+        }
+        // Merge middleware-rewritten query params. When middleware calls
+        // \`NextResponse.rewrite(urlWithExtraSearch)\`, the extra search
+        // params land on \`result.resolvedQuery\` — we need to forward them
+        // to the edge handler's URL so \`req.nextUrl.searchParams\` sees
+        // them. Without this, pages-API tests like middleware-general's
+        // "passes search params with rewrites" lose the middleware-added
+        // \`foo=bar\` between the rewrite and the \`/api/edge-search-params\`
+        // handler.
+        if (result.resolvedQuery && typeof result.resolvedQuery === "object") {
+          for (const [key, value] of Object.entries(result.resolvedQuery)) {
+            if (edgeRequestUrl.searchParams.has(key)) continue;
+            appendSearchParam(edgeRequestUrl.searchParams, key, value);
+          }
         }
         if (handler.type === "APP_PAGE") {
           for (const [key, value] of Object.entries(edgeRequestQuery)) {
