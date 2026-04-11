@@ -1243,7 +1243,8 @@ async function __handleRequest(request, env, ctx) {
       // at build time. Their handlers require filesystem access that CF Workers
       // doesn't have, so we serve the HTML directly from assets.
       const servePath = resolvedPathname || url.pathname;
-      const staticAssetPath = STATIC_PAGES[servePath];
+      const staticEntry = STATIC_PAGES[servePath];
+      const staticAssetPath = staticEntry?.assetPath;
       const isAppRouterRSCRequest =
         request.headers.has("rsc") ||
         request.headers.has("next-router-state-tree") ||
@@ -1260,7 +1261,23 @@ async function __handleRequest(request, env, ctx) {
           if (assetRes.ok) {
             const headers = new Headers(assetRes.headers);
             headers.set("Content-Type", "text/html; charset=utf-8");
-            if (!headers.has("x-nextjs-cache") && (result.status || 200) === 200) {
+            // Prerender entries for pages calling notFound() / redirect() /
+            // permanentRedirect() carry initialStatus + initialHeaders. The
+            // status determines whether we return 404/307/308 vs 200, and the
+            // headers carry the redirect Location.
+            const prerenderStatus = staticEntry.status;
+            const finalStatus = prerenderStatus ?? result.status ?? 200;
+            if (staticEntry.headers) {
+              for (const [k, v] of Object.entries(staticEntry.headers)) {
+                if (Array.isArray(v)) {
+                  headers.delete(k);
+                  for (const vv of v) headers.append(k, vv);
+                } else {
+                  headers.set(k, v);
+                }
+              }
+            }
+            if (!headers.has("x-nextjs-cache") && finalStatus === 200) {
               headers.set("x-nextjs-cache", "HIT");
             }
             // Apply middleware resolved headers if present
@@ -1271,7 +1288,7 @@ async function __handleRequest(request, env, ctx) {
               });
             }
             return new Response(assetRes.body, {
-              status: result.status || 200,
+              status: finalStatus,
               headers,
             });
           }
@@ -1302,7 +1319,7 @@ async function __handleRequest(request, env, ctx) {
           if (!result.status) result = { ...result, status: 404 };
         } else {
           // Try static 404 page from assets
-          const notFoundPath = STATIC_PAGES["/404"] || "/404/index.html";
+          const notFoundPath = STATIC_PAGES["/404"]?.assetPath || "/404/index.html";
           try {
             const notFound = await env.ASSETS.fetch(new Request(new URL(notFoundPath, url.origin)));
             if (notFound.ok) {
@@ -1635,18 +1652,29 @@ function collectBootManifestPaths(manifests: Record<string, string>): string[] {
  * Handles the /index → / normalization: outputs.staticFiles uses /index
  * as the pathname for the root page, but resolveRoutes resolves to /.
  */
-function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, string> {
-  const map: Record<string, string> = {};
+interface StaticPageEntry {
+  assetPath: string;
+  // App router pages that call notFound() / redirect() / permanentRedirect()
+  // are pre-rendered to HTML at build time, but their HTTP status (404 / 307 /
+  // 308) and redirect Location header live in the prerender metadata. The
+  // worker has to apply both when serving the static HTML.
+  status?: number;
+  headers?: Record<string, string | string[]>;
+}
+
+function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, StaticPageEntry> {
+  const map: Record<string, StaticPageEntry> = {};
   for (const file of outputs.staticFiles) {
     // Only include HTML pages (no file extension), not _next/static/* assets
     if (!file.pathname.startsWith("/_next/") && !path.extname(file.pathname)) {
       const assetPath = path.join(file.pathname, "index.html");
+      const entry: StaticPageEntry = { assetPath };
       // Map the original pathname
-      map[file.pathname] = assetPath;
+      map[file.pathname] = entry;
       // Also map normalized form: /index → /, /foo/index → /foo
       if (file.pathname.endsWith("/index")) {
         const parent = file.pathname.slice(0, -6) || "/";
-        map[parent] = assetPath;
+        map[parent] = entry;
       }
     }
   }
@@ -1662,10 +1690,18 @@ function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, 
       ? path.join(prerender.pathname, "index.html")
       : prerender.pathname;
 
-    map[prerender.pathname] = assetPath;
+    const entry: StaticPageEntry = { assetPath };
+    if (typeof prerender.fallback.initialStatus === "number") {
+      entry.status = prerender.fallback.initialStatus;
+    }
+    if (prerender.fallback.initialHeaders) {
+      entry.headers = prerender.fallback.initialHeaders;
+    }
+
+    map[prerender.pathname] = entry;
     if (prerender.pathname.endsWith("/index")) {
       const parent = prerender.pathname.slice(0, -6) || "/";
-      map[parent] = assetPath;
+      map[parent] = entry;
     }
   }
   return map;
