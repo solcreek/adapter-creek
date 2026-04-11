@@ -26,6 +26,15 @@ mkdir -p "${PNPM_STORE_DIR}"
 export VERCEL_ENV="${VERCEL_ENV:-preview}"
 export VERCEL="${VERCEL:-1}"
 
+# Mirror what \`vercel deploy --build-env NEXT_PRIVATE_TEST_MODE=e2e\` does for
+# upstream Vercel adapter tests. The test harness writes a shim at the top of
+# each fixture's \`next.config.js\` that aliases NEXT_PRIVATE_TEST_MODE →
+# __NEXT_TEST_MODE so the Next.js client bundle's test-only instrumentation
+# (e.g. \`window.__NEXT_HYDRATED_AT\`, perf.measure('Next.js-hydration'))
+# actually ships in the build. Without this, tests asserting on those globals
+# receive \`undefined\`.
+export NEXT_PRIVATE_TEST_MODE="${NEXT_PRIVATE_TEST_MODE:-e2e}"
+
 log() {
   printf '[adapter-creek] %s %s\n' "$(date '+%H:%M:%S')" "$*" >&2
 }
