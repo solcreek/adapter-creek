@@ -366,6 +366,23 @@ function __getPrerenderManifest() {
   };
 }
 
+// Segment-prefetch inlining hints computed at build time. Next.js normally
+// reads \`.next/server/prefetch-hints.json\` in NextNodeServer's constructor
+// and stores it on \`this.renderOpts.prefetchHints\`, which later flows into
+// \`ctx.renderOpts.prefetchHints?.[pagePath]\` during walk-tree-with-flight-
+// router-state. We bypass NextNodeServer and invoke route modules directly,
+// so that plumbing never runs — meaning the initial FlightRouterState for
+// segment-prefetch responses ends up with the \`InlinedIntoChild\` hint bit
+// missing and \`experimental.prefetchInlining\` looks broken. Parse the
+// manifest here at init and patch \`routeModule.render\` to inject the hints
+// into \`context.renderOpts\` on the fly.
+let __prefetchHintsCache = null;
+function __getPrefetchHints() {
+  if (__prefetchHintsCache !== null) return __prefetchHintsCache;
+  __prefetchHintsCache = __parseJsonManifest("prefetch-hints.json", {}) || {};
+  return __prefetchHintsCache;
+}
+
 // Compile routes-manifest.json's dynamicRoutes into [{ regex, page, paramKeys }]
 // once at module init. The @next/routing layer only resolves URLs to handlers
 // via exact PATHNAMES match or via config-level rewrites — it doesn't expand
@@ -1640,6 +1657,34 @@ async function __handleRequest(request, env, ctx) {
         // Route module evaluation can install a singleton that assumes a
         // filesystem-backed runtime. Rebuild our proxy after the module loads.
         __initManifests();
+        // Inject build-time prefetch hints into context.renderOpts before
+        // the route module renders. Next.js's app-page template builds a
+        // fresh renderOpts object per request and never populates
+        // \`prefetchHints\` — that field is normally set on NextNodeServer's
+        // shared renderOpts in its constructor. Since we bypass
+        // NextNodeServer, we patch routeModule.render to copy the hints in.
+        // Without this, \`experimental.prefetchInlining\` routes emit a
+        // FlightRouterState with the InlinedIntoChild hint bit missing and
+        // every segment renders as \`outlined ■\`.
+        const rm = mod && mod.routeModule;
+        if (
+          rm &&
+          typeof rm.render === "function" &&
+          !rm.__creekRenderPatched
+        ) {
+          const origRender = rm.render.bind(rm);
+          rm.render = function (req, res, context) {
+            if (
+              context &&
+              context.renderOpts &&
+              context.renderOpts.prefetchHints == null
+            ) {
+              context.renderOpts.prefetchHints = __getPrefetchHints();
+            }
+            return origRender(req, res, context);
+          };
+          rm.__creekRenderPatched = true;
+        }
       }
 
       if (handler.runtime === "edge") {
