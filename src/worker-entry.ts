@@ -819,9 +819,26 @@ const middlewareHandler = async (mwCtx) => {
     }
     if (typeof handler !== "function") return {};
 
-    const mwReq = new Request(mwCtx.url, {
+    // Strip Next.js flight headers before middleware sees them. The upstream
+    // edge adapter does the same — middleware gets a clean request without
+    // RSC / router-state-tree / segment-prefetch noise. Without this strip,
+    // user middleware that gates on these headers (e.g. "is this an RSC
+    // request?") gets the wrong answer for client-side navigation.
+    const FLIGHT_HEADERS = [
+      "rsc",
+      "next-router-state-tree",
+      "next-router-prefetch",
+      "next-router-segment-prefetch",
+      "next-hmr-refresh",
+    ];
+    const mwHeaders = new Headers(mwCtx.headers);
+    for (const h of FLIGHT_HEADERS) mwHeaders.delete(h);
+    const mwUrlClean = new URL(mwCtx.url.toString());
+    mwUrlClean.searchParams.delete("_rsc");
+
+    const mwReq = new Request(mwUrlClean, {
       method: mwCtx.requestBody ? "POST" : "GET",
-      headers: mwCtx.headers,
+      headers: mwHeaders,
       body: mwCtx.requestBody,
     });
     let response;
@@ -839,7 +856,7 @@ const middlewareHandler = async (mwCtx) => {
       return {};
     }
     console.error("[creek-mw]", mwCtx.url?.pathname, "status:", response.status, "location:", response.headers.get("location"), "x-mw-rewrite:", response.headers.get("x-middleware-rewrite"));
-    const mwResult = responseToMiddlewareResult(response, mwCtx.headers, mwCtx.url);
+    const mwResult = responseToMiddlewareResult(response, mwHeaders, mwCtx.url);
     return mwResult;
   } catch (err) {
     console.error("[creek-mw] Error:", err instanceof Error ? err.stack || err.message : String(err));
@@ -853,13 +870,26 @@ const middlewareHandler = async (mwCtx) => {
   try {
     const handler = __middleware_mod.handler || __middleware_mod.default;
     if (typeof handler !== "function") return {};
-    const mwReq = new Request(mwCtx.url, {
+    // Mirror the edge middleware path: strip flight headers and the _rsc
+    // search param so middleware sees a clean request.
+    const FLIGHT_HEADERS = [
+      "rsc",
+      "next-router-state-tree",
+      "next-router-prefetch",
+      "next-router-segment-prefetch",
+      "next-hmr-refresh",
+    ];
+    const mwHeaders = new Headers(mwCtx.headers);
+    for (const h of FLIGHT_HEADERS) mwHeaders.delete(h);
+    const mwUrlClean = new URL(mwCtx.url.toString());
+    mwUrlClean.searchParams.delete("_rsc");
+    const mwReq = new Request(mwUrlClean, {
       method: mwCtx.requestBody ? "POST" : "GET",
-      headers: mwCtx.headers,
+      headers: mwHeaders,
       body: mwCtx.requestBody,
     });
     const response = await handler(mwReq, {});
-    return responseToMiddlewareResult(response, mwCtx.headers, mwCtx.url);
+    return responseToMiddlewareResult(response, mwHeaders, mwCtx.url);
   } catch {
     return {};
   }
