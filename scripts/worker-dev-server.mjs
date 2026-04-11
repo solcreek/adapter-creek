@@ -158,6 +158,24 @@ if (!workerPath || !assetsDir) {
 
 globalThis.self = globalThis;
 
+// Polyfill URLPattern for local dev. CF Workers (and Edge runtime) expose
+// URLPattern as a global, so \`next/server\`'s conditional export
+// (\`typeof URLPattern !== "undefined" ? URLPattern : undefined\`) picks it
+// up. Node.js through v22 doesn't have it yet (experimental behind a flag
+// in v23), which means middleware that uses \`new URLPattern(...)\` — and
+// any test fixture that imports \`URLPattern\` from \`next/server\` — crashes
+// with "re is not a constructor". Install the polyfill before importing
+// the worker so the bundled check succeeds.
+if (typeof globalThis.URLPattern === "undefined") {
+  try {
+    const { URLPattern } = await import("urlpattern-polyfill");
+    globalThis.URLPattern = URLPattern;
+  } catch {
+    // Polyfill missing from devDeps — middleware using URLPattern will
+    // fail loudly at first invocation.
+  }
+}
+
 const workerSource = await readFile(path.resolve(workerPath), "utf8");
 let patchedWorkerSource = workerSource.replace(
   'import { DurableObject } from "cloudflare:workers";',

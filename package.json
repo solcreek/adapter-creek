@@ -54,6 +54,7 @@
     "@types/node": "^22.13.10",
     "next": "16.2.3",
     "typescript": "^5.8.2",
+    "urlpattern-polyfill": "^10.1.0",
     "vitest": "^4.1.2"
   }
 }
