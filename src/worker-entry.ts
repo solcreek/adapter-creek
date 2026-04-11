@@ -119,6 +119,31 @@ import ${JSON.stringify(alsPolyfillPath)};
 import { AsyncLocalStorage } from "node:async_hooks";
 if (!globalThis.AsyncLocalStorage) globalThis.AsyncLocalStorage = AsyncLocalStorage;
 
+// Patch globalThis.Request BEFORE any Next.js code evaluates. Node's Request
+// constructor throws \`RequestInit: duplex option is required when sending a
+// body\` whenever init.body is a ReadableStream without \`duplex: "half"\`.
+// NextRequest's constructor normally sets \`init.duplex = "half"\` for Node
+// compatibility, but only when \`process.env.NEXT_RUNTIME !== "edge"\`. We
+// pretend to be the edge runtime (so the edge chunks take the edge code path),
+// which makes NextRequest skip its own duplex fix — and the underlying Node
+// Request then throws. Auto-injecting duplex here fixes both paths without
+// having to switch NEXT_RUNTIME.
+if (typeof globalThis.Request === "function") {
+  const __OrigRequest = globalThis.Request;
+  class __PatchedRequest extends __OrigRequest {
+    constructor(input, init) {
+      if (init && init.body != null && init.duplex === undefined) {
+        init = Object.assign({}, init, { duplex: "half" });
+      }
+      super(input, init);
+    }
+  }
+  // Copy over static methods (e.g. Request.redirect isn't defined, but be safe)
+  Object.setPrototypeOf(__PatchedRequest, __OrigRequest);
+  Object.defineProperty(__PatchedRequest, "name", { value: "Request" });
+  globalThis.Request = __PatchedRequest;
+}
+
 // Polyfill process methods and env that Next.js uses.
 if (typeof process !== "undefined") {
   if (!process.env) process.env = {};
@@ -885,10 +910,48 @@ const middlewareHandler = async (mwCtx) => {
     const mwUrlClean = new URL(mwCtx.url.toString());
     mwUrlClean.searchParams.delete("_rsc");
 
+    // Materialize the request body into a Uint8Array so that downstream code
+    // (NextRequest, user middleware, req.json()/text()/formData()) can
+    // construct new Request instances without the \`duplex: "half"\` init
+    // option that Node enforces whenever body is a ReadableStream. The
+    // middleware-general "Edge can read request body" tests rely on this
+    // because their middleware calls req.json() / req.text() / req.formData(),
+    // each of which may trigger an internal NextRequest wrap that fails with
+    // \`RequestInit: duplex option is required when sending a body\` when
+    // given a streamed body.
+    let mwBodyBuffer = null;
+    if (mwCtx.requestBody) {
+      try {
+        if (typeof mwCtx.requestBody.getReader === "function") {
+          const chunks = [];
+          const reader = mwCtx.requestBody.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) chunks.push(value);
+          }
+          if (chunks.length > 0) {
+            const total = chunks.reduce((s, c) => s + c.byteLength, 0);
+            mwBodyBuffer = new Uint8Array(total);
+            let offset = 0;
+            for (const c of chunks) {
+              mwBodyBuffer.set(c, offset);
+              offset += c.byteLength;
+            }
+          } else {
+            mwBodyBuffer = new Uint8Array(0);
+          }
+        } else if (mwCtx.requestBody instanceof Uint8Array) {
+          mwBodyBuffer = mwCtx.requestBody;
+        }
+      } catch (readErr) {
+        console.error("[creek-mw] body read error:", readErr instanceof Error ? readErr.message : String(readErr));
+      }
+    }
     const mwReq = new Request(mwUrlClean, {
-      method: mwCtx.requestBody ? "POST" : "GET",
+      method: mwBodyBuffer ? "POST" : "GET",
       headers: mwHeaders,
-      body: mwCtx.requestBody,
+      body: mwBodyBuffer,
     });
     let response;
     try {
@@ -944,10 +1007,38 @@ const middlewareHandler = async (mwCtx) => {
     for (const h of FLIGHT_HEADERS) mwHeaders.delete(h);
     const mwUrlClean = new URL(mwCtx.url.toString());
     mwUrlClean.searchParams.delete("_rsc");
+    // See edge variant for rationale: buffer body to avoid duplex issues.
+    let mwBodyBuffer = null;
+    if (mwCtx.requestBody) {
+      try {
+        if (typeof mwCtx.requestBody.getReader === "function") {
+          const chunks = [];
+          const reader = mwCtx.requestBody.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            if (value) chunks.push(value);
+          }
+          if (chunks.length > 0) {
+            const total = chunks.reduce((s, c) => s + c.byteLength, 0);
+            mwBodyBuffer = new Uint8Array(total);
+            let offset = 0;
+            for (const c of chunks) {
+              mwBodyBuffer.set(c, offset);
+              offset += c.byteLength;
+            }
+          } else {
+            mwBodyBuffer = new Uint8Array(0);
+          }
+        } else if (mwCtx.requestBody instanceof Uint8Array) {
+          mwBodyBuffer = mwCtx.requestBody;
+        }
+      } catch {}
+    }
     const mwReq = new Request(mwUrlClean, {
-      method: mwCtx.requestBody ? "POST" : "GET",
+      method: mwBodyBuffer ? "POST" : "GET",
       headers: mwHeaders,
-      body: mwCtx.requestBody,
+      body: mwBodyBuffer,
     });
     const response = await handler(mwReq, {});
     const mwResult = responseToMiddlewareResult(response, mwHeaders, mwCtx.url);
