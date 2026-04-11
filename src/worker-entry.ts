@@ -1464,6 +1464,17 @@ async function __handleRequest(request, env, ctx) {
       if (resolvedPathname && !HANDLERS[resolvedPathname]) {
         if (HANDLERS[resolvedPathname + "/index"]) resolvedPathname = resolvedPathname + "/index";
       }
+      // Root alias: the routing layer exposes the Pages Router root as
+      // \`/index\` in HANDLERS (and PATHNAMES), not \`/\`. When the incoming
+      // request is for \`/\` and nothing else matched, try \`/index\`
+      // directly. Without this, the root page 404s whenever a Pages
+      // Router app has _document.getInitialProps (forces SSR — page lives
+      // in HANDLERS under \`/index\`, STATIC_PAGES is empty).
+      if (url.pathname === "/" && (!resolvedPathname || !HANDLERS[resolvedPathname])) {
+        if (HANDLERS["/index"]) {
+          resolvedPathname = "/index";
+        }
+      }
       // Trailing-slash normalization. \`@next/routing\` does exact pathname
       // matching and is unaware of Next.js's \`trailingSlash\` config. When
       // the config is \`trailingSlash: true\`, Next.js redirects \`/foo\` →
