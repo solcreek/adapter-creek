@@ -415,6 +415,25 @@ function __matchDynamicRoute(pathname) {
   return null;
 }
 
+// Merge the original request's query string into a redirect Location when
+// the Location is a path-only template (e.g. the trailingSlash: true
+// \`beforeMiddleware\` rule declares \`headers: { Location: "/$1/" }\` — no
+// query). Without this, following the redirect strips user-supplied query
+// params and the downstream page handler sees an empty search.
+//
+// Important: we only apply this to RELATIVE Locations. Middleware that
+// explicitly calls \`NextResponse.redirect(new URL('/dest', request.url))\`
+// produces an absolute URL and deliberately wants the query dropped — we
+// must not smuggle the original query back in for that case.
+function __preserveQuery(location, originalSearch) {
+  if (!location || !originalSearch) return location;
+  // Only path-only Locations get the query preservation treatment. Absolute
+  // URLs (http://, https://, //host) always convey intent as-is.
+  if (!location.startsWith("/") || location.startsWith("//")) return location;
+  if (location.includes("?")) return location;
+  return location + originalSearch;
+}
+
 function __getEdgeRouteEnvs() {
   const manifest = __parseJsonManifest("middleware-manifest.json", null);
   if (!manifest) return {};
@@ -1338,14 +1357,30 @@ async function __handleRequest(request, env, ctx) {
           headers: { Location: result.redirect.url.toString() },
         });
       }
-      // Middleware redirects: resolveRoutes returns Location in resolvedHeaders + 3xx status
-      // (not as result.redirect) when middleware calls NextResponse.redirect().
+      // Middleware and config redirects: resolveRoutes returns Location in
+      // resolvedHeaders + 3xx status (not as result.redirect) when
+      // NextResponse.redirect() fires, OR when the routing manifest's
+      // \`beforeMiddleware\` rules set an onMatch Location header pattern
+      // (e.g. the trailingSlash: true redirect, whose destination is
+      // declared as \`headers: { Location: "/$1/" }\`).
+      //
+      // For the trailingSlash case specifically, routing emits a
+      // path-only Location AND still resolves a handler (resolvedPathname
+      // is set), which signals this is an "internal path normalization"
+      // — we need to preserve the original query string or the follow-up
+      // request loses user-supplied params like \`?href=/about\`.
+      // For middleware-explicit redirects (resolvedPathname undefined),
+      // the user chose the destination deliberately and we must not
+      // smuggle the original query back in.
       if (result.status && result.status >= 300 && result.status < 400 && result.resolvedHeaders) {
         const location = result.resolvedHeaders.get("location") || result.resolvedHeaders.get("Location");
         if (location) {
+          const shouldPreserveQuery = !!result.resolvedPathname;
+          const finalLocation = shouldPreserveQuery
+            ? __preserveQuery(location, url.search)
+            : location;
           const headers = new Headers();
-          headers.set("Location", location);
-          // Forward other middleware headers (e.g., x-redirect-header)
+          headers.set("Location", finalLocation);
           result.resolvedHeaders.forEach((val, key) => {
             if (key.toLowerCase() !== "location") headers.set(key, val);
           });
@@ -1428,6 +1463,32 @@ async function __handleRequest(request, env, ctx) {
       // Try index route: /foo → /foo/index or /foo/page
       if (resolvedPathname && !HANDLERS[resolvedPathname]) {
         if (HANDLERS[resolvedPathname + "/index"]) resolvedPathname = resolvedPathname + "/index";
+      }
+      // Trailing-slash normalization. \`@next/routing\` does exact pathname
+      // matching and is unaware of Next.js's \`trailingSlash\` config. When
+      // the config is \`trailingSlash: true\`, Next.js redirects \`/foo\` →
+      // \`/foo/\` via a routes-manifest 308 rewrite — but the follow-up
+      // request for \`/foo/\` lands here with no resolvedPathname because
+      // PATHNAMES only has \`/foo\`. Strip the trailing slash and retry the
+      // handler lookup so Pages Router + trailingSlash: true pages work.
+      // Also catch the static-page variant via STATIC_PAGES (auto-static
+      // optimized pages live there, not HANDLERS).
+      if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
+        const pn = url.pathname;
+        if (pn !== "/" && pn.endsWith("/")) {
+          const stripped = pn.slice(0, -1);
+          if (HANDLERS[stripped]) {
+            resolvedPathname = stripped;
+          } else if (STATIC_PAGES[stripped]) {
+            // STATIC_PAGES lookup runs against \`servePath\` below, and
+            // \`servePath\` falls back to \`url.pathname\` with the trailing
+            // slash when \`resolvedPathname\` is unset. Setting it here
+            // forces the static-serve branch to use the stripped path so
+            // auto-static-optimized Pages Router routes resolve under
+            // \`trailingSlash: true\`.
+            resolvedPathname = stripped;
+          }
+        }
       }
       // 4a. Static pages — serve pre-rendered HTML from assets.
       // Pages Router static pages and auto-optimized pages are pre-rendered
