@@ -341,6 +341,55 @@ function __getPrerenderManifest() {
   };
 }
 
+// Compile routes-manifest.json's dynamicRoutes into [{ regex, page, paramKeys }]
+// once at module init. The @next/routing layer only resolves URLs to handlers
+// via exact PATHNAMES match or via config-level rewrites — it doesn't expand
+// app-router dynamic patterns like \`/catch-all/[...slug]\`. The worker has to
+// do that itself when the routing layer returns no resolvedPathname, otherwise
+// every dynamic URL 404s.
+let __compiledDynamicRoutes = null;
+function __getCompiledDynamicRoutes() {
+  if (__compiledDynamicRoutes) return __compiledDynamicRoutes;
+  __compiledDynamicRoutes = [];
+  try {
+    const raw = __findManifestEntry("routes-manifest.json");
+    if (!raw) return __compiledDynamicRoutes;
+    const manifest = JSON.parse(raw[1]);
+    if (!Array.isArray(manifest.dynamicRoutes)) return __compiledDynamicRoutes;
+    for (const route of manifest.dynamicRoutes) {
+      if (!route?.page || !route?.namedRegex) continue;
+      // routeKeys maps the param name in namedRegex (e.g. "nxtPslug") to the
+      // user-facing key ("slug"). We keep the namedRegex group names as-is
+      // so the matched groups carry the nxtP prefix that the app router
+      // expects to identify and strip from searchParams.
+      const paramKeys = route.routeKeys ? Object.keys(route.routeKeys) : [];
+      try {
+        __compiledDynamicRoutes.push({
+          page: route.page,
+          regex: new RegExp(route.namedRegex),
+          paramKeys,
+        });
+      } catch {}
+    }
+  } catch {}
+  return __compiledDynamicRoutes;
+}
+
+function __matchDynamicRoute(pathname) {
+  for (const entry of __getCompiledDynamicRoutes()) {
+    const m = entry.regex.exec(pathname);
+    if (!m) continue;
+    const params = {};
+    if (m.groups) {
+      for (const [k, v] of Object.entries(m.groups)) {
+        if (v != null) params[k] = decodeURIComponent(v);
+      }
+    }
+    return { page: entry.page, params };
+  }
+  return null;
+}
+
 function __getEdgeRouteEnvs() {
   const manifest = __parseJsonManifest("middleware-manifest.json", null);
   if (!manifest) return {};
@@ -1238,6 +1287,27 @@ async function __handleRequest(request, env, ctx) {
       if (resolvedPathname && !HANDLERS[resolvedPathname]) {
         if (HANDLERS[resolvedPathname + "/index"]) resolvedPathname = resolvedPathname + "/index";
       }
+      // Dynamic-route fallback. The @next/routing layer only does exact-match
+      // resolution against PATHNAMES (or via config rewrites/redirects); it
+      // does not expand app-router dynamic patterns. So a request to
+      // \`/catch-all/hello/world\` lands here with no resolvedPathname even
+      // though there's a \`/catch-all/[...slug]\` handler in HANDLERS. Compile
+      // routes-manifest.json's dynamicRoutes into a regex table at module
+      // init and try them now. On match, set resolvedPathname to the
+      // handler's bracketed pathname and merge the captured params into
+      // routeMatches so getNormalizedRouteParams() picks them up.
+      if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
+        const dyn = __matchDynamicRoute(url.pathname);
+        if (dyn && HANDLERS[dyn.page]) {
+          resolvedPathname = dyn.page;
+          if (Object.keys(dyn.params).length > 0) {
+            result = {
+              ...result,
+              routeMatches: { ...(result.routeMatches || {}), ...dyn.params },
+            };
+          }
+        }
+      }
       // 4a. Static pages — serve pre-rendered HTML from assets.
       // Pages Router static pages and auto-optimized pages are pre-rendered
       // at build time. Their handlers require filesystem access that CF Workers
@@ -1639,6 +1709,19 @@ function collectHandlers(
   return handlers;
 }
 
+// Decide whether a `outputs.staticFiles` entry is a page (HTML body) we
+// should serve from STATIC_PAGES, vs a real asset file (.js/.css/.png etc.)
+// that the ASSETS binding handles directly. Page paths look like \`/about\`
+// or \`/catch-all/[...slug]\`. We can't just check `path.extname()`: a Next.js
+// dynamic segment like `[...slug]` contains dots and `extname` returns
+// `.slug]`, which would incorrectly classify catch-all pages as assets.
+function __isStaticPagePathname(pathname: string): boolean {
+  if (pathname.startsWith("/_next/")) return false;
+  // Bracketed dynamic segments → always a page, ignore the fake extname.
+  if (pathname.includes("[")) return true;
+  return !path.extname(pathname);
+}
+
 /**
  * Find JS manifests that need to execute before edge runtime modules evaluate.
  * This includes top-level manifest globals and all per-page client-reference manifests.
@@ -1688,8 +1771,10 @@ interface StaticPageEntry {
 function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, StaticPageEntry> {
   const map: Record<string, StaticPageEntry> = {};
   for (const file of outputs.staticFiles) {
-    // Only include HTML pages (no file extension), not _next/static/* assets
-    if (!file.pathname.startsWith("/_next/") && !path.extname(file.pathname)) {
+    // Only include HTML pages, not _next/static/* assets. Use the bracket-aware
+    // helper so dynamic segments like /catch-all/[...slug] aren't misclassified
+    // as having a file extension.
+    if (__isStaticPagePathname(file.pathname)) {
       const assetPath = path.join(file.pathname, "index.html");
       const entry: StaticPageEntry = { assetPath };
       // Map the original pathname

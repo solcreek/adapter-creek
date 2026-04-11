@@ -243,6 +243,19 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   console.log(`  [Creek Adapter] Output ready: ${OUTPUT_DIR}/`);
 }
 
+// True for static-file entries that represent a pre-rendered HTML page
+// (e.g. \`/about\`, \`/catch-all/[...slug]\`) rather than a real asset like
+// \`/_next/static/foo.js\`. We can't just check `path.extname()`: a Next.js
+// dynamic segment like `[...slug]` contains dots and `extname` returns
+// `.slug]`, which would misclassify catch-all pages as assets and skip the
+// `index.html` rewrite below — leaving the served file at \`/catch-all/[...slug]\`
+// where the worker can't find it.
+function isStaticHtmlPage(pathname: string): boolean {
+  if (pathname.startsWith("/_next/")) return false;
+  if (pathname.includes("[")) return true;
+  return !path.extname(pathname);
+}
+
 async function collectStaticFiles(
   outputs: BuildContext["outputs"],
   assetsDir: string,
@@ -253,8 +266,8 @@ async function collectStaticFiles(
 
   for (const file of outputs.staticFiles) {
     let destRelative = file.pathname;
-    if (!path.extname(destRelative)) {
-      // Extensionless static files are pre-rendered HTML pages (e.g. /, /about, /404).
+    if (isStaticHtmlPage(destRelative)) {
+      // Pre-rendered HTML pages (e.g. /, /about, /404, /catch-all/[...slug]).
       // Store as <pathname>/index.html so CF Workers Assets serves them correctly.
       destRelative = path.join(destRelative, "index.html");
     }
@@ -269,7 +282,7 @@ async function collectStaticFiles(
   for (const prerender of outputs.prerenders) {
     if (prerender.fallback?.filePath) {
       let destRelative = prerender.pathname;
-      if (!path.extname(destRelative)) {
+      if (isStaticHtmlPage(destRelative)) {
         destRelative = destRelative + "/index.html";
       }
       const destPath = path.join(assetsDir, destRelative);
