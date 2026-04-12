@@ -2110,8 +2110,16 @@ async function __handleRequest(request, env, ctx) {
             // but doesn't know the original request was unmatched.
             if (!result.status) result = { ...result, status: 404 };
           } else {
-            // Try static 404 page from assets
-            const notFoundPath = STATIC_PAGES["/404"]?.assetPath || "/404/index.html";
+            // Try static 404 page from assets. For basePath apps the
+            // 404 HTML is at /docs/404/index.html — prepend BASE_PATH
+            // to the candidate paths so the ASSETS binding finds it.
+            const notFoundCandidates = [];
+            if (STATIC_PAGES["/404"]?.assetPath) {
+              notFoundCandidates.push(STATIC_PAGES["/404"].assetPath);
+            }
+            if (BASE_PATH) notFoundCandidates.push(BASE_PATH + "/404/index.html");
+            notFoundCandidates.push("/404/index.html");
+            const notFoundPath = notFoundCandidates[0];
             const fallbackHeaders = new Headers();
             // Merge middleware response headers so tests like
             // middleware-general's "should keep non data requests in
@@ -2124,12 +2132,14 @@ async function __handleRequest(request, env, ctx) {
               });
             }
             try {
-              const notFound = await env.ASSETS.fetch(new Request(new URL(notFoundPath, url.origin)));
-              if (notFound.ok) {
-                notFound.headers.forEach((val, key) => {
-                  if (!fallbackHeaders.has(key)) fallbackHeaders.set(key, val);
-                });
-                return new Response(notFound.body, { status: 404, headers: fallbackHeaders });
+              for (const candidate of notFoundCandidates) {
+                const notFound = await env.ASSETS.fetch(new Request(new URL(candidate, url.origin)));
+                if (notFound.ok) {
+                  notFound.headers.forEach((val, key) => {
+                    if (!fallbackHeaders.has(key)) fallbackHeaders.set(key, val);
+                  });
+                  return new Response(notFound.body, { status: 404, headers: fallbackHeaders });
+                }
               }
             } catch {}
             if (!fallbackHeaders.has("content-type")) {
