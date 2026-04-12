@@ -1658,6 +1658,37 @@ async function __handleRequest(request, env, ctx) {
         });
       }
 
+      // Middleware-prefetch short-circuit: the Pages Router client sends
+      // /_next/data/ prefetch requests with \`x-middleware-prefetch: 1\` to
+      // discover routing metadata (rewrites/redirects) WITHOUT fetching the
+      // full page data. Real Next.js responds with a minimal JSON \`{}\`
+      // body plus headers like \`x-nextjs-rewrite\` and
+      // \`x-nextjs-matched-path\`, and the client caches this routing info.
+      // When the user clicks the Link, a FULL data request fires — without
+      // the \`x-middleware-prefetch\` header — and the client captures it as
+      // a real network request. Without this short-circuit, our worker runs
+      // the full SSP handler on prefetch, the client caches the complete
+      // data, and the subsequent click uses the cache → no visible request
+      // → the "allows shallow linking with middleware" test fails because
+      // the deep-link click doesn't generate the expected _next/data fetch.
+      if (request.headers.get("x-middleware-prefetch") === "1") {
+        const mwPrefetchHeaders = new Headers();
+        mwPrefetchHeaders.set("content-type", "application/json");
+        mwPrefetchHeaders.set("x-middleware-skip", "1");
+        if (result.mwRewrite) {
+          mwPrefetchHeaders.set("x-nextjs-rewrite", result.mwRewrite);
+        }
+        if (result.invocationTarget?.pathname) {
+          mwPrefetchHeaders.set("x-nextjs-matched-path", result.invocationTarget.pathname);
+        }
+        if (result.resolvedHeaders) {
+          result.resolvedHeaders.forEach((val, key) => {
+            if (!mwPrefetchHeaders.has(key)) mwPrefetchHeaders.set(key, val);
+          });
+        }
+        return new Response("{}", { status: 200, headers: mwPrefetchHeaders });
+      }
+
       // Strip Next.js internal sentinel values from route matches. The
       // sentinel format is \`$nxtP{paramName}\` (e.g. \`$nxtPslug\`,
       // \`$nxtPrest\`), used for empty optional catch-all segments. Match by
