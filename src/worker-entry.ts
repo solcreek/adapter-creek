@@ -2376,6 +2376,37 @@ async function __handleRequest(request, env, ctx) {
       });
     }
   } catch {}
+  // Strip stale Content-Encoding from dynamic responses. Edge API routes
+  // commonly do \`fetch(remoteUrl)\` and forward the Response — fetch()
+  // automatically decompresses brotli/gzip bodies, but the remote's
+  // \`Content-Encoding: br\` header stays attached to the new Response.
+  // When that response reaches a downstream client (e.g. node-fetch in
+  // the test harness), it tries to decompress already-plain bytes and
+  // fails with "Decompression failed". We only strip for non-static
+  // content-types to avoid breaking cached immutable assets that are
+  // genuinely compressed.
+  try {
+    if (
+      response &&
+      typeof response.headers?.has === "function" &&
+      response.headers.has("content-encoding")
+    ) {
+      const url2 = new URL(request.url);
+      const isStaticAsset = url2.pathname.startsWith("/_next/static/") ||
+        url2.pathname.startsWith("/_next/image");
+      if (!isStaticAsset) {
+        const headers = new Headers(response.headers);
+        headers.delete("content-encoding");
+        headers.delete("content-length");
+        headers.delete("transfer-encoding");
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
+      }
+    }
+  } catch {}
   return response;
 }
 
