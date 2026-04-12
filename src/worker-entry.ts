@@ -579,6 +579,55 @@ function __shouldRunMiddleware(url, headers) {
   return false;
 }
 
+// Manually re-apply ROUTING.beforeFiles rewrites and check if the
+// destination is a path-only target (potential public file). The routing
+// layer applies these internally but only surfaces \`invocationTarget\` for
+// destinations that match a known PATHNAME — so a rewrite to \`/file.txt\`
+// (a /public asset) gets silently dropped. Returns the destination
+// pathname if a rewrite matches and looks file-like, else null.
+function __resolveRewriteToPublicFile(url, headers) {
+  if (!ROUTING || !Array.isArray(ROUTING.beforeFiles)) return null;
+  // Apply the same locale prefix the routing layer applies internally.
+  let candidatePath = url.pathname;
+  if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+    const seg = url.pathname.split("/")[1] || "";
+    if (!I18N.locales.includes(seg)) {
+      const def = I18N.defaultLocale || I18N.locales[0];
+      candidatePath = "/" + def + url.pathname;
+    }
+  }
+  for (const rule of ROUTING.beforeFiles) {
+    if (!rule || !rule.sourceRegex || !rule.destination) continue;
+    let regex;
+    try { regex = new RegExp(rule.sourceRegex, "i"); } catch { continue; }
+    const match = candidatePath.match(regex);
+    if (!match) continue;
+    // Substitute $1, $2, ... and named groups into destination.
+    let dest = rule.destination;
+    for (let i = 1; i < match.length; i++) {
+      if (match[i] !== undefined) {
+        dest = dest.replace(new RegExp("\\\\$" + i, "g"), match[i]);
+      }
+    }
+    if (match.groups) {
+      for (const [k, v] of Object.entries(match.groups)) {
+        if (v !== undefined) dest = dest.replace(new RegExp("\\\\$" + k, "g"), v);
+      }
+    }
+    // Only treat as a potential public file if the destination is path-only,
+    // doesn't start with /api/, and looks file-like (has an extension).
+    const destPath = dest.split("?")[0];
+    if (
+      destPath.startsWith("/") &&
+      !destPath.startsWith("/api/") &&
+      /\\.[a-zA-Z0-9]+$/.test(destPath)
+    ) {
+      return destPath;
+    }
+  }
+  return null;
+}
+
 // Compile routes-manifest.json's dynamicRoutes into [{ regex, page, paramKeys }]
 // once at module init. The @next/routing layer only resolves URLs to handlers
 // via exact PATHNAMES match or via config-level rewrites — it doesn't expand
@@ -1517,6 +1566,17 @@ async function __handleRequest(request, env, ctx) {
       // we have to defer until after resolveRoutes, but to skip routing on
       // (a) we evaluate it eagerly.
       let nextDataAppRouterPath = null;
+      // For Pages Router static pages, the upstream adapter API only
+      // registers data routes (\`/_next/data/<buildId>/<page>.json\` →
+      // page handler) for DYNAMIC pages or when middleware is present
+      // (see needsMiddlewareResolveRoutes in build-complete.ts). Static
+      // pages with getServerSideProps/getStaticProps don't get a data
+      // route, so resolveRoutes returns no match for their data URLs.
+      // Capture the page path here and pre-rewrite the URL passed to
+      // routing so it can find the handler. The original data URL
+      // semantics (JSON response, x-nextjs-data header) are preserved
+      // by checking BASE_PATH-aware url.pathname later.
+      let staticPagesDataRoutePath = null;
       if (assetPath.startsWith("/_next/data/")) {
         const dataMatch = assetPath.match(/^\\/_next\\/data\\/([^/]+)\\/(.+)\\.json$/);
         if (dataMatch && dataMatch[1] === BUILD_ID) {
@@ -1531,6 +1591,9 @@ async function __handleRequest(request, env, ctx) {
             return new Response("{}", { status: 200, headers });
           }
           nextDataAppRouterPath = candidate;
+          if (handler && (handler.type === "PAGES" || handler.type === "PAGES_API")) {
+            staticPagesDataRoutePath = handler.pathname || lookup;
+          }
         }
       }
 
@@ -1690,8 +1753,16 @@ async function __handleRequest(request, env, ctx) {
         }
         return mwRes;
       };
+      // For static Pages Router data URLs, rewrite the routing URL to
+      // the page path so resolveRoutes can find the handler. We keep
+      // the original \`url\` reference unchanged; \`invokeNodeHandler\`
+      // reconstructs req.url from the original request to preserve
+      // the data-URL prefix that Pages Router's render layer looks for.
+      const __routingUrl = staticPagesDataRoutePath
+        ? new URL((BASE_PATH || "") + staticPagesDataRoutePath + (url.search || ""), url.origin)
+        : new URL(request.url);
       let result = await resolveRoutes({
-        url: new URL(request.url),
+        url: __routingUrl,
         buildId: BUILD_ID,
         basePath: BASE_PATH,
         // Pass i18n so the routing layer prepends the default locale to
@@ -1753,7 +1824,8 @@ async function __handleRequest(request, env, ctx) {
         // perform client-side navigation to the redirect target — a
         // real 3xx would be followed by the browser (losing the SPA
         // state) OR blocked by CORS if the target is external.
-        const isDataReq = url.pathname.startsWith("/_next/data/");
+        const isDataReq = url.pathname.startsWith("/_next/data/") ||
+          (BASE_PATH && url.pathname.startsWith(BASE_PATH + "/_next/data/"));
         const redirectUrl = result.redirect.url.toString();
         if (isDataReq) {
           const headers = new Headers();
@@ -1792,7 +1864,8 @@ async function __handleRequest(request, env, ctx) {
           // Data-request redirect: same as result.redirect branch above —
           // return 200 + x-nextjs-redirect so the Pages Router client
           // performs soft navigation instead of a browser-forced hard nav.
-          const isDataReq = url.pathname.startsWith("/_next/data/");
+          const isDataReq = url.pathname.startsWith("/_next/data/") ||
+          (BASE_PATH && url.pathname.startsWith(BASE_PATH + "/_next/data/"));
           if (isDataReq) {
             const headers = new Headers();
             headers.set("content-type", "application/json");
@@ -2202,6 +2275,35 @@ async function __handleRequest(request, env, ctx) {
           }
         }
 
+        // Before falling back to 404, try the rewrite target as a public
+        // file (e.g. \`/file.txt\` from /public). i18n-ignore-rewrite-source-locale
+        // exercises this: \`/<locale>/rewrite-files/file.txt\` rewrites to
+        // \`/file.txt\` (locale: false). The rewrite target isn't a route
+        // in PATHNAMES, but it's a real file under /public — serve it from
+        // ASSETS before declaring 404.
+        // Before falling back to 404, try the rewrite target as a public
+        // file. i18n-ignore-rewrite-source-locale exercises this:
+        // \`/<locale>/rewrite-files/file.txt\` (locale: false) rewrites to
+        // \`/file.txt\`. resolveRoutes applies the rewrite but doesn't
+        // surface invocationTarget when the destination isn't a registered
+        // PATHNAME — so we manually re-apply the beforeFiles rewrites and
+        // check if the destination is a static asset.
+        if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
+          const candidate = __resolveRewriteToPublicFile(url, request.headers);
+          if (candidate) {
+            try {
+              const candidates = [];
+              if (BASE_PATH) candidates.push(BASE_PATH + candidate);
+              candidates.push(candidate);
+              for (const cand of candidates) {
+                const assetRes = await env.ASSETS.fetch(
+                  new Request(new URL(cand, url.origin))
+                );
+                if (assetRes.ok) return assetRes;
+              }
+            } catch {}
+          }
+        }
         // If still no handler, fall back to SSR _not-found handler or static 404.
         if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
           if (HANDLERS["/_not-found"]) {
@@ -2429,14 +2531,46 @@ async function __handleRequest(request, env, ctx) {
       // Streaming SSR: use TransformStream so chunks flow to the client
       // as Next.js writes them, enabling Server Components streaming,
       // PPR shell delivery, and progressive HTML rendering.
+      let __invokedResponse;
       if (handler.runtime === "nodejs" && handler.type === "APP_PAGE") {
-        return await __withMinimalWorkStore(
+        __invokedResponse = await __withMinimalWorkStore(
           handler.pathname,
           ctx,
           () => invokeNodeHandler(request, mod, ctx, result, handler.pathname),
         );
+      } else {
+        __invokedResponse = await invokeNodeHandler(request, mod, ctx, result, handler.pathname);
       }
-      return await invokeNodeHandler(request, mod, ctx, result, handler.pathname);
+      // For Pages Router page errors (status 500 from getServerSideProps
+      // throwing) on a NON-data URL navigation, replace our generic JSON
+      // error body with the static 500.html page so the browser renders
+      // the proper Pages Router error UI (and \`_app\` re-mounts, restoring
+      // \`window.*\` globals like the test event-log helper).
+      // Data URL requests keep the JSON 500 — Pages Router's
+      // \`fetchNextData\` reads the body as text and only checks the
+      // status code to emit \`routeChangeError\`.
+      if (
+        __invokedResponse &&
+        __invokedResponse.status === 500 &&
+        handler.type === "PAGES" &&
+        !staticPagesDataRoutePath &&
+        !nextDataAppRouterPath
+      ) {
+        try {
+          const candidates = [];
+          if (BASE_PATH) candidates.push(BASE_PATH + "/500/index.html");
+          candidates.push("/500/index.html");
+          for (const candidate of candidates) {
+            const res500 = await env.ASSETS.fetch(new Request(new URL(candidate, url.origin)));
+            if (res500.ok) {
+              const headers = new Headers();
+              headers.set("content-type", "text/html; charset=utf-8");
+              return new Response(res500.body, { status: 500, headers });
+            }
+          }
+        } catch {}
+      }
+      return __invokedResponse;
     } catch (err) {
       const msg = err instanceof Error ? (err.stack || err.message) : String(err);
       return new Response(JSON.stringify({ error: "ssr_error", message: msg }), {
@@ -2464,7 +2598,8 @@ async function __handleRequest(request, env, ctx) {
     if (
       response &&
       typeof response.headers?.has === "function" &&
-      url.pathname.startsWith("/_next/data/") &&
+      (url.pathname.startsWith("/_next/data/") ||
+        (BASE_PATH && url.pathname.startsWith(BASE_PATH + "/_next/data/"))) &&
       !response.headers.has("x-nextjs-deployment-id")
     ) {
       const headers = new Headers(response.headers);
@@ -2992,9 +3127,20 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   // header as a signal; we set it here so both checks agree.
   // Fixes middleware-general's client-transition tests (router.push()
   // triggers a data fetch that must return JSON for the SPA to update).
-  const isPagesDataRequest = url.pathname.startsWith("/_next/data/");
+  // For basePath apps the original URL is /<basePath>/_next/data/...
+  // — keep req.url as the original (without basePath stripping) so
+  // Next.js's render layer recognizes the data-URL pattern.
+  const isPagesDataRequest = url.pathname.startsWith("/_next/data/") ||
+    (BASE_PATH && url.pathname.startsWith(BASE_PATH + "/_next/data/"));
   if (isPagesDataRequest) {
-    req.url = url.pathname + (targetQuery || "");
+    // Strip basePath from the URL so Next.js's data URL parser
+    // (which expects \`/_next/data/<buildId>/<page>.json\` exactly)
+    // recognizes it.
+    let dataPath = url.pathname;
+    if (BASE_PATH && dataPath.startsWith(BASE_PATH + "/")) {
+      dataPath = dataPath.slice(BASE_PATH.length);
+    }
+    req.url = dataPath + (targetQuery || "");
   } else {
     req.url = targetUrl + targetQuery;
   }
