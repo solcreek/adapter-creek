@@ -2097,7 +2097,23 @@ async function __handleRequest(request, env, ctx) {
         // /_not-found. Letting the fallback re-route to the bracketed
         // App Router handler would bypass that enforcement and turn 404s
         // into 200s with the wrong content.
-        const dyn = __matchDynamicRoute(url.pathname);
+        // For i18n builds, strip the locale prefix before matching against
+        // routes-manifest dynamic routes. The routes-manifest contains
+        // locale-less patterns like /[first]/[second]/[third]; without
+        // stripping, a locale-prefixed path like /es/first/second/unknown
+        // (4 segments) would match /[first]/[second]/[third]/[fourth]
+        // instead of /[first]/[second]/[third] — giving the wrong handler
+        // and bypassing fallback:false 404 enforcement. Fixes
+        // i18n-fallback-collision "should 404 properly for fallback:false
+        // non-prerendered /es/first/second/non-existent".
+        let matchPathname = url.pathname;
+        if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+          const firstSeg = url.pathname.split("/")[1] || "";
+          if (I18N.locales.includes(firstSeg)) {
+            matchPathname = url.pathname.slice(firstSeg.length + 1) || "/";
+          }
+        }
+        const dyn = __matchDynamicRoute(matchPathname);
         if (dyn && HANDLERS[dyn.page] && HANDLERS[dyn.page].type === "PAGES") {
           // Prerender fallback: false — if the route is a fallback:false
           // SSG route and the matched slug is NOT in the prerendered route
