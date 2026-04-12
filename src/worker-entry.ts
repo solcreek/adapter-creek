@@ -1473,13 +1473,17 @@ async function __handleRequest(request, env, ctx) {
         if (mwRes && mwRes.rewrite && I18N && Array.isArray(I18N.locales)) {
           try {
             const rewriteUrl = new URL(mwRes.rewrite.toString());
+            // External rewrites (different origin) must not be locale-
+            // prefixed — we're proxying to a foreign service that knows
+            // nothing about our i18n config.
+            const isExternal = rewriteUrl.origin !== mwCtx.url.origin;
             const firstSegment = rewriteUrl.pathname.split("/")[1] || "";
             const hasLocale = I18N.locales.includes(firstSegment);
             const pn = rewriteUrl.pathname;
             const isNonLocalePath =
               pn.startsWith("/api/") || pn === "/api" ||
               pn.startsWith("/_next/") || pn.startsWith("/_static/");
-            if (!hasLocale && !isNonLocalePath) {
+            if (!isExternal && !hasLocale && !isNonLocalePath) {
               const incomingFirst = mwCtx.url.pathname.split("/")[1] || "";
               const locale = I18N.locales.includes(incomingFirst)
                 ? incomingFirst
@@ -1628,10 +1632,29 @@ async function __handleRequest(request, env, ctx) {
             }
           } catch {}
         }
-        return fetch(result.externalRewrite.toString(), {
+        const upstream = await fetch(result.externalRewrite.toString(), {
           method: request.method,
           headers: request.headers,
           body: request.body,
+        });
+        // \`fetch\` already transparently decompressed the upstream body,
+        // so the response we return downstream is uncompressed bytes —
+        // but the upstream \`Content-Encoding: gzip\` (or brotli) header
+        // is still set, and handing that combination to node-fetch on
+        // the test harness side triggers \`FetchError: incorrect header
+        // check\` when it tries to re-decompress an already-plain body.
+        // Strip the encoding-related headers and let the runtime
+        // re-compute Content-Length as needed.
+        const cleanHeaders = new Headers();
+        upstream.headers.forEach((val, key) => {
+          const k = key.toLowerCase();
+          if (k === "content-encoding" || k === "content-length" || k === "transfer-encoding") return;
+          cleanHeaders.append(key, val);
+        });
+        return new Response(upstream.body, {
+          status: upstream.status,
+          statusText: upstream.statusText,
+          headers: cleanHeaders,
         });
       }
 
@@ -2725,19 +2748,17 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     if (!h.has("x-nextjs-cache") && h.get("x-nextjs-prerender") === "1") {
       h.set("x-nextjs-cache", "PRERENDER");
     }
-    // Pages Router client reads \`x-nextjs-rewrite\` on data responses to
-    // determine the "virtual" URL the user was trying to navigate to
-    // (when middleware rewrote the request). It uses the rewrite URL to
-    // update router.asPath + router.query after a client transition.
-    // Our middleware wrapper captures the final (post-i18n-normalization)
-    // rewrite path into routeResult.mwRewrite — echo it back here on
-    // Pages Router data responses so the client merges the rewrite
-    // query params into router.query.
-    if (
-      isPagesDataRequest &&
-      routeResult?.mwRewrite &&
-      !h.has("x-nextjs-rewrite")
-    ) {
+    // Pages Router client reads \`x-nextjs-rewrite\` on both data
+    // responses and initial HTML responses to track the "virtual" URL
+    // the user navigated to when middleware rewrote the request. It
+    // uses the rewrite URL to update router.asPath + router.query and
+    // to keep the SPA router coherent across client transitions —
+    // without it, Link clicks from a middleware-rewritten initial load
+    // fall back to a hard navigation (the router can't reconcile
+    // pathname vs. the rendered \`__NEXT_DATA__.page\`). Echo back the
+    // rewrite captured in routeResult.mwRewrite whenever middleware
+    // supplied one.
+    if (routeResult?.mwRewrite && !h.has("x-nextjs-rewrite")) {
       h.set("x-nextjs-rewrite", routeResult.mwRewrite);
     }
     // Drop Content-Length for HTML responses: the quirks-mode rewriter and
