@@ -1513,11 +1513,16 @@ async function __handleRequest(request, env, ctx) {
       // ASSETS binding (which serves files copied from /public). On miss, we
       // fall through to routing so user-defined routes with extensions still
       // work (rare, but valid).
+      // When middleware is present and its matchers match this URL, skip
+      // the early asset serve so middleware can intercept the request.
+      // Tests like middleware-static-files depend on middleware being able
+      // to rewrite /file.svg → a JSON API response.
       if (
         request.method === "GET" &&
         !assetPath.startsWith("/_next/") &&
         !assetPath.startsWith("/api/") &&
-        /\\.[a-zA-Z0-9]+$/.test(assetPath)
+        /\\.[a-zA-Z0-9]+$/.test(assetPath) &&
+        !(HAS_MIDDLEWARE && __shouldRunMiddleware(url, request.headers))
       ) {
         try {
           const assetRes = await env.ASSETS.fetch(request);
