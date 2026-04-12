@@ -122,7 +122,19 @@ log "next build complete"
 
 # Save build metadata
 BUILD_ID=$(cat .next/BUILD_ID 2>/dev/null || echo "unknown")
-HEALTHCHECK_PATH="/_next/static/${BUILD_ID}/_buildManifest.js"
+# Detect basePath from the build output so the health check URL is correct.
+# Apps with basePath (e.g. "/docs") serve static assets at /docs/_next/...
+# instead of /_next/...; without this, the health check 404s and the deploy
+# script exits with "Server failed to start within 60s".
+# Read from required-server-files.json (already built) which is more reliable
+# than parsing next.config.js directly (handles TS, ESM, functions, etc.).
+BASE_PATH=$(node -e "
+  try {
+    const f = require('fs').readFileSync('.next/required-server-files.json','utf8');
+    console.log(JSON.parse(f).config.basePath || '');
+  } catch { console.log(''); }
+" 2>/dev/null || echo "")
+HEALTHCHECK_PATH="${BASE_PATH}/_next/static/${BUILD_ID}/_buildManifest.js"
 
 # Local test server runs the generated worker directly in Node to avoid
 # wrangler/miniflare buffering streamed action responses.

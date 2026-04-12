@@ -1446,10 +1446,19 @@ async function __handleRequest(request, env, ctx) {
 
       // 1. Static assets via WfP ASSETS binding
       // /_next/data/ requests are Pages Router data fetches — must go through routing
-      const assetPath =
-        ASSET_PREFIX_PATH && url.pathname.startsWith(ASSET_PREFIX_PATH + "/")
-          ? url.pathname.slice(ASSET_PREFIX_PATH.length) || "/"
-          : url.pathname;
+      // Strip basePath and assetPrefix from the URL to normalize the
+      // pathname for both routing and asset serving. Apps with
+      // basePath: "/docs" serve assets at /docs/_next/static/... but
+      // the routing layer and PATHNAMES use unprefixed paths.
+      let assetPath = url.pathname;
+      if (BASE_PATH && assetPath.startsWith(BASE_PATH + "/")) {
+        assetPath = assetPath.slice(BASE_PATH.length) || "/";
+      } else if (BASE_PATH && assetPath === BASE_PATH) {
+        assetPath = "/";
+      }
+      if (ASSET_PREFIX_PATH && assetPath.startsWith(ASSET_PREFIX_PATH + "/")) {
+        assetPath = assetPath.slice(ASSET_PREFIX_PATH.length) || "/";
+      }
       // Skip the early \`/_next/\` short-circuit when middleware is present:
       // middleware's default matcher covers every path (including
       // \`/_next/static/*\`), and tests like middleware-general's
@@ -1465,10 +1474,13 @@ async function __handleRequest(request, env, ctx) {
         !assetPath.startsWith("/_next/data/")
       ) {
         try {
-          // Strip asset prefix for ASSETS binding lookup
-          const assetReq = ASSET_PREFIX
-            ? new Request(new URL(assetPath, url.origin), { headers: request.headers })
-            : request;
+          // For basePath apps, the ASSETS binding stores files WITH the
+          // basePath prefix (/docs/_next/static/...) so we must use the
+          // ORIGINAL url.pathname for the fetch — not the stripped
+          // assetPath. The assetPath stripping above is only for the
+          // startsWith("/_next/") routing check.
+          const assetUrl = new URL(url.pathname, url.origin);
+          const assetReq = new Request(assetUrl, { headers: request.headers });
           const assetRes = await env.ASSETS.fetch(assetReq);
           if (assetRes.ok) return assetRes;
         } catch {}
