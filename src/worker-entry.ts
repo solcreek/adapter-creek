@@ -244,12 +244,26 @@ function __normalizeRoutingRedirects(routing) {
         const loc = rule.headers?.Location || rule.headers?.location;
         if (loc && !rule.destination) rule.destination = loc;
       }
+      // Next.js defaults to case-insensitive routing (routes-manifest
+      // caseSensitive: false). @next/routing compiles our
+      // \`rule.sourceRegex\` string with \`new RegExp(sourceRegex)\` —
+      // default case-sensitive. Swap the string for a RegExp instance
+      // carrying the \`i\` flag so that a URL like /rewrite-no-basePath
+      // (camelCase) still matches a rule declared as /rewrite-no-basepath.
+      // new RegExp(regexInstance) copies the flags, so downstream
+      // re-compilations preserve case-insensitivity.
+      if (typeof rule.sourceRegex === "string") {
+        try { rule.sourceRegex = new RegExp(rule.sourceRegex, "i"); } catch {}
+      }
     }
     return rules;
   };
   patchList(routing.beforeMiddleware);
   patchList(routing.beforeFiles);
   patchList(routing.afterFiles);
+  patchList(routing.dynamicRoutes);
+  patchList(routing.onMatch);
+  patchList(routing.fallback);
   return routing;
 }
 __normalizeRoutingRedirects(ROUTING);
