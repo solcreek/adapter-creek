@@ -1429,6 +1429,7 @@ async function __handleRequest(request, env, ctx) {
       // body.
       let mwModifiedRequestHeaders = null;
       let mwCapturedResponse = null;
+      let mwCapturedRewrite = null;
       const wrappedMiddlewareHandler = async (mwCtx) => {
         const mwRes = await middlewareHandler(mwCtx);
         if (mwRes && mwRes.requestHeaders) {
@@ -1436,6 +1437,51 @@ async function __handleRequest(request, env, ctx) {
         }
         if (mwRes && mwRes.__mwResponse) {
           mwCapturedResponse = mwRes.__mwResponse;
+        }
+        // i18n rewrite normalization: @next/routing prepends the default
+        // locale to the INITIAL incoming URL before middleware runs, but
+        // does not re-prepend after a middleware rewrite. When user
+        // middleware calls \`NextResponse.rewrite('/blog/from-middleware')\`
+        // (no locale prefix), the routing layer tries to match
+        // \`/blog/from-middleware\` against PATHNAMES, which for i18n builds
+        // only contain locale-prefixed entries like \`/en/blog/[slug]\`.
+        // The match fails and we 404. Detect: if the rewrite URL is
+        // missing a locale segment AND the path isn't a non-locale
+        // namespace (/api/*, /_next/*, /_static/*), prepend the
+        // currently-detected locale. Fixes middleware-general's
+        // "should have correct dynamic route params for middleware rewrite
+        // to dynamic route" and friends.
+        if (mwRes && mwRes.rewrite && I18N && Array.isArray(I18N.locales)) {
+          try {
+            const rewriteUrl = new URL(mwRes.rewrite.toString());
+            const firstSegment = rewriteUrl.pathname.split("/")[1] || "";
+            const hasLocale = I18N.locales.includes(firstSegment);
+            const pn = rewriteUrl.pathname;
+            const isNonLocalePath =
+              pn.startsWith("/api/") || pn === "/api" ||
+              pn.startsWith("/_next/") || pn.startsWith("/_static/");
+            if (!hasLocale && !isNonLocalePath) {
+              const incomingFirst = mwCtx.url.pathname.split("/")[1] || "";
+              const locale = I18N.locales.includes(incomingFirst)
+                ? incomingFirst
+                : I18N.defaultLocale;
+              if (locale) {
+                rewriteUrl.pathname = "/" + locale + (rewriteUrl.pathname === "/" ? "" : rewriteUrl.pathname);
+                mwRes.rewrite = rewriteUrl;
+              }
+            }
+            // Capture the final rewrite URL (post-i18n normalization) so
+            // the Pages Router data response can echo it back via
+            // \`x-nextjs-rewrite\`. The client reads that header to update
+            // router.query and router.asPath after a client-transition
+            // that was rewritten by middleware.
+            mwCapturedRewrite = rewriteUrl.pathname + (rewriteUrl.search || "");
+          } catch {}
+        } else if (mwRes && mwRes.rewrite) {
+          try {
+            const rewriteUrl = new URL(mwRes.rewrite.toString());
+            mwCapturedRewrite = rewriteUrl.pathname + (rewriteUrl.search || "");
+          } catch {}
         }
         return mwRes;
       };
@@ -1461,6 +1507,9 @@ async function __handleRequest(request, env, ctx) {
       });
       if (mwModifiedRequestHeaders) {
         result = { ...result, mwRequestHeaders: mwModifiedRequestHeaders };
+      }
+      if (mwCapturedRewrite) {
+        result = { ...result, mwRewrite: mwCapturedRewrite };
       }
       // @next/routing's \`checkDynamicRoutes\` helper is called from inside
       // the afterFiles loop with an already-rewritten URL and iterates
@@ -2656,6 +2705,21 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     }
     if (!h.has("x-nextjs-cache") && h.get("x-nextjs-prerender") === "1") {
       h.set("x-nextjs-cache", "PRERENDER");
+    }
+    // Pages Router client reads \`x-nextjs-rewrite\` on data responses to
+    // determine the "virtual" URL the user was trying to navigate to
+    // (when middleware rewrote the request). It uses the rewrite URL to
+    // update router.asPath + router.query after a client transition.
+    // Our middleware wrapper captures the final (post-i18n-normalization)
+    // rewrite path into routeResult.mwRewrite — echo it back here on
+    // Pages Router data responses so the client merges the rewrite
+    // query params into router.query.
+    if (
+      isPagesDataRequest &&
+      routeResult?.mwRewrite &&
+      !h.has("x-nextjs-rewrite")
+    ) {
+      h.set("x-nextjs-rewrite", routeResult.mwRewrite);
     }
     // Drop Content-Length for HTML responses: the quirks-mode rewriter and
     // data-dpl-id injector in \`__rewriteFirstChunk\` can expand the first
