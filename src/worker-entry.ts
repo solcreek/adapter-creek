@@ -221,6 +221,38 @@ const ASSET_PREFIX_PATH = (() => {
   return ASSET_PREFIX.startsWith("/") ? ASSET_PREFIX.replace(/\\/$/, "") : "";
 })();
 const ROUTING = ${JSON.stringify(opts.routing)};
+// Normalize ROUTING: when Next.js emits a redirect rule via \`beforeMiddleware\`
+// it sets \`headers.Location\` + \`status\` in the 3xx range but sometimes
+// omits the \`destination\` field. @next/routing's \`processRoutes\` loop
+// only short-circuits (and returns the redirect) when a matched rule has
+// BOTH \`destination\` AND a redirect header — otherwise it just writes the
+// Location header and keeps iterating. For i18n builds this means the
+// more-specific rule (\`/en/redirect-1\` → \`/somewhere/else\`) matches first
+// but doesn't return early, and a later less-specific rule
+// (\`/:locale/redirect-1\` → \`/$1/somewhere/else\`) overwrites Location with
+// a locale-prefixed target. Test: middleware-general "should redirect the
+// same for direct visit and client-transition" expects /somewhere/else, we
+// were returning /en/somewhere/else. Fill in \`destination\` from the
+// Location header so the first match wins.
+function __normalizeRoutingRedirects(routing) {
+  if (!routing || typeof routing !== "object") return routing;
+  const patchList = (rules) => {
+    if (!Array.isArray(rules)) return rules;
+    for (const rule of rules) {
+      if (!rule || typeof rule !== "object") continue;
+      if (typeof rule.status === "number" && rule.status >= 300 && rule.status < 400) {
+        const loc = rule.headers?.Location || rule.headers?.location;
+        if (loc && !rule.destination) rule.destination = loc;
+      }
+    }
+    return rules;
+  };
+  patchList(routing.beforeMiddleware);
+  patchList(routing.beforeFiles);
+  patchList(routing.afterFiles);
+  return routing;
+}
+__normalizeRoutingRedirects(ROUTING);
 const PATHNAMES = ${JSON.stringify(pathnames)};
 const I18N = ${JSON.stringify(opts.i18n)};
 const HAS_MIDDLEWARE = ${JSON.stringify(!!opts.outputs.middleware)};
