@@ -1714,6 +1714,65 @@ async function __handleRequest(request, env, ctx) {
         // into 200s with the wrong content.
         const dyn = __matchDynamicRoute(url.pathname);
         if (dyn && HANDLERS[dyn.page] && HANDLERS[dyn.page].type === "PAGES") {
+          // Prerender fallback: false — if the route is a fallback:false
+          // SSG route and the matched slug is NOT in the prerendered route
+          // list, the page doesn't exist. Pages Router's own handler has
+          // a 404 branch (\`j2.end("This page could not be found")\`) but
+          // that code path doesn't set statusCode, so the response comes
+          // back as 200. Short-circuit here: check the prerender manifest
+          // for a matching (locale-prefixed) prerendered route; if none,
+          // return 404 directly before the handler ever runs.
+          // Fixes middleware-general's "should handle 404 on fallback:
+          // false route correctly".
+          try {
+            const prerenderManifest = __getPrerenderManifest();
+            const dynamicRoute = prerenderManifest?.dynamicRoutes?.[dyn.page];
+            if (dynamicRoute && dynamicRoute.fallback === false) {
+              const prerenderedRoutes = prerenderManifest?.routes || {};
+              // Try to find a prerendered path that matches the current
+              // request. Accept either the raw url.pathname or a
+              // locale-prefixed variant.
+              const candidates = [url.pathname];
+              if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+                const firstSeg = url.pathname.split("/")[1] || "";
+                if (!I18N.locales.includes(firstSeg)) {
+                  for (const locale of I18N.locales) {
+                    candidates.push("/" + locale + url.pathname);
+                  }
+                }
+              }
+              const found = candidates.some((c) => prerenderedRoutes[c] != null);
+              if (!found) {
+                const headers = new Headers();
+                if (result?.resolvedHeaders) {
+                  result.resolvedHeaders.forEach((val, key) => {
+                    if (key.toLowerCase() === "set-cookie") headers.append(key, val);
+                    else headers.set(key, val);
+                  });
+                }
+                headers.set("content-type", "text/html; charset=utf-8");
+                // Prefer a pre-rendered 404 page from assets; fall back to
+                // text/plain "Not Found" if the asset isn't available.
+                try {
+                  const locale = I18N?.defaultLocale || "";
+                  const tried = [];
+                  if (locale) tried.push("/" + locale + "/404/index.html");
+                  tried.push("/404/index.html");
+                  for (const path of tried) {
+                    const res404 = await env.ASSETS.fetch(new Request(new URL(path, url.origin)));
+                    if (res404.ok) {
+                      res404.headers.forEach((val, key) => {
+                        if (!headers.has(key)) headers.set(key, val);
+                      });
+                      return new Response(res404.body, { status: 404, headers });
+                    }
+                  }
+                } catch {}
+                headers.set("content-type", "text/plain; charset=utf-8");
+                return new Response("Not Found", { status: 404, headers });
+              }
+            }
+          } catch {}
           resolvedPathname = dyn.page;
           if (Object.keys(dyn.params).length > 0) {
             result = {
