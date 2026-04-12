@@ -2108,7 +2108,11 @@ async function __handleRequest(request, env, ctx) {
       const canServeStaticPage =
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
-        !isAppRouterRSCRequest;
+        !isAppRouterRSCRequest &&
+        // Data URL requests must return JSON, not the prerendered HTML.
+        // Pages Router's fetchNextData calls .json() on the body —
+        // serving HTML breaks soft navigation and skew detection.
+        !nextDataAppRouterPath;
       if (staticAssetPath && canServeStaticPage) {
         try {
           const assetRes = await env.ASSETS.fetch(
@@ -2317,15 +2321,33 @@ async function __handleRequest(request, env, ctx) {
         // Pages Router static-page data URL fallback: if this is a
         // \`/_next/data/<id>/<page>.json\` request that maps to a known
         // pre-rendered static page (no getStaticProps/SSP, so no handler
-        // was registered), respond with minimal \`{pageProps:{}}\` JSON.
-        // Without this, fetchNextData treats the 404 as an asset error
-        // and falls back to a hard navigation — see middleware-redirects
-        // "should implement internal redirects". Real Next.js returns
-        // \`{pageProps:{}}\` here.
+        // was registered), respond with the pre-rendered SSG data file
+        // from assets if it exists, otherwise minimal \`{pageProps:{}}\`
+        // JSON. Without this, fetchNextData treats the 404 as an asset
+        // error and falls back to a hard navigation — see
+        // middleware-redirects "should implement internal redirects".
         if (
           (!resolvedPathname || !HANDLERS[resolvedPathname]) &&
           nextDataAppRouterPath
         ) {
+          // First try fetching the actual prerendered data file from ASSETS
+          // (SSG pages with getStaticProps emit /_next/data/<id>/<page>.json).
+          try {
+            const dataAssetUrl = new URL(url.pathname, url.origin);
+            const dataAssetRes = await env.ASSETS.fetch(
+              new Request(dataAssetUrl, { headers: request.headers })
+            );
+            if (dataAssetRes.ok) {
+              const headers = new Headers(dataAssetRes.headers);
+              if (!headers.has("x-nextjs-deployment-id")) {
+                headers.set("x-nextjs-deployment-id", BUILD_ID);
+              }
+              return new Response(dataAssetRes.body, {
+                status: 200,
+                headers,
+              });
+            }
+          } catch {}
           // Build candidate set: bare path, /index variant, and locale-
           // prefixed variants. Static i18n pages are emitted as
           // \`/<locale>/<page>\` (root: \`/<locale>\`); the bare \`/\` page
