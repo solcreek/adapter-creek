@@ -1961,6 +1961,19 @@ async function __handleRequest(request, env, ctx) {
               return new Response("{}", { status: 200, headers });
             }
           } catch {}
+          // Pages Router data URL with truly-external rewrite: don't proxy
+          // the body. Return 200 + \`x-nextjs-rewrite\` so fetchNextData
+          // surfaces a \`redirect-external\` effect → hard navigation to
+          // the rewritten URL. Proxying would deliver HTML where the
+          // client expects JSON.
+          // Fixes middleware-rewrites "should override with rewrite
+          // externally correctly".
+          const externalUrl = result.externalRewrite.toString();
+          const headers = new Headers();
+          headers.set("content-type", "application/json");
+          headers.set("x-nextjs-rewrite", externalUrl);
+          headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
+          return new Response("{}", { status: 200, headers });
         }
         // \`duplex: 'half'\` is required by the Node/Undici fetch when
         // forwarding a streaming request body — without it Node throws
@@ -2132,8 +2145,36 @@ async function __handleRequest(request, env, ctx) {
       // Pages Router static pages and auto-optimized pages are pre-rendered
       // at build time. Their handlers require filesystem access that CF Workers
       // doesn't have, so we serve the HTML directly from assets.
-      const servePath = resolvedPathname || url.pathname;
-      const staticEntry = STATIC_PAGES[servePath];
+      // For SSG fallback:true pages, generateStaticParams pre-renders specific
+      // slugs (/fallback-true-blog/build-time-1) AND the fallback shell
+      // (/fallback-true-blog/[slug]). resolvedPathname is the bracket form
+      // — but we should prefer the specific slug's prerender over the
+      // fallback shell when the URL matches one. Try the literal URL path
+      // (with default locale prefix) before the bracket form.
+      let servePath = resolvedPathname || url.pathname;
+      let staticEntry = STATIC_PAGES[servePath];
+      if (
+        resolvedPathname &&
+        /\\[/.test(resolvedPathname) &&
+        url.pathname &&
+        url.pathname !== resolvedPathname
+      ) {
+        const candidates = [url.pathname];
+        if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+          const seg = url.pathname.split("/")[1] || "";
+          if (!I18N.locales.includes(seg)) {
+            const def = I18N.defaultLocale || I18N.locales[0];
+            candidates.push("/" + def + url.pathname);
+          }
+        }
+        for (const cand of candidates) {
+          if (STATIC_PAGES[cand]) {
+            servePath = cand;
+            staticEntry = STATIC_PAGES[cand];
+            break;
+          }
+        }
+      }
       const staticAssetPath = staticEntry?.assetPath;
       const isAppRouterRSCRequest =
         request.headers.has("rsc") ||
@@ -2352,6 +2393,36 @@ async function __handleRequest(request, env, ctx) {
           }
         }
 
+        // Pages Router data URL with a middleware rewrite that didn't
+        // resolve to a local handler (e.g. middleware rewrote
+        // \`/dynamic-replace\` → \`/dynamic-fallback/catch-all\` and the
+        // routing layer couldn't match the rewritten target's data
+        // route). Return 200 + \`x-nextjs-rewrite\` + minimal body so
+        // fetchNextData updates router state to the rewritten URL
+        // instead of treating the 404 as an asset error.
+        // Fixes middleware-rewrites "should correctly rewriting to a
+        // different dynamic path".
+        if (
+          (!resolvedPathname || !HANDLERS[resolvedPathname]) &&
+          nextDataAppRouterPath &&
+          result.mwRewrite
+        ) {
+          const headers = new Headers();
+          headers.set("content-type", "application/json");
+          headers.set("x-nextjs-rewrite", result.mwRewrite);
+          headers.set("x-nextjs-deployment-id", BUILD_ID);
+          headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
+          if (result.resolvedHeaders) {
+            result.resolvedHeaders.forEach((val, key) => {
+              if (!headers.has(key)) headers.set(key, val);
+            });
+          }
+          return new Response(JSON.stringify({ pageProps: {} }), {
+            status: 200,
+            headers,
+          });
+        }
+
         // Pages Router static-page data URL fallback: if this is a
         // \`/_next/data/<id>/<page>.json\` request that maps to a known
         // pre-rendered static page (no getStaticProps/SSP, so no handler
@@ -2430,6 +2501,14 @@ async function __handleRequest(request, env, ctx) {
               notFoundCandidates.push(STATIC_PAGES["/404"].assetPath);
             }
             if (BASE_PATH) notFoundCandidates.push(BASE_PATH + "/404/index.html");
+            // For i18n builds the 404 page is emitted under the default
+            // locale (\`/en/404/index.html\`), not the bare \`/404/index.html\`.
+            // Try the locale-prefixed variant before falling back.
+            if (I18N && I18N.defaultLocale) {
+              const loc = I18N.defaultLocale;
+              if (BASE_PATH) notFoundCandidates.push(BASE_PATH + "/" + loc + "/404/index.html");
+              notFoundCandidates.push("/" + loc + "/404/index.html");
+            }
             notFoundCandidates.push("/404/index.html");
             const notFoundPath = notFoundCandidates[0];
             const fallbackHeaders = new Headers();
