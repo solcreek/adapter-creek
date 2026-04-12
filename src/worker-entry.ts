@@ -2114,7 +2114,12 @@ async function __handleRequest(request, env, ctx) {
           }
         }
         const dyn = __matchDynamicRoute(matchPathname);
-        if (dyn && HANDLERS[dyn.page] && HANDLERS[dyn.page].type === "PAGES") {
+        // Include PAGES_API (dynamic API routes like /api/blog/[slug])
+        // in the fallback. Without this, /api/blog/first 404s because
+        // resolveRoutes doesn't find it in PATHNAMES and our fallback
+        // skipped non-PAGES handlers. App Router (APP_PAGE) still
+        // bypasses this path — see the comment above for why.
+        if (dyn && HANDLERS[dyn.page] && (HANDLERS[dyn.page].type === "PAGES" || HANDLERS[dyn.page].type === "PAGES_API")) {
           // Prerender fallback: false — if the route is a fallback:false
           // SSG route and the matched slug is NOT in the prerendered route
           // list, the page doesn't exist. Pages Router's own handler has
