@@ -2553,7 +2553,22 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   const targetQuery = Object.keys(rawQueryForUrl).length > 0
     ? "?" + new URLSearchParams(rawQueryForUrl).toString()
     : url.search;
-  req.url = targetUrl + targetQuery;
+  // Pages Router data requests: if the original URL is a
+  // \`/_next/data/<buildId>/<page>.json\` data fetch, keep that prefix on
+  // req.url so Next.js's render layer recognizes it and returns JSON
+  // (props + __N_SSG/__N_SSP) instead of the full HTML page. resolveRoutes
+  // already resolved the underlying handler, but our default targetUrl is
+  // invocationTarget.pathname — the naked page path — which makes the
+  // handler render HTML. Pages Router also reads the \`x-nextjs-data\`
+  // header as a signal; we set it here so both checks agree.
+  // Fixes middleware-general's client-transition tests (router.push()
+  // triggers a data fetch that must return JSON for the SPA to update).
+  const isPagesDataRequest = url.pathname.startsWith("/_next/data/");
+  if (isPagesDataRequest) {
+    req.url = url.pathname + (targetQuery || "");
+  } else {
+    req.url = targetUrl + targetQuery;
+  }
   // Prefer middleware-overridden request headers when available. These come
   // from \`NextResponse.next({ request: { headers } })\` and are required for
   // \`headers().get()\` to return the override value inside the page handler.
@@ -2570,6 +2585,15 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     routeResult.resolvedHeaders.forEach((val, key) => {
       req.headers[key.toLowerCase()] = val;
     });
+  }
+  // Pages Router data-request marker: Next.js's render layer reads
+  // \`req.headers["x-nextjs-data"]\` to decide whether to emit JSON or
+  // HTML. Browser clients set this via fetchNextData, but our own
+  // plumbing may strip headers (when mwRequestHeaders overrides happen
+  // upstream), so re-set it here for any data URL to guarantee both
+  // the URL prefix AND the header agree.
+  if (isPagesDataRequest) {
+    req.headers["x-nextjs-data"] = "1";
   }
   if (bodyBuffer) {
     // Ensure Content-Length is set — body parsers need it.
