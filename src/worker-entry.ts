@@ -1877,6 +1877,23 @@ async function __handleRequest(request, env, ctx) {
       if (resolvedPathname && !HANDLERS[resolvedPathname]) {
         if (HANDLERS[resolvedPathname + "/index"]) resolvedPathname = resolvedPathname + "/index";
       }
+      // Also check the original URL pathname and the middleware
+      // invocation target for /foo → /foo/index alias. When resolveRoutes
+      // doesn't find a match (e.g. a request for /api when only
+      // /api/index is in PATHNAMES), we still need to resolve to the
+      // /foo/index handler. Tests like
+      // edge-api-endpoints-can-receive-body "reads the body from index"
+      // hit /api expecting the pages/api/index.js handler to fire.
+      if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
+        const candidates = [url.pathname];
+        if (result.invocationTarget?.pathname) {
+          candidates.push(result.invocationTarget.pathname);
+        }
+        for (const c of candidates) {
+          const key = c + "/index";
+          if (HANDLERS[key]) { resolvedPathname = key; break; }
+        }
+      }
       // Root alias: the routing layer exposes the Pages Router root as
       // \`/index\` in HANDLERS (and PATHNAMES), not \`/\`. When the incoming
       // request is for \`/\` and nothing else matched, try \`/index\`
