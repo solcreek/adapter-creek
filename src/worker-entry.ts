@@ -437,6 +437,134 @@ function __getPrefetchHints() {
   return __prefetchHintsCache;
 }
 
+// Middleware matchers: ctx.routing doesn't include the has/missing conditions
+// from middleware.config.matcher — those live in middleware-manifest.json.
+// When a matcher has \`has: [{type:'header', key:'x-test'}]\` or
+// \`missing: [{type:'query', key:'skip'}]\`, the server must evaluate
+// those conditions BEFORE invoking middleware. Without this, middleware
+// runs on every request regardless of matcher conditions, and tests
+// like middleware-custom-matchers fail because middleware fires when it
+// shouldn't.
+let __middlewareMatchersCache = null;
+function __getMiddlewareMatchers() {
+  if (__middlewareMatchersCache !== null) return __middlewareMatchersCache;
+  __middlewareMatchersCache = [];
+  try {
+    const manifest = __parseJsonManifest("middleware-manifest.json", null);
+    if (!manifest) return __middlewareMatchersCache;
+    const mw = manifest.middleware?.["/"]; // middleware is always at "/"
+    if (mw && Array.isArray(mw.matchers)) {
+      for (const m of mw.matchers) {
+        try {
+          __middlewareMatchersCache.push({
+            regex: new RegExp(m.regexp),
+            has: m.has || null,
+            missing: m.missing || null,
+          });
+        } catch {}
+      }
+    }
+  } catch {}
+  return __middlewareMatchersCache;
+}
+
+// Evaluate has/missing conditions from middleware matchers against a
+// request URL + headers. Returns true if the condition set is satisfied.
+function __checkHasConditions(conditions, url, headers) {
+  if (!conditions || conditions.length === 0) return true;
+  for (const cond of conditions) {
+    switch (cond.type) {
+      case "header": {
+        const val = headers.get(cond.key);
+        if (val == null) return false;
+        if (cond.value && !new RegExp(cond.value).test(val)) return false;
+        break;
+      }
+      case "query": {
+        const val = url.searchParams.get(cond.key);
+        if (val == null) return false;
+        if (cond.value && !new RegExp(cond.value).test(val)) return false;
+        break;
+      }
+      case "cookie": {
+        const cookieHeader = headers.get("cookie") || "";
+        const cookies = Object.fromEntries(
+          cookieHeader.split(";").map(c => {
+            const [k, ...v] = c.trim().split("=");
+            return [k, v.join("=")];
+          })
+        );
+        const val = cookies[cond.key];
+        if (val == null) return false;
+        if (cond.value && !new RegExp(cond.value).test(val)) return false;
+        break;
+      }
+      case "host": {
+        const host = headers.get("host") || url.hostname;
+        if (cond.value && !new RegExp(cond.value).test(host)) return false;
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return true;
+}
+
+function __checkMissingConditions(conditions, url, headers) {
+  if (!conditions || conditions.length === 0) return true;
+  for (const cond of conditions) {
+    switch (cond.type) {
+      case "header": {
+        const val = headers.get(cond.key);
+        if (val != null && (!cond.value || new RegExp(cond.value).test(val))) return false;
+        break;
+      }
+      case "query": {
+        const val = url.searchParams.get(cond.key);
+        if (val != null && (!cond.value || new RegExp(cond.value).test(val))) return false;
+        break;
+      }
+      case "cookie": {
+        const cookieHeader = headers.get("cookie") || "";
+        const cookies = Object.fromEntries(
+          cookieHeader.split(";").map(c => {
+            const [k, ...v] = c.trim().split("=");
+            return [k, v.join("=")];
+          })
+        );
+        const val = cookies[cond.key];
+        if (val != null && (!cond.value || new RegExp(cond.value).test(val))) return false;
+        break;
+      }
+      case "host": {
+        const host = headers.get("host") || url.hostname;
+        if (cond.value && new RegExp(cond.value).test(host)) return false;
+        break;
+      }
+      default:
+        break;
+    }
+  }
+  return true;
+}
+
+// Check whether the given request should go through middleware based on
+// the matchers compiled from middleware-manifest.json. Returns true if
+// at least one matcher matches (regex + has + missing all satisfied).
+// When no matchers are defined, default to true (middleware runs on all).
+function __shouldRunMiddleware(url, headers) {
+  const matchers = __getMiddlewareMatchers();
+  if (matchers.length === 0) return true;
+  for (const m of matchers) {
+    if (!m.regex.test(url.pathname)) continue;
+    if (!__checkHasConditions(m.has, url, headers)) continue;
+    if (!__checkMissingConditions(m.missing, url, headers)) continue;
+    return true;
+  }
+  return false;
+}
+
 // Compile routes-manifest.json's dynamicRoutes into [{ regex, page, paramKeys }]
 // once at module init. The @next/routing layer only resolves URLs to handlers
 // via exact PATHNAMES match or via config-level rewrites — it doesn't expand
@@ -1450,6 +1578,14 @@ async function __handleRequest(request, env, ctx) {
       let mwCapturedResponse = null;
       let mwCapturedRewrite = null;
       const wrappedMiddlewareHandler = async (mwCtx) => {
+        // Check middleware matchers (has/missing conditions) before
+        // invoking middleware. @next/routing only checks the source regex
+        // from ROUTING.beforeMiddleware — it doesn't evaluate has/missing
+        // from middleware-manifest.json. Skip middleware if no matcher is
+        // satisfied, matching real Next.js behavior.
+        if (!__shouldRunMiddleware(mwCtx.url, mwCtx.headers)) {
+          return {};
+        }
         const mwRes = await middlewareHandler(mwCtx);
         if (mwRes && mwRes.requestHeaders) {
           mwModifiedRequestHeaders = mwRes.requestHeaders;
@@ -1730,9 +1866,22 @@ async function __handleRequest(request, env, ctx) {
       // directly. Without this, the root page 404s whenever a Pages
       // Router app has _document.getInitialProps (forces SSR — page lives
       // in HANDLERS under \`/index\`, STATIC_PAGES is empty).
-      if (url.pathname === "/" && (!resolvedPathname || !HANDLERS[resolvedPathname])) {
-        if (HANDLERS["/index"]) {
-          resolvedPathname = "/index";
+      // Root alias: the routing layer exposes the Pages Router root as
+      // \`/index\` in HANDLERS (and PATHNAMES), not \`/\`. Check the original
+      // URL, the invocation target, AND the middleware rewrite target —
+      // without this, a middleware rewrite from \`/source-match\` → \`/\`
+      // doesn't find the index handler and 404s.
+      {
+        let isRoot = url.pathname === "/";
+        if (!isRoot && result.invocationTarget?.pathname === "/") isRoot = true;
+        if (!isRoot && result.mwRewrite) {
+          try {
+            const rp = result.mwRewrite.split("?")[0];
+            if (rp === "/") isRoot = true;
+          } catch {}
+        }
+        if (isRoot && (!resolvedPathname || !HANDLERS[resolvedPathname])) {
+          if (HANDLERS["/index"]) resolvedPathname = "/index";
         }
       }
       // Trailing-slash normalization. \`@next/routing\` does exact pathname
