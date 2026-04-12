@@ -1594,6 +1594,21 @@ async function __handleRequest(request, env, ctx) {
           if (handler && (handler.type === "PAGES" || handler.type === "PAGES_API")) {
             staticPagesDataRoutePath = handler.pathname || lookup;
           }
+          // For purely static Pages Router pages (no getStaticProps /
+          // getServerSideProps), Next.js doesn't register a handler — the
+          // page is served from a prerendered HTML asset. But Pages Router
+          // client still issues \`/_next/data/<id>/<page>.json\` fetches on
+          // soft-navigation; if we 404 those, fetchNextData treats the
+          // miss as an asset error and forces a hard navigation
+          // (router.ts:556 markAssetError → handleHardNavigation). Real
+          // Next.js returns 200 + \`{pageProps:{}}\` for these. Detect a
+          // known prerendered/static pathname and answer with that minimal
+          // body so soft navigation works.
+          // Fixes middleware-redirects "should implement internal
+          // redirects" — clicking /old-home (middleware redirects to
+          // /new-home) follows up with a /new-home data fetch; without
+          // this, the follow-up 404s and the navigation degrades to a
+          // full reload (window.__SAME_PAGE → undefined).
         }
       }
 
@@ -2296,6 +2311,51 @@ async function __handleRequest(request, env, ctx) {
                 if (assetRes.ok) return assetRes;
               }
             } catch {}
+          }
+        }
+
+        // Pages Router static-page data URL fallback: if this is a
+        // \`/_next/data/<id>/<page>.json\` request that maps to a known
+        // pre-rendered static page (no getStaticProps/SSP, so no handler
+        // was registered), respond with minimal \`{pageProps:{}}\` JSON.
+        // Without this, fetchNextData treats the 404 as an asset error
+        // and falls back to a hard navigation — see middleware-redirects
+        // "should implement internal redirects". Real Next.js returns
+        // \`{pageProps:{}}\` here.
+        if (
+          (!resolvedPathname || !HANDLERS[resolvedPathname]) &&
+          nextDataAppRouterPath
+        ) {
+          // Build candidate set: bare path, /index variant, and locale-
+          // prefixed variants. Static i18n pages are emitted as
+          // \`/<locale>/<page>\` (root: \`/<locale>\`); the bare \`/\` page
+          // also appears in HANDLERS/PATHNAMES.
+          const isRoot = nextDataAppRouterPath === "/" || nextDataAppRouterPath === "/index";
+          const bareForm = isRoot ? "/" : nextDataAppRouterPath;
+          const indexForm = isRoot ? "/index" : nextDataAppRouterPath;
+          const knownPaths = [bareForm, indexForm];
+          if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+            for (const locale of I18N.locales) {
+              if (isRoot) {
+                knownPaths.push("/" + locale);
+                knownPaths.push("/" + locale + "/index");
+              } else {
+                knownPaths.push("/" + locale + nextDataAppRouterPath);
+              }
+            }
+          }
+          const isKnownStatic = knownPaths.some(
+            (p) => PATHNAMES.includes(p) || STATIC_PAGES?.[p]
+          );
+          if (isKnownStatic) {
+            const headers = new Headers();
+            headers.set("content-type", "application/json");
+            headers.set("x-nextjs-deployment-id", BUILD_ID);
+            headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
+            return new Response(JSON.stringify({ pageProps: {} }), {
+              status: 200,
+              headers,
+            });
           }
         }
         // If still no handler, fall back to SSR _not-found handler or static 404.
