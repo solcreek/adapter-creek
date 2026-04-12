@@ -1832,6 +1832,33 @@ async function __handleRequest(request, env, ctx) {
           routeMatches: undefined,
         };
       }
+      // When resolvedPathname is a STATIC page (no bracket params),
+      // routing's matchesPathname-then-dynamicRoutes loop may have
+      // matched a sibling dynamic route (e.g. \`/[param]\`) and merged
+      // its destination query (\`nxtPparam=...\`) plus the
+      // \`nextLocale\` capture into resolvedQuery. The static handler
+      // doesn't have route params, so these markers leak into
+      // \`req.query\` and pollute the page's \`getServerSideProps\` /
+      // \`getStaticProps\` query argument. Strip them.
+      // Fixes middleware-rewrites "should clear query parameters".
+      if (
+        result.resolvedPathname &&
+        !/\\[/.test(result.resolvedPathname) &&
+        result.resolvedQuery
+      ) {
+        const cleanedQuery = {};
+        for (const [k, v] of Object.entries(result.resolvedQuery)) {
+          if (k === "nextLocale") continue;
+          if (k.startsWith("nxtP")) continue;
+          if (/^[0-9]+$/.test(k)) continue;
+          cleanedQuery[k] = v;
+        }
+        result = {
+          ...result,
+          resolvedQuery: cleanedQuery,
+          routeMatches: undefined,
+        };
+      }
       if (result.redirect) {
         // For Pages Router data requests, return 200 with
         // \`x-nextjs-redirect\` header instead of a 3xx Location response.
@@ -1935,11 +1962,18 @@ async function __handleRequest(request, env, ctx) {
             }
           } catch {}
         }
-        const upstream = await fetch(result.externalRewrite.toString(), {
+        // \`duplex: 'half'\` is required by the Node/Undici fetch when
+        // forwarding a streaming request body — without it Node throws
+        // \`RequestInit: duplex option is required when sending a body\`.
+        const upstreamInit = {
           method: request.method,
           headers: request.headers,
-          body: request.body,
-        });
+        };
+        if (request.body) {
+          upstreamInit.body = request.body;
+          upstreamInit.duplex = "half";
+        }
+        const upstream = await fetch(result.externalRewrite.toString(), upstreamInit);
         // \`fetch\` already transparently decompressed the upstream body,
         // so the response we return downstream is uncompressed bytes —
         // but the upstream \`Content-Encoding: gzip\` (or brotli) header
