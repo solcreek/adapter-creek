@@ -312,6 +312,27 @@ function __getStringifiedManifest(manifestBaseName, globalName, fallbackValue) {
 
 globalThis.__SERVER_FILES_MANIFEST =
   globalThis.__SERVER_FILES_MANIFEST || __getServerFilesManifest();
+// Force a runtime deployment id so Next.js Pages Router's skew-protection
+// handshake stays self-consistent:
+//   - Server render emits \`<html data-dpl-id="<BUILD_ID>">\` (via Next.js's
+//     own createHtmlDataDplIdTransformStream, gated on nextConfig.deploymentId).
+//   - Client hydration keeps the attribute because the VDOM now has a matching
+//     value (otherwise React strips it as "undefined" → remove).
+//   - fetchNextData sends \`x-deployment-id: <BUILD_ID>\` on /_next/data fetches;
+//     we respond with \`x-nextjs-deployment-id: <BUILD_ID>\`; they match and
+//     client navigation stays soft.
+// Without this, every middleware-general client-transition test hard-navigates,
+// wiping \`window.beforeNav\` and failing assertions like
+// "should rewrite the same for direct visit and client-transition".
+if (
+  globalThis.__SERVER_FILES_MANIFEST &&
+  typeof globalThis.__SERVER_FILES_MANIFEST === "object" &&
+  globalThis.__SERVER_FILES_MANIFEST.config &&
+  typeof globalThis.__SERVER_FILES_MANIFEST.config === "object" &&
+  !globalThis.__SERVER_FILES_MANIFEST.config.deploymentId
+) {
+  globalThis.__SERVER_FILES_MANIFEST.config.deploymentId = BUILD_ID;
+}
 globalThis.__BUILD_MANIFEST =
   globalThis.__BUILD_MANIFEST ||
   __parseJsonManifest("build-manifest.json") ||
@@ -1938,30 +1959,27 @@ async function __handleRequest(request, env, ctx) {
   // Skew protection: the Pages Router client compares
   // \`x-nextjs-deployment-id\` on \`/_next/data/*\` responses against the
   // \`data-dpl-id\` it read from \`<html>\` on the initial page load; any
-  // mismatch forces a hard navigation. We don't set \`data-dpl-id\` in our
-  // HTML (because \`nextConfig.deploymentId\` is usually unset in tests),
-  // so the client's \`deploymentId\` stays undefined. Previously we
-  // unconditionally injected \`x-nextjs-deployment-id: <BUILD_ID>\` on
-  // data responses to make the pages-ssg-data-deployment-skew test happy
-  // — but that test is a no-op in deploy mode (both its describes are
-  // gated on \`isNextDev\` / \`isNextStart\`), and the header broke every
-  // middleware-general client-side navigation into a hard reload, which
-  // clears \`window.beforeNav\` and fails tests like
-  // "should rewrite the same for direct visit and client-transition".
-  // Only forward the header when the request explicitly opts in via
-  // \`x-deployment-id\` (which the client only sends when it knows its own
-  // deploymentId), so the match check has a chance of succeeding.
+  // mismatch forces a hard navigation that wipes \`window.beforeNav\` and
+  // breaks middleware-general client-transition tests. We now inject both
+  // sides of the handshake:
+  //   - \`data-dpl-id="<BUILD_ID>"\` into the \`<html>\` tag via the HTML
+  //     stream rewriter (__injectDplId in __rewriteFirstChunk), so the
+  //     client sees a concrete deploymentId on page load.
+  //   - \`x-nextjs-deployment-id: <BUILD_ID>\` on every \`/_next/data/*\`
+  //     response, matching the HTML attribute so the client's
+  //     skew check succeeds.
+  // The unconditional header also keeps pages-ssg-data-deployment-skew
+  // happy (its \`isNextDeploy\` branch asserts the header is truthy).
   try {
     const url = new URL(request.url);
     if (
       response &&
       typeof response.headers?.has === "function" &&
       url.pathname.startsWith("/_next/data/") &&
-      !response.headers.has("x-nextjs-deployment-id") &&
-      request.headers.get("x-deployment-id")
+      !response.headers.has("x-nextjs-deployment-id")
     ) {
       const headers = new Headers(response.headers);
-      headers.set("x-nextjs-deployment-id", request.headers.get("x-deployment-id"));
+      headers.set("x-nextjs-deployment-id", BUILD_ID);
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
@@ -2524,6 +2542,16 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     if (!h.has("x-nextjs-cache") && h.get("x-nextjs-prerender") === "1") {
       h.set("x-nextjs-cache", "PRERENDER");
     }
+    // Drop Content-Length for HTML responses: the quirks-mode rewriter and
+    // data-dpl-id injector in \`__rewriteFirstChunk\` can expand the first
+    // chunk. If we keep the pre-computed Content-Length Next.js set via
+    // \`res.setHeader\`, the downstream HTTP layer truncates the body to
+    // match the (now-stale) length, cutting off the tail of __NEXT_DATA__
+    // and producing "Unterminated string in JSON" client errors.
+    const ctLower = String(h.get("content-type") || "").toLowerCase();
+    if (ctLower.includes("text/html")) {
+      h.delete("content-length");
+    }
     const body = responseDisallowsBody ? null : readable;
     const init = {
       status,
@@ -2559,8 +2587,11 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   // of any other test that already produced well-formed HTML.
   let __streamStarted = false;
   let __preDoctypeBuffer = null;  // Uint8Array of stray pre-doctype bytes, or null
+  let __dplIdInjected = false;    // have we already inserted data-dpl-id on <html
   const __DOCTYPE_BYTES = new TextEncoder().encode("<!DOCTYPE");
   const __HEAD_CLOSE_BYTES = new TextEncoder().encode("</head>");
+  const __HTML_OPEN_BYTES = new TextEncoder().encode("<html");
+  const __DPL_ID_ATTR = new TextEncoder().encode(\` data-dpl-id="\${BUILD_ID}"\`);
   function __indexOfBytes(haystack, needle) {
     if (needle.length === 0) return 0;
     const max = haystack.length - needle.length;
@@ -2578,14 +2609,43 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     out.set(b, a.length);
     return out;
   }
+  // Insert \` data-dpl-id="<BUILD_ID>"\` right after \`<html\` in the chunk
+  // so the Pages Router client reads \`document.documentElement.dataset.dplId\`
+  // on page load and sends \`x-deployment-id\` on subsequent data fetches.
+  // This keeps the deployment-id handshake self-consistent for both
+  // pages-ssg-data-deployment-skew (needs the response header truthy) and
+  // middleware-general client-side navigation tests (need the header
+  // value to match, otherwise \`fetchNextData\` throws and forces a hard
+  // reload). Returns the chunk unchanged if \`<html\` isn't present or the
+  // attribute has already been injected.
+  function __injectDplId(chunk) {
+    if (__dplIdInjected) return chunk;
+    const htmlIdx = __indexOfBytes(chunk, __HTML_OPEN_BYTES);
+    if (htmlIdx === -1) return chunk;
+    // Skip if the attribute is already somewhere in the chunk (e.g.
+    // upstream Next.js set it via \`_document.tsx\` because nextConfig
+    // declared a deploymentId).
+    if (__indexOfBytes(chunk, new TextEncoder().encode("data-dpl-id")) !== -1) {
+      __dplIdInjected = true;
+      return chunk;
+    }
+    const insertAt = htmlIdx + __HTML_OPEN_BYTES.length;
+    const out = new Uint8Array(chunk.length + __DPL_ID_ATTR.length);
+    out.set(chunk.subarray(0, insertAt), 0);
+    out.set(__DPL_ID_ATTR, insertAt);
+    out.set(chunk.subarray(insertAt), insertAt + __DPL_ID_ATTR.length);
+    __dplIdInjected = true;
+    return out;
+  }
   function __rewriteFirstChunk(chunk) {
     // Fast path: this chunk alone already starts with <!DOCTYPE and no
-    // stray pre-doctype buffer is pending. Emit unchanged.
+    // stray pre-doctype buffer is pending. Still run the data-dpl-id
+    // injection on the chunk so the \`<html>\` element gets tagged.
     if (
       !__preDoctypeBuffer &&
       __indexOfBytes(chunk.slice(0, 16), __DOCTYPE_BYTES) === 0
     ) {
-      return chunk;
+      return __injectDplId(chunk);
     }
     // Locate the doctype anywhere in the current chunk.
     const doctypeIdx = __indexOfBytes(chunk, __DOCTYPE_BYTES);
@@ -2607,7 +2667,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     __preDoctypeBuffer = null;
     if (combinedStray.length === 0) {
       // No stray content to re-insert — just return the doctype-onwards bytes.
-      return rest;
+      return __injectDplId(rest);
     }
     // Inject the stray content right before </head> in the remainder.
     const headCloseIdx = __indexOfBytes(rest, __HEAD_CLOSE_BYTES);
@@ -2615,13 +2675,13 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       // No </head> yet — append the stray content at the end of the chunk
       // as a fallback. Standards mode is preserved (doctype leads the stream)
       // and any referenced polyfill still loads, just later than ideal.
-      return __mergeBytes(rest, combinedStray);
+      return __injectDplId(__mergeBytes(rest, combinedStray));
     }
     const out = new Uint8Array(rest.length + combinedStray.length);
     out.set(rest.slice(0, headCloseIdx), 0);
     out.set(combinedStray, headCloseIdx);
     out.set(rest.slice(headCloseIdx), headCloseIdx + combinedStray.length);
-    return out;
+    return __injectDplId(out);
   }
 
   // Intercept write — stream chunks to the client.

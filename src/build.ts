@@ -33,7 +33,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   console.log(`\n  [Creek Adapter] Preparing deployment output...`);
 
   // Step 1: Collect static files (including public/* and edge-chunks/*)
-  const assetCount = await collectStaticFiles(ctx.outputs, assetsDir, ctx.projectDir, ctx.distDir);
+  const assetCount = await collectStaticFiles(ctx.outputs, assetsDir, ctx.projectDir, ctx.distDir, ctx.buildId);
   console.log(`  [Creek Adapter] ${assetCount} static files collected`);
 
   // Step 2: Collect WASM files from all outputs
@@ -256,18 +256,44 @@ function isStaticHtmlPage(pathname: string): boolean {
   return !path.extname(pathname);
 }
 
+// Inject `data-dpl-id="<buildId>"` into the `<html>` tag of static HTML
+// files at build time. The Pages Router client reads this attribute on
+// page load to populate `globalThis.NEXT_DEPLOYMENT_ID`, then sends
+// `x-deployment-id: <buildId>` on subsequent /_next/data/* fetches. The
+// worker runtime always responds with `x-nextjs-deployment-id: <buildId>`,
+// so the client's skew-protection check matches and client-side
+// navigation stays soft. Without this injection, static pages (/404,
+// /error, /about) don't have the attribute — because nextConfig.deploymentId
+// is usually unset in test fixtures — and client-transition tests in
+// middleware-general hard-reload on every push, wiping `window.beforeNav`.
+// Dynamically rendered pages get the attribute through Next.js's own
+// `createHtmlDataDplIdTransformStream`, which we enable at runtime by
+// patching `__SERVER_FILES_MANIFEST.config.deploymentId` in worker-entry.
+async function copyHtmlWithDplId(src: string, dest: string, buildId: string): Promise<void> {
+  const content = await fs.readFile(src, "utf8");
+  // Skip if already has the attribute (e.g. upstream nextConfig.deploymentId
+  // was set at build time), otherwise insert right after `<html`.
+  let patched = content;
+  if (!content.includes("data-dpl-id")) {
+    patched = content.replace(/<html(?=[\s>])/, `<html data-dpl-id="${buildId}"`);
+  }
+  await fs.writeFile(dest, patched);
+}
+
 async function collectStaticFiles(
   outputs: BuildContext["outputs"],
   assetsDir: string,
   projectDir?: string,
   distDir?: string,
+  buildId?: string,
 ): Promise<number> {
   let count = 0;
   const allPathnames = new Set(outputs.staticFiles.map((f) => f.pathname));
 
   for (const file of outputs.staticFiles) {
     let destRelative = file.pathname;
-    if (isStaticHtmlPage(destRelative)) {
+    const isHtml = isStaticHtmlPage(destRelative);
+    if (isHtml) {
       // Pre-rendered HTML pages (e.g. /, /about, /404, /catch-all/[...slug]).
       // Store as <pathname>/index.html so CF Workers Assets serves them correctly.
       destRelative = path.join(destRelative, "index.html");
@@ -275,7 +301,11 @@ async function collectStaticFiles(
     const destPath = path.join(assetsDir, destRelative);
     await fs.mkdir(path.dirname(destPath), { recursive: true });
     try {
-      await fs.copyFile(file.filePath, destPath);
+      if (isHtml && buildId) {
+        await copyHtmlWithDplId(file.filePath, destPath, buildId);
+      } else {
+        await fs.copyFile(file.filePath, destPath);
+      }
       count++;
     } catch {}
   }
@@ -283,13 +313,18 @@ async function collectStaticFiles(
   for (const prerender of outputs.prerenders) {
     if (prerender.fallback?.filePath) {
       let destRelative = prerender.pathname;
-      if (isStaticHtmlPage(destRelative)) {
+      const isHtml = isStaticHtmlPage(destRelative);
+      if (isHtml) {
         destRelative = destRelative + "/index.html";
       }
       const destPath = path.join(assetsDir, destRelative);
       await fs.mkdir(path.dirname(destPath), { recursive: true });
       try {
-        await fs.copyFile(prerender.fallback.filePath, destPath);
+        if (isHtml && buildId) {
+          await copyHtmlWithDplId(prerender.fallback.filePath, destPath, buildId);
+        } else {
+          await fs.copyFile(prerender.fallback.filePath, destPath);
+        }
         count++;
       } catch {}
     }
