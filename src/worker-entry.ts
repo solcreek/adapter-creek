@@ -2276,12 +2276,6 @@ async function __handleRequest(request, env, ctx) {
         }
 
         // Before falling back to 404, try the rewrite target as a public
-        // file (e.g. \`/file.txt\` from /public). i18n-ignore-rewrite-source-locale
-        // exercises this: \`/<locale>/rewrite-files/file.txt\` rewrites to
-        // \`/file.txt\` (locale: false). The rewrite target isn't a route
-        // in PATHNAMES, but it's a real file under /public — serve it from
-        // ASSETS before declaring 404.
-        // Before falling back to 404, try the rewrite target as a public
         // file. i18n-ignore-rewrite-source-locale exercises this:
         // \`/<locale>/rewrite-files/file.txt\` (locale: false) rewrites to
         // \`/file.txt\`. resolveRoutes applies the rewrite but doesn't
