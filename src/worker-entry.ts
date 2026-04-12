@@ -1594,6 +1594,7 @@ async function __handleRequest(request, env, ctx) {
       let mwModifiedRequestHeaders = null;
       let mwCapturedResponse = null;
       let mwCapturedRewrite = null;
+      let mwCapturedRedirect = null;
       const wrappedMiddlewareHandler = async (mwCtx) => {
         // Check middleware matchers (has/missing conditions) before
         // invoking middleware. @next/routing only checks the source regex
@@ -1659,6 +1660,20 @@ async function __handleRequest(request, env, ctx) {
             mwCapturedRewrite = rewriteUrl.pathname + (rewriteUrl.search || "");
           } catch {}
         }
+        // Capture middleware redirect URL for data responses. Pages Router
+        // client reads \`x-nextjs-redirect\` on /_next/data/ responses to
+        // know where to navigate when middleware returned a
+        // NextResponse.redirect(). Without this header, data-driven
+        // redirects silently fail — the client stays on the old URL.
+        // Fixes middleware-redirects "should redirect to data urls with
+        // data requests and internal/external redirects".
+        if (mwRes && mwRes.redirect) {
+          try {
+            mwCapturedRedirect = mwRes.redirect.url
+              ? mwRes.redirect.url.toString()
+              : mwRes.redirect.toString();
+          } catch {}
+        }
         return mwRes;
       };
       let result = await resolveRoutes({
@@ -1686,6 +1701,9 @@ async function __handleRequest(request, env, ctx) {
       }
       if (mwCapturedRewrite) {
         result = { ...result, mwRewrite: mwCapturedRewrite };
+      }
+      if (mwCapturedRedirect) {
+        result = { ...result, mwRedirect: mwCapturedRedirect };
       }
       // @next/routing's \`checkDynamicRoutes\` helper is called from inside
       // the afterFiles loop with an already-rewritten URL and iterates
@@ -1715,9 +1733,24 @@ async function __handleRequest(request, env, ctx) {
         };
       }
       if (result.redirect) {
+        // For Pages Router data requests, return 200 with
+        // \`x-nextjs-redirect\` header instead of a 3xx Location response.
+        // The Pages Router client fetchNextData reads this header to
+        // perform client-side navigation to the redirect target — a
+        // real 3xx would be followed by the browser (losing the SPA
+        // state) OR blocked by CORS if the target is external.
+        const isDataReq = url.pathname.startsWith("/_next/data/");
+        const redirectUrl = result.redirect.url.toString();
+        if (isDataReq) {
+          const headers = new Headers();
+          headers.set("content-type", "application/json");
+          headers.set("x-nextjs-redirect", redirectUrl);
+          headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
+          return new Response("{}", { status: 200, headers });
+        }
         return new Response(null, {
           status: result.redirect.status,
-          headers: { Location: result.redirect.url.toString() },
+          headers: { Location: redirectUrl },
         });
       }
       // Middleware and config redirects: resolveRoutes returns Location in
@@ -1742,6 +1775,21 @@ async function __handleRequest(request, env, ctx) {
           const finalLocation = shouldPreserveQuery
             ? __preserveQuery(location, url.search)
             : location;
+          // Data-request redirect: same as result.redirect branch above —
+          // return 200 + x-nextjs-redirect so the Pages Router client
+          // performs soft navigation instead of a browser-forced hard nav.
+          const isDataReq = url.pathname.startsWith("/_next/data/");
+          if (isDataReq) {
+            const headers = new Headers();
+            headers.set("content-type", "application/json");
+            headers.set("x-nextjs-redirect", finalLocation);
+            headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
+            result.resolvedHeaders.forEach((val, key) => {
+              const k = key.toLowerCase();
+              if (k !== "location" && !headers.has(k)) headers.set(key, val);
+            });
+            return new Response("{}", { status: 200, headers });
+          }
           const headers = new Headers();
           headers.set("Location", finalLocation);
           result.resolvedHeaders.forEach((val, key) => {
