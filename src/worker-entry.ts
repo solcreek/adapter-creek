@@ -1050,14 +1050,33 @@ const middlewareHandler = async (mwCtx) => {
         () => handler(mwReq, {})
       );
     } catch (handlerErr) {
-      console.error("[creek-mw] handler error:", handlerErr instanceof Error ? handlerErr.stack || handlerErr.message : String(handlerErr));
-      return {};
+      // Middleware threw. Return a \`bodySent\` result with a synthetic
+      // 500 Response captured in __mwResponse so __handleRequest forwards
+      // the error to the client as the final response — matching Next.js's
+      // "middleware failed, hard nav" behavior. Without this we'd
+      // silently return {} and continue resolving the request, letting
+      // the handler render the page normally (200 OK) and hiding the
+      // middleware failure from the client's skew-protection check.
+      // Fixes middleware-general "hard-navigates when the data request
+      // failed" for both i18n variants.
+      const errMsg = handlerErr instanceof Error ? (handlerErr.stack || handlerErr.message) : String(handlerErr);
+      console.error("[creek-mw] handler error:", errMsg);
+      const errResponse = new Response(
+        "Internal Server Error: " + (handlerErr instanceof Error ? handlerErr.message : String(handlerErr)),
+        {
+          status: 500,
+          headers: { "content-type": "text/plain; charset=utf-8" },
+        },
+      );
+      return {
+        bodySent: true,
+        __mwResponse: errResponse,
+      };
     }
     if (!response || !(response instanceof Response)) {
       console.error("[creek-mw] handler returned non-Response:", typeof response, response);
       return {};
     }
-    console.error("[creek-mw]", mwCtx.url?.pathname, "status:", response.status, "location:", response.headers.get("location"), "x-mw-rewrite:", response.headers.get("x-middleware-rewrite"));
     const mwResult = responseToMiddlewareResult(response, mwHeaders, mwCtx.url);
     // Stash the original response on the result so the worker can return
     // its body verbatim when middleware handles the request itself (e.g.
