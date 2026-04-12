@@ -1961,26 +1961,37 @@ async function __handleRequest(request, env, ctx) {
               return new Response("{}", { status: 200, headers });
             }
           } catch {}
-          // Pages Router data URL with truly-external rewrite: don't proxy
-          // the body. Return 200 + \`x-nextjs-rewrite\` so fetchNextData
-          // surfaces a \`redirect-external\` effect → hard navigation to
-          // the rewritten URL. Proxying would deliver HTML where the
-          // client expects JSON.
+          // Pages Router data URL with truly-external rewrite from
+          // \`fetchNextData\` (XHR with x-nextjs-data:1): return 200 +
+          // \`x-nextjs-rewrite\` so the client triggers a hard nav to
+          // the rewritten URL. For browser-direct navigation to a data
+          // URL (no x-nextjs-data header), fall through to proxying so
+          // the upstream HTML is rendered.
           // Fixes middleware-rewrites "should override with rewrite
-          // externally correctly".
-          const externalUrl = result.externalRewrite.toString();
-          const headers = new Headers();
-          headers.set("content-type", "application/json");
-          headers.set("x-nextjs-rewrite", externalUrl);
-          headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
-          return new Response("{}", { status: 200, headers });
+          // externally correctly" + "should rewrite to the external
+          // url for incoming data request externally rewritten".
+          if (request.headers.get("x-nextjs-data") === "1") {
+            const externalUrl = result.externalRewrite.toString();
+            const headers = new Headers();
+            headers.set("content-type", "application/json");
+            headers.set("x-nextjs-rewrite", externalUrl);
+            headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
+            return new Response("{}", { status: 200, headers });
+          }
         }
         // \`duplex: 'half'\` is required by the Node/Undici fetch when
         // forwarding a streaming request body — without it Node throws
         // \`RequestInit: duplex option is required when sending a body\`.
+        // Use middleware-overridden request headers (from
+        // \`NextResponse.next({ request: { headers } })\`) when present
+        // — middleware-rewrites tests forward custom headers to the
+        // external upstream this way.
+        const upstreamHeaders = result.mwRequestHeaders
+          ? new Headers(result.mwRequestHeaders)
+          : new Headers(request.headers);
         const upstreamInit = {
           method: request.method,
-          headers: request.headers,
+          headers: upstreamHeaders,
         };
         if (request.body) {
           upstreamInit.body = request.body;
@@ -2232,11 +2243,35 @@ async function __handleRequest(request, env, ctx) {
 
       // 4b. If no route handler matched, check for static assets or 404.
       if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
+        // For Pages Router data URLs that middleware rewrote to a
+        // different page, look up the rewritten target's prerendered
+        // data file in ASSETS instead of the original URL's. Without
+        // this, /dynamic-no-cache/1 → /2 rewrite would still serve
+        // /1's prerendered data (test "should opt out of prefetch
+        // caching for dynamic routes" depends on click seeing the
+        // rewritten /2's data).
+        let assetUrlPath = url.pathname;
+        if (nextDataAppRouterPath && result?.mwRewrite) {
+          const dataPathMatch = url.pathname.match(/^(\\/_next\\/data\\/[^/]+)\\/(.+)\\.json$/);
+          if (dataPathMatch) {
+            const rewriteBase = result.mwRewrite.split("?")[0].replace(/^\\//, "");
+            // The rewritten target needs locale prefix to match the
+            // emitted prerendered path (\`/en/dynamic-no-cache/2.json\`).
+            let rewritten = rewriteBase;
+            if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+              const firstSeg = rewriteBase.split("/")[0] || "";
+              if (!I18N.locales.includes(firstSeg)) {
+                rewritten = (I18N.defaultLocale || I18N.locales[0]) + "/" + rewriteBase;
+              }
+            }
+            assetUrlPath = dataPathMatch[1] + "/" + rewritten + ".json";
+          }
+        }
         // Try static assets — for paths with extensions (JS, CSS, images)
         // or paths that might be stored in assets.
         try {
           const assetRes = await env.ASSETS.fetch(
-            new Request(new URL(url.pathname, url.origin), { headers: request.headers })
+            new Request(new URL(assetUrlPath, url.origin), { headers: request.headers })
           );
           if (assetRes.ok) {
             const assetHeaders = applyStaticAssetHeaders(
@@ -2542,6 +2577,15 @@ async function __handleRequest(request, env, ctx) {
       }
 
       const handler = HANDLERS[resolvedPathname];
+      if (!handler) {
+        // Defensive: if we got here without a resolvable handler (e.g.
+        // middleware rewrote a data URL to an unregistered target),
+        // fall through to the no-handler 404 response below rather than
+        // crashing on \`handler.type\`.
+        const fallbackHeaders = new Headers();
+        fallbackHeaders.set("content-type", "text/plain; charset=utf-8");
+        return new Response("Not Found", { status: 404, headers: fallbackHeaders });
+      }
 
       // \`_next/data\` request that middleware rewrote to an app-router route:
       // short-circuit with x-nextjs-matched-path so the Pages Router client
@@ -3328,6 +3372,18 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     let dataPath = url.pathname;
     if (BASE_PATH && dataPath.startsWith(BASE_PATH + "/")) {
       dataPath = dataPath.slice(BASE_PATH.length);
+    }
+    // If middleware rewrote this data URL to a different page, rebuild
+    // the data path with the rewritten target so the handler sees the
+    // rewritten params (e.g. middleware-rewrites
+    // /dynamic-no-cache/1 → /dynamic-no-cache/2: the handler must
+    // receive id=2, not id=1).
+    if (routeResult?.mwRewrite) {
+      const dataMatch = dataPath.match(/^(\\/_next\\/data\\/[^/]+)\\/(.+)\\.json$/);
+      if (dataMatch) {
+        const rewriteBase = routeResult.mwRewrite.split("?")[0].replace(/^\\//, "");
+        dataPath = dataMatch[1] + "/" + rewriteBase + ".json";
+      }
     }
     req.url = dataPath + (targetQuery || "");
   } else {
