@@ -2380,13 +2380,27 @@ async function __handleRequest(request, env, ctx) {
       // (with default locale prefix) before the bracket form.
       let servePath = resolvedPathname || url.pathname;
       let staticEntry = STATIC_PAGES[servePath];
-      if (
-        resolvedPathname &&
-        /\\[/.test(resolvedPathname) &&
-        url.pathname &&
-        url.pathname !== resolvedPathname
-      ) {
-        const candidates = [url.pathname];
+      // Two fallback candidates worth trying:
+      //   1. The literal URL pathname (for SSG fallback shells matched
+      //      on the bracket route — e.g. resolvedPathname
+      //      \`/blog/[slug]\` but a real prerender exists at
+      //      \`/blog/first\`).
+      //   2. The URL pathname prefixed with the default i18n locale (for
+      //      Pages Router i18n: \`/new-home\` should serve
+      //      \`/en/new-home\` when the defaultLocale is \`en\` and no
+      //      locale appears in the URL). Without this, after a
+      //      middleware \`Response.redirect(url)\` where \`url.pathname =
+      //      "/new-home"\` the browser follows to an unprefixed URL
+      //      that 404s — breaks middleware-redirects.
+      if (!staticEntry && url.pathname) {
+        const candidates = [];
+        if (
+          resolvedPathname &&
+          resolvedPathname.includes("[") &&
+          url.pathname !== resolvedPathname
+        ) {
+          candidates.push(url.pathname);
+        }
         if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
           const seg = url.pathname.split("/")[1] || "";
           if (!I18N.locales.includes(seg)) {
@@ -2424,17 +2438,29 @@ async function __handleRequest(request, env, ctx) {
       // A "rewrite" in the sense that should skip the prerendered-HTML
       // serve is a CONFIG or MIDDLEWARE rewrite that points the URL at a
       // different route (e.g. /source → /dest). @next/routing also
-      // exposes dynamic-route matching via \`invocationTarget.pathname\`,
-      // but with the bracket form (e.g. /[key]) — that's not a rewrite,
-      // just the route pattern. Treat bracket-form invocationTargets as
-      // normal dynamic matches so their prerendered variants still get
-      // served. Fixes next-after-app-deploy (and other ISR/SSG fixtures
-      // where the request URL matches a prerendered key that differs
-      // from the route pattern).
-      const isRewritten =
-        result?.invocationTarget?.pathname &&
-        result.invocationTarget.pathname !== url.pathname &&
-        !result.invocationTarget.pathname.includes("[");
+      // exposes dynamic-route matching and i18n locale-prefix additions
+      // through invocationTarget.pathname:
+      //   - bracket-form routes (e.g. /[key]) — dynamic route pattern
+      //   - i18n prefix (e.g. /new-home → /en/new-home with default
+      //     locale) — automatic locale normalization, not a rewrite
+      // Exclude both so their prerendered variants still get served.
+      // Fixes: next-after-app-deploy (dynamic route prerenders) +
+      // middleware-redirects (i18n Pages Router target rendering).
+      const isRewritten = (() => {
+        const it = result?.invocationTarget?.pathname;
+        if (!it || it === url.pathname) return false;
+        if (it.includes("[")) return false;
+        // i18n locale-prefix addition: invocationTarget is exactly
+        // "/<locale>" + url.pathname (or "/<locale>") for the root
+        // case.
+        if (I18N && Array.isArray(I18N.locales)) {
+          for (const locale of I18N.locales) {
+            if (it === "/" + locale + url.pathname) return false;
+            if (url.pathname === "/" && it === "/" + locale) return false;
+          }
+        }
+        return true;
+      })();
       const canServeStaticPage =
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
@@ -2899,11 +2925,20 @@ async function __handleRequest(request, env, ctx) {
         // from \`edgeRouteParams\` below (not URL re-parsing), so the handler
         // still gets the correct params for the rewritten route.
         // See isRewritten comment in static-asset block — bracket-form
-        // invocationTargets are dynamic matches, not rewrites.
-        const isEdgeRewrite =
-          result.invocationTarget?.pathname &&
-          result.invocationTarget.pathname !== url.pathname &&
-          !result.invocationTarget.pathname.includes("[");
+        // invocationTargets AND i18n locale-prefix additions are not
+        // rewrites.
+        const isEdgeRewrite = (() => {
+          const it = result.invocationTarget?.pathname;
+          if (!it || it === url.pathname) return false;
+          if (it.includes("[")) return false;
+          if (I18N && Array.isArray(I18N.locales)) {
+            for (const locale of I18N.locales) {
+              if (it === "/" + locale + url.pathname) return false;
+              if (url.pathname === "/" && it === "/" + locale) return false;
+            }
+          }
+          return true;
+        })();
         if (result.invocationTarget?.pathname && !isEdgeRewrite) {
           edgeRequestUrl.pathname = result.invocationTarget.pathname;
         }
@@ -3801,11 +3836,21 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     //
     // Fixes app-dir/hooks "usePathname should have the canonical url
     // pathname on rewrite".
-    // Bracket-form invocationTarget means dynamic-route matching, not a
-    // rewrite — see isRewritten comment in the static-asset serve block.
-    const isRewrite = targetUrl !== url.pathname &&
-      !!routeResult?.invocationTarget?.pathname &&
-      !targetUrl.includes("[");
+    // Bracket-form invocationTarget and i18n locale-prefix additions
+    // are not rewrites — see isRewritten comment in the static-asset
+    // serve block.
+    const isRewrite = (() => {
+      if (targetUrl === url.pathname) return false;
+      if (!routeResult?.invocationTarget?.pathname) return false;
+      if (targetUrl.includes("[")) return false;
+      if (I18N && Array.isArray(I18N.locales)) {
+        for (const locale of I18N.locales) {
+          if (targetUrl === "/" + locale + url.pathname) return false;
+          if (url.pathname === "/" && targetUrl === "/" + locale) return false;
+        }
+      }
+      return true;
+    })();
     if (isRewrite) {
       req.url = url.pathname + (url.search || "");
     } else {
