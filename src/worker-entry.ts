@@ -667,6 +667,47 @@ function __shouldRunMiddleware(url, headers) {
   return false;
 }
 
+// Walk ROUTING.beforeMiddleware for header-only rules that match the
+// request URL, and collect the headers they would emit. Header-only
+// rules come from \`nextConfig.headers()\` (no destination, no redirect
+// status). We use this on the static-asset shortcut path to ensure
+// \`next.config.js\` headers apply to public files like \`/favicon.ico\`,
+// matching Vercel's asset-serving behavior. Returns null if no rule
+// contributes headers, else a Headers object with the merged set.
+function __collectConfigHeaders(url, requestHeaders) {
+  if (!ROUTING || !Array.isArray(ROUTING.beforeMiddleware)) return null;
+  const out = new Headers();
+  let any = false;
+  for (const rule of ROUTING.beforeMiddleware) {
+    if (!rule || !rule.headers || typeof rule.headers !== "object") continue;
+    // Skip redirect rules (have destination and a 3xx status). Headers-only
+    // rules from user config have no \`status\` in the 3xx range and no
+    // \`destination\`.
+    if (
+      rule.status !== undefined &&
+      rule.status >= 300 &&
+      rule.status < 400
+    ) continue;
+    if (rule.destination) continue;
+    if (!rule.sourceRegex) continue;
+    let re;
+    try {
+      re = new RegExp(rule.sourceRegex);
+    } catch {
+      continue;
+    }
+    if (!re.test(url.pathname)) continue;
+    if (rule.has && !__checkHasConditions(rule.has, url, requestHeaders)) continue;
+    if (rule.missing && !__checkMissingConditions(rule.missing, url, requestHeaders)) continue;
+    for (const [k, v] of Object.entries(rule.headers)) {
+      if (v == null) continue;
+      out.set(k, String(v));
+      any = true;
+    }
+  }
+  return any ? out : null;
+}
+
 // Manually re-apply ROUTING.beforeFiles rewrites and check if the
 // destination is a path-only target (potential public file). The routing
 // layer applies these internally but only surfaces \`invocationTarget\` for
@@ -1806,7 +1847,30 @@ async function __handleRequest(request, env, ctx) {
       ) {
         try {
           const assetRes = await env.ASSETS.fetch(request);
-          if (assetRes.ok) return assetRes;
+          if (assetRes.ok) {
+            // Apply \`headers()\` config rules to static assets. @next/routing
+            // encodes those rules into \`ROUTING.beforeMiddleware\` with a
+            // source-regex + \`headers\` object (no \`destination\`, no
+            // redirect status). We don't run full \`resolveRoutes\` on this
+            // shortcut path (for perf), so evaluate beforeMiddleware header
+            // rules against the asset URL directly and merge any hits onto
+            // the response — otherwise \`next.config.js\` headers never land
+            // on public files like \`/favicon.ico\`.
+            // Fixes app-dir/no-duplicate-headers-next-config.
+            const configHeaders = __collectConfigHeaders(url, request.headers);
+            if (configHeaders) {
+              const merged = new Headers(assetRes.headers);
+              configHeaders.forEach((val, key) => {
+                merged.set(key, val);
+              });
+              return new Response(assetRes.body, {
+                status: assetRes.status,
+                statusText: assetRes.statusText,
+                headers: merged,
+              });
+            }
+            return assetRes;
+          }
         } catch {}
       }
 
