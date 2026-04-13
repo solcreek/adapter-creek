@@ -3459,15 +3459,25 @@ async function __handleRequest(request, env, ctx) {
               }
               // Case (b): no prerendered /404 — custom _error has
               // getInitialProps. Re-invoke /_error so it renders with the
-              // original req context.
+              // original req context. Pre-seed status=404 on routeResult
+              // so \`invokeNodeHandler\` sets \`res.statusCode = 404\`
+              // BEFORE \`_error.getInitialProps({res})\` runs — otherwise
+              // the default Error component reads \`res.statusCode = 200\`
+              // and the rendered \`__NEXT_DATA__.pageProps.statusCode\`
+              // comes out as 200, so the visible title says "200: An
+              // unexpected error has occurred" instead of "404: This
+              // page could not be found".
+              // Fixes getserversideprops "should render 404 correctly
+              // when notFound is returned".
               if (HANDLERS["/_error"]) {
                 const errorHandler = HANDLERS["/_error"];
                 const errorMod = await errorHandler.load();
+                const errorRouteResult = { ...(result || {}), status: 404 };
                 const errorRes = await invokeNodeHandler(
                   request,
                   errorMod,
                   ctx,
-                  result,
+                  errorRouteResult,
                   "/_error",
                   "PAGES",
                 );
