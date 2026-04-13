@@ -4002,7 +4002,33 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     })();
     const isAppRouterHandler = handlerType === "APP_PAGE";
     if (isRewrite && isAppRouterHandler) {
-      req.url = url.pathname + (url.search || "");
+      // App Router rewrite: keep the ORIGINAL pathname (for
+      // \`usePathname()\` canonical) but MERGE the nxtP-prefixed route
+      // param captures into the query string. Next.js's internal
+      // \`handleRewrites\` + \`normalizeQueryParams\` uses the nxtP*
+      // signal to identify which query keys are route params and
+      // strip them from the final \`searchParams\` prop. Without this,
+      // the captures that @next/routing already computed
+      // (\`domain=vercel-test\`, \`section=galleries/123\`) leak into
+      // App Router's \`searchParams\` because Next.js re-runs the
+      // rewrite internally against the page regex, which adds
+      // unprefixed dynamic params to the query — and never strips
+      // them because \`routeParamKeys\` stays empty.
+      // Fixes app-dir/rewrite-with-search-params.
+      const existing = new URLSearchParams(url.search || "");
+      const rm = routeResult?.routeMatches || {};
+      for (const [key, value] of Object.entries(rm)) {
+        if (!key.startsWith("nxtP")) continue;
+        if (/^[0-9]+$/.test(key)) continue;
+        if (value === undefined || value === null) continue;
+        if (Array.isArray(value)) {
+          for (const v of value) existing.append(key, String(v));
+        } else {
+          existing.set(key, String(value));
+        }
+      }
+      const mergedSearch = existing.toString();
+      req.url = url.pathname + (mergedSearch ? "?" + mergedSearch : "");
     } else {
       req.url = targetUrl + targetQuery;
     }
