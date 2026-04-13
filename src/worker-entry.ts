@@ -1184,8 +1184,25 @@ function __initManifests() {
           });
         }
         if (prop === "moduleLoading" || prop === "entryCSSFiles" || prop === "entryJSFiles") {
-          const first = clientReferenceManifestsPerRoute.values().next().value;
-          return first ? first[prop] : undefined;
+          // Next.js's manifests-singleton resolves these props against the
+          // CURRENT route's manifest (see app-render/manifests-singleton.ts).
+          // We were returning the FIRST manifest inserted, which hid
+          // route-specific CSS/JS entries and caused e.g. /_not-found
+          // (global-not-found convention) to render without its CSS links.
+          const workStore = typeof __nextWorkAsyncStorage?.getStore === "function"
+            ? __nextWorkAsyncStorage.getStore()
+            : undefined;
+          if (workStore?.route) {
+            const routeManifest = clientReferenceManifestsPerRoute.get(workStore.route);
+            if (routeManifest && routeManifest[prop] !== undefined) {
+              return routeManifest[prop];
+            }
+          }
+          // Fallback: scan until we find any manifest with this prop.
+          for (const manifest of clientReferenceManifestsPerRoute.values()) {
+            if (manifest && manifest[prop] !== undefined) return manifest[prop];
+          }
+          return undefined;
         }
         return undefined;
       }
