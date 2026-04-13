@@ -4155,6 +4155,15 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       return true;
     })();
     const isAppRouterHandler = handlerType === "APP_PAGE";
+    // Middleware rewrites are dynamic and not reproducible by Pages
+    // Router's internal handleRewrites (they'd need the middleware to
+    // be re-invoked). So we have to carry the target URL + mw-added
+    // search params through req.url in that case. Config rewrites, by
+    // contrast, ARE reproduced by handleRewrites internally — so for
+    // those Pages Router wants the ORIGINAL URL on req.url (so
+    // \`appProps.url\` / \`asPath\` / \`resolvedUrl\` all line up with
+    // what the client saw) and it'll re-run the rewrite itself.
+    const isMiddlewareRewrite = isRewrite && !!routeResult?.mwRewrite;
     if (isRewrite && isAppRouterHandler) {
       // App Router rewrite: keep the ORIGINAL pathname (for
       // \`usePathname()\` canonical) but MERGE the nxtP-prefixed route
@@ -4183,6 +4192,17 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       }
       const mergedSearch = existing.toString();
       req.url = url.pathname + (mergedSearch ? "?" + mergedSearch : "");
+    } else if (isRewrite && !isAppRouterHandler && !isMiddlewareRewrite) {
+      // Pages Router + CONFIG rewrite: keep req.url = original URL so
+      // \`ctx.req.url\` / \`appProps.url\` / \`router.asPath\` reflect the
+      // client's URL. Next.js's RouteModule.prepare() re-runs the
+      // config rewrites internally via handleRewrites and derives the
+      // correct params from the rewrite target. interpolateDynamicPath
+      // is a no-op on the original URL (no \`[param]\` placeholders to
+      // replace), so req.url stays unchanged through the render.
+      // Fixes getserversideprops "should have correct req.url and query
+      // for direct visit dynamic page rewrite direct" (+ siblings).
+      req.url = url.pathname + (url.search || "");
     } else {
       req.url = targetUrl + targetQuery;
     }
