@@ -3661,6 +3661,30 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   // Build IncomingMessage with body already buffered
   const req = new IncomingMessage();
   req.method = request.method;
+  // Populate Next.js's private request metadata so the app-render layer
+  // can reconstruct the caller's origin/protocol/host. Two consumers rely
+  // on this:
+  //   - action-handler.ts builds a same-origin fetch URL for the "single
+  //     pass" server-action redirect using
+  //     \`proto = getRequestMeta(req, "initProtocol") ?? "https"\`. Without
+  //     initProtocol we default to https — fine on real CF Workers but
+  //     breaks the local dev server (SSL handshake against HTTP port).
+  //   - base-server.ts uses initURL / initQuery / initProtocol for
+  //     preview-mode and header forwarding.
+  // Symbol.for(...) matches Next.js's own \`NEXT_REQUEST_META\` export.
+  const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
+  req[NEXT_REQUEST_META] = {
+    initURL: request.url,
+    initProtocol: url.protocol.replace(/:+$/, ""),
+    initQuery: {},
+  };
+  // Tell Next.js's server-action redirect codepath the real origin so
+  // its internal fetch (action-handler.ts:417) doesn't default to
+  // \`https://<host>\`. Setting \`__NEXT_PRIVATE_ORIGIN\` short-circuits
+  // the protocol-inference logic there. process.env on workerd is
+  // writable at runtime. This is per-request (safe under workerd's
+  // request-isolated model; each request runs in the same global but
+  // Next.js reads the env synchronously during action handling).
   // Use invocationTarget URL if available (handles rewrites).
   // Strip $nxtPrest sentinel from optional catch-all paths — Next.js uses
   // this internally but the handler should receive the path without it.
@@ -3758,6 +3782,20 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   if (isPagesDataRequest) {
     req.headers["x-nextjs-data"] = "1";
   }
+  // Set x-forwarded-proto to the real request protocol so Next.js's
+  // route-module.ts derives the correct origin for internal fetches
+  // (e.g. the server-action "single pass" redirect fetch that
+  // action-handler.ts performs when a Server Action calls \`redirect()\`).
+  // Without this, Next.js defaults to "https" and the internal fetch
+  // does an SSL handshake against our HTTP dev server → fails with
+  // ERR_SSL_PACKET_LENGTH_TOO_LONG, and the client stays on the
+  // current page instead of following the redirect.
+  if (!req.headers["x-forwarded-proto"]) {
+    req.headers["x-forwarded-proto"] = url.protocol.replace(/:+$/, "");
+  }
+  try {
+    process.env.__NEXT_PRIVATE_ORIGIN = url.origin;
+  } catch {}
   if (bodyBuffer) {
     // Ensure Content-Length is set — body parsers need it.
     req.headers['content-length'] = String(bodyBuffer.length);
