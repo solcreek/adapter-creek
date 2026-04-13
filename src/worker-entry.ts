@@ -2690,6 +2690,25 @@ async function __handleRequest(request, env, ctx) {
         const pid = pm?.preview?.previewModeId;
         return !!pid && cookieVal === pid;
       })();
+      // Crawler bypass for Pages Router fallback:true shells: when the
+      // request UA is a known crawler AND we're about to serve a
+      // bracket-form fallback shell (\`Loading...\`), invoke the handler
+      // dynamically instead so the full page renders. Next.js does this
+      // so crawlers (which don't run JS) see real content instead of
+      // the placeholder. Only apply to Pages Router bracket-shell
+      // entries — App Router and concrete prerenders are unaffected.
+      // Fixes e2e/prerender-crawler.test.ts "should block for crawler
+      // correctly".
+      const isCrawlerRequest = (() => {
+        const ua = request.headers.get("user-agent") || "";
+        if (!ua) return false;
+        // Mirrors Next.js's crawler regex (server/api-utils/node/try-get-preview-data).
+        // Covers googlebot, bingbot, yahoo slurp, duckduckbot, baiduspider,
+        // yandex, facebookexternalhit, ia_archiver, etc.
+        return /bot|spider|crawler|slurp|ia_archiver|facebookexternalhit/i.test(ua);
+      })();
+      const isServingBracketShell =
+        typeof servePath === "string" && servePath.includes("[") && !!staticEntry;
       const canServeStaticPage =
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
@@ -2699,6 +2718,7 @@ async function __handleRequest(request, env, ctx) {
         // serving HTML breaks soft navigation and skew detection.
         !nextDataAppRouterPath &&
         !isDraftModeRequest &&
+        !(isCrawlerRequest && isServingBracketShell) &&
         (!isRewritten || !hasHandlerForTarget);
       if (staticAssetPath && canServeStaticPage) {
         try {
