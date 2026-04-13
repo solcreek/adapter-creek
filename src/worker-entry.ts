@@ -570,8 +570,23 @@ function __checkMissingConditions(conditions, url, headers) {
 function __shouldRunMiddleware(url, headers) {
   const matchers = __getMiddlewareMatchers();
   if (matchers.length === 0) return true;
+  // Real Next.js URL-decodes the pathname before matching middleware
+  // matchers, so \`/vercel%20copy.svg\` matches the \`/vercel copy.svg\`
+  // matcher and \`/another%2fhello\` matches \`/another/hello\`. The raw
+  // pathname doesn't decode \`%20\` → space or \`%2f\` → \`/\`, so we
+  // also test against a decoded variant (when it differs).
+  // Fixes middleware-static-files URL-encoded sub-tests.
+  const candidates = [url.pathname];
+  try {
+    const decoded = decodeURIComponent(url.pathname);
+    if (decoded !== url.pathname) candidates.push(decoded);
+  } catch {}
   for (const m of matchers) {
-    if (!m.regex.test(url.pathname)) continue;
+    let matched = false;
+    for (const cand of candidates) {
+      if (m.regex.test(cand)) { matched = true; break; }
+    }
+    if (!matched) continue;
     if (!__checkHasConditions(m.has, url, headers)) continue;
     if (!__checkMissingConditions(m.missing, url, headers)) continue;
     return true;
