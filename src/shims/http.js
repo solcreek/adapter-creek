@@ -91,16 +91,56 @@ export class IncomingMessage extends EventEmitter {
   destroy() { this.emit("close"); return this; }
   [Symbol.asyncIterator]() {
     const self = this;
-    const chunks = [];
-    let done = false;
-    let resolve;
-    let pending = new Promise(r => { resolve = r; });
-    self.on("data", (chunk) => { chunks.push(chunk); resolve(); pending = new Promise(r => { resolve = r; }); });
-    self.on("end", () => { done = true; resolve(); });
+    // Drain both currently-buffered chunks AND any chunks that arrive
+    // via subsequent push() calls. Use a pull-based queue with a
+    // resolver so we wake up the awaiting consumer exactly when new
+    // data arrives or end is reached. This replaces an older
+    // implementation that went through on("data"/"end") events with a
+    // queueMicrotask + _startFlowing dance — on workerd the microtask
+    // timing was unreliable for bodyParser:false handlers that iterate
+    // the request body directly (they would hang forever).
+    const queue = [];
+    let ended = false;
+    let resolver = null;
+    const notify = () => {
+      if (resolver) {
+        const r = resolver;
+        resolver = null;
+        r();
+      }
+    };
+    // Seed the queue with any pre-buffered chunks. Clear the shim's
+    // buffer so a later push() goes straight into our queue.
+    for (const chunk of self._bufferedChunks) queue.push(chunk);
+    self._bufferedChunks = [];
+    self._flowing = true;
+    self._readableState.flowing = true;
+    if (self._ended) {
+      ended = true;
+      self._readableState.endEmitted = true;
+    }
+    // Replace push() so later chunks land in our queue. Keep the null
+    // sentinel semantics for end-of-stream.
+    const origPush = self.push.bind(self);
+    self.push = (chunk) => {
+      if (chunk === null) {
+        ended = true;
+        self._ended = true;
+        self.complete = true;
+        self._readableState.ended = true;
+        self._readableState.endEmitted = true;
+        notify();
+        return;
+      }
+      queue.push(chunk);
+      notify();
+    };
     return {
       async next() {
-        while (chunks.length === 0 && !done) await pending;
-        if (chunks.length > 0) return { done: false, value: chunks.shift() };
+        if (queue.length === 0 && !ended) {
+          await new Promise((r) => { resolver = r; });
+        }
+        if (queue.length > 0) return { done: false, value: queue.shift() };
         return { done: true, value: undefined };
       }
     };

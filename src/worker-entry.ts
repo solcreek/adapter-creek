@@ -3376,10 +3376,27 @@ class IncomingMessage extends _IM {
   }
   on(event, fn) {
     super.on(event, fn);
-    if (event === "data" && !this._customFlowing) queueMicrotask(() => this._startFlowing());
+    // Trigger flushing for any consumer-side event that reads data:
+    //   - "data": classic flowing mode listeners
+    //   - "readable": paused-mode readers (also used internally by
+    //     Readable's Symbol.asyncIterator)
+    // Without the "readable" branch, \`for await (const chunk of req)\` in
+    // handlers (bodyParser:false, server actions reading req directly)
+    // would hang forever: Readable's iterator waits on a "readable" event
+    // but our buffered push() never surfaces as one until _startFlowing
+    // runs. Fixes middleware-fetches-with-body bodyParser:false tests.
+    if ((event === "data" || event === "readable") && !this._customFlowing) {
+      queueMicrotask(() => this._startFlowing());
+    }
     return this;
   }
   resume() { this._startFlowing(); return super.resume(); }
+  [Symbol.asyncIterator]() {
+    // Ensure buffered body is flushed into the Readable before the
+    // native iterator starts awaiting "readable" / "end" events.
+    this._startFlowing();
+    return super[Symbol.asyncIterator]();
+  }
 }
 const ServerResponse = _SR;
 
