@@ -3264,12 +3264,19 @@ function collectHandlers(
     type: string,
   ) => {
     if (output.pathname.endsWith(".rsc")) return;
+    // Strip App Router route-group segments (\`(group)\`) so handlers are
+    // keyed on the user-visible URL. Only applies to APP_PAGE / APP_ROUTE
+    // types — Pages Router doesn't have groups.
+    const effectivePathname =
+      type === "APP_PAGE" || type === "APP_ROUTE"
+        ? stripRouteGroups(output.pathname)
+        : output.pathname;
     const importPath = output.edgeRuntime?.modulePath || output.filePath;
     const slotIdentity =
       output.edgeRuntime?.entryKey ||
       output.filePath ||
       importPath;
-    const existingIndex = handlerIndexes.get(output.pathname);
+    const existingIndex = handlerIndexes.get(effectivePathname);
     if (existingIndex !== undefined) {
       const existing = handlers[existingIndex];
       const existingIsSlot = isParallelSlotPath(
@@ -3286,7 +3293,7 @@ function collectHandlers(
     }
 
     const entry: HandlerEntry = {
-      pathname: output.pathname,
+      pathname: effectivePathname,
       importPath,
       varName: `_h${idx++}`,
       runtime: output.runtime,
@@ -3302,7 +3309,7 @@ function collectHandlers(
     if (existingIndex !== undefined) {
       handlers[existingIndex] = entry;
     } else {
-      handlerIndexes.set(output.pathname, handlers.length);
+      handlerIndexes.set(effectivePathname, handlers.length);
       handlers.push(entry);
     }
   };
@@ -3422,15 +3429,30 @@ function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, 
   return map;
 }
 
+// Strip App Router "route group" segments (\`(name)\`) from a pathname.
+// Groups are purely organizational in Next.js — they affect layout nesting
+// but are invisible in the URL. Next.js's adapter-emitted \`pathname\` for
+// a file under \`app/(group)/foo/sitemap.xml\` is \`/(group)/foo/sitemap.xml\`,
+// but the browser requests \`/foo/sitemap.xml\`. Our HANDLERS + PATHNAMES
+// lookups have to key on the user-visible URL, not the internal path.
+function stripRouteGroups(pathname: string): string {
+  if (!pathname.includes("(")) return pathname;
+  const stripped = pathname
+    .split("/")
+    .filter((seg) => !(seg.startsWith("(") && seg.endsWith(")") && seg.length > 2))
+    .join("/");
+  return stripped === "" ? "/" : stripped;
+}
+
 function collectPathnames(
   outputs: BuildContext["outputs"],
   manifests: Record<string, string>,
 ): string[] {
   const pathnames = new Set<string>();
   const supplementalMetadataRoutes = collectSupplementalMetadataRoutes(outputs, manifests);
-  for (const p of outputs.appPages) pathnames.add(p.pathname);
-  for (const r of outputs.appRoutes) pathnames.add(r.pathname);
-  for (const r of supplementalMetadataRoutes) pathnames.add(r.pathname);
+  for (const p of outputs.appPages) pathnames.add(stripRouteGroups(p.pathname));
+  for (const r of outputs.appRoutes) pathnames.add(stripRouteGroups(r.pathname));
+  for (const r of supplementalMetadataRoutes) pathnames.add(stripRouteGroups(r.pathname));
   for (const p of outputs.pages) pathnames.add(p.pathname);
   for (const a of outputs.pagesApi) pathnames.add(a.pathname);
   for (const s of outputs.staticFiles) pathnames.add(s.pathname);
