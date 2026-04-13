@@ -1546,6 +1546,26 @@ async function __handleRequest(request, env, ctx) {
   // from the incoming external request — see __INTERNAL_NEXT_HEADERS
   // comment for why.
   request = __filterInternalRequestHeaders(request);
+
+  // Normalize repeated slashes (\`//\`) and backslashes (\`\\\\\`) in the
+  // URL path. Real Next.js issues a 308 redirect to the cleaned URL so
+  // browsers land on a canonical form. Without this, paths like
+  // \`/basepath//to-sv\` 404 because the routing layer doesn't match
+  // double-slash variants. See base-server.ts:982.
+  // Fixes i18n-ignore-redirect-source-locale/redirects-with-basepath
+  // (16 sub-tests, the test produces \`basepath//to-sv\` from an
+  // empty-locale template literal).
+  {
+    const rawUrl = new URL(request.url);
+    if (/\\\\|\\/\\//.test(rawUrl.pathname)) {
+      const cleaned = rawUrl.pathname.replace(/\\\\/g, "/").replace(/\\/\\/+/g, "/");
+      const cleanedUrl = new URL(cleaned + (rawUrl.search || ""), rawUrl.origin);
+      return new Response(null, {
+        status: 308,
+        headers: { Location: cleanedUrl.toString() },
+      });
+    }
+  }
   // Reset patch state so Next.js will re-wrap fetch for this request.
   globalThis.fetch = __ourFetchWrapper;
   globalThis[__NEXT_PATCH_SYMBOL] = false;
