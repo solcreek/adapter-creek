@@ -1552,12 +1552,20 @@ async function __handleRequest(request, env, ctx) {
         !assetPath.startsWith("/_next/data/")
       ) {
         try {
-          // For basePath apps, the ASSETS binding stores files WITH the
-          // basePath prefix (/docs/_next/static/...) so we must use the
-          // ORIGINAL url.pathname for the fetch — not the stripped
-          // assetPath. The assetPath stripping above is only for the
-          // startsWith("/_next/") routing check.
-          const assetUrl = new URL(url.pathname, url.origin);
+          // Asset storage layout:
+          //   - basePath (\`/docs\`): assets live under \`/docs/_next/static/...\`
+          //   - assetPrefix (\`/cap\` or \`https://cdn/cap\`): assets live under
+          //     \`/_next/static/...\` (assetPrefix only changes the URL the
+          //     client uses, not on-disk layout)
+          // Always look up using \`<BASE_PATH><stripped-assetPath>\`. For
+          // assetPrefix-only builds, this drops the prefix; for basePath
+          // builds, it adds basePath back; for combined, it adds basePath
+          // after stripping assetPrefix.
+          // Fixes app-dir/asset-prefix-absolute: scripts include the
+          // absolute assetPrefix host, so test fetches local with
+          // \`/<prefix>/_next/static/...\` and expects 200.
+          const lookupPath = (BASE_PATH || "") + assetPath;
+          const assetUrl = new URL(lookupPath, url.origin);
           const assetReq = new Request(assetUrl, { headers: request.headers });
           const assetRes = await env.ASSETS.fetch(assetReq);
           if (assetRes.ok) return assetRes;
