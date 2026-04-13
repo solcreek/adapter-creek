@@ -132,28 +132,44 @@ function toAssetPathname(urlPathname) {
 }
 
 function createAssetsBinding(assetsDir) {
+  const base = path.resolve(assetsDir);
+  async function tryServe(candidatePath) {
+    const resolved = path.resolve(assetsDir, "." + candidatePath);
+    if (!resolved.startsWith(base)) return null;
+    if (!(await fileExists(resolved))) return null;
+    const fileStat = await stat(resolved);
+    if (!fileStat.isFile()) return null;
+    const headers = new Headers();
+    headers.set("Content-Type", getContentType(resolved));
+    headers.set("Content-Length", String(fileStat.size));
+    return new Response(Readable.toWeb(createReadStream(resolved)), {
+      status: 200,
+      headers,
+    });
+  }
   return {
     async fetch(request) {
       const url = new URL(request.url);
       const assetPath = toAssetPathname(url.pathname);
-      const resolved = path.resolve(assetsDir, "." + assetPath);
-      if (!resolved.startsWith(path.resolve(assetsDir))) {
-        return new Response("Forbidden", { status: 403 });
-      }
-      if (!(await fileExists(resolved))) {
-        return new Response("Not Found", { status: 404 });
-      }
-      const fileStat = await stat(resolved);
-      if (!fileStat.isFile()) {
-        return new Response("Not Found", { status: 404 });
-      }
-      const headers = new Headers();
-      headers.set("Content-Type", getContentType(resolved));
-      headers.set("Content-Length", String(fileStat.size));
-      return new Response(Readable.toWeb(createReadStream(resolved)), {
-        status: 200,
-        headers,
-      });
+      // Try literal (URL-encoded) path first so files whose on-disk
+      // names contain URL-encoded sequences (e.g. \`key/%2Fnodejs%2Fdynamic-page\`
+      // which Next.js writes verbatim to preserve slashes inside a
+      // dynamic param value) are served correctly. If that misses, try
+      // the URL-decoded form — required for \`generateStaticParams\`
+      // returning raw characters like \`sticks & stones\` where the
+      // file-on-disk name has the space/ampersand decoded. Real CF
+      // Workers handles both variants transparently; this mirrors that
+      // in the local dev server.
+      const literalRes = await tryServe(assetPath);
+      if (literalRes) return literalRes;
+      try {
+        const decoded = decodeURIComponent(assetPath);
+        if (decoded !== assetPath) {
+          const decodedRes = await tryServe(decoded);
+          if (decodedRes) return decodedRes;
+        }
+      } catch {}
+      return new Response("Not Found", { status: 404 });
     },
   };
 }

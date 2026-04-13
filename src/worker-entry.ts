@@ -2492,16 +2492,35 @@ async function __handleRequest(request, env, ctx) {
       // "should return HTML/data correctly for pre-rendered page".
       const resolvedIsBracketShell =
         resolvedPathname && resolvedPathname.includes("[");
+      // URL-decoded pathname for matching build-time prerender keys.
+      // generateStaticParams returns raw values (e.g. 'sticks & stones')
+      // and Next.js writes STATIC_PAGES keys with those raw values, but
+      // browsers fetch the URL-encoded form ('/sticks%20%26%20stones').
+      // Add a decoded candidate so the prerendered HTML is found.
+      // Fixes app-dir/prerender-encoding.
+      let decodedPathname = null;
+      if (url.pathname && url.pathname.includes("%")) {
+        try {
+          const dec = decodeURIComponent(url.pathname);
+          if (dec !== url.pathname) decodedPathname = dec;
+        } catch {}
+      }
       const concreteCandidates = [];
       if (url.pathname) {
         if (resolvedIsBracketShell && url.pathname !== resolvedPathname) {
           concreteCandidates.push(url.pathname);
+          if (decodedPathname) concreteCandidates.push(decodedPathname);
+        } else if (decodedPathname) {
+          concreteCandidates.push(decodedPathname);
         }
         if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
           const seg = url.pathname.split("/")[1] || "";
           if (!I18N.locales.includes(seg)) {
             const def = I18N.defaultLocale || I18N.locales[0];
             concreteCandidates.push("/" + def + url.pathname);
+            if (decodedPathname) {
+              concreteCandidates.push("/" + def + decodedPathname);
+            }
           }
         }
       }
