@@ -1502,7 +1502,50 @@ globalThis.fetch = function(input, init) {
 // patchFetch rebuild the chain fresh per-request.
 const __NEXT_PATCH_SYMBOL = Symbol.for("next-patch");
 const __ourFetchWrapper = globalThis.fetch;
+// Internal Next.js headers that must NOT be honored when sent by the
+// external client. These are normally set by the middleware proxy
+// chain (or by Next.js's IPC layer) and a malicious client could use
+// them to bypass framework invariants — e.g. sending
+// \`x-middleware-set-cookie\` would let the client implant cookies that
+// \`cookies()\` reads back as if middleware had set them. Keeps the worker
+// in sync with Next.js's \`filterInternalHeaders\` (server/lib/server-ipc/utils.ts).
+const __INTERNAL_NEXT_HEADERS = [
+  "x-middleware-rewrite",
+  "x-middleware-redirect",
+  "x-middleware-set-cookie",
+  "x-middleware-skip",
+  "x-middleware-override-headers",
+  "x-middleware-next",
+  "x-now-route-matches",
+  "x-matched-path",
+  "x-next-resume-state-length",
+];
+
+function __filterInternalRequestHeaders(req) {
+  let dirty = false;
+  const next = new Headers();
+  req.headers.forEach((val, key) => {
+    if (__INTERNAL_NEXT_HEADERS.includes(key.toLowerCase())) {
+      dirty = true;
+      return;
+    }
+    next.append(key, val);
+  });
+  if (!dirty) return req;
+  return new Request(req.url, {
+    method: req.method,
+    headers: next,
+    body: req.body,
+    ...(req.body ? { duplex: "half" } : {}),
+    redirect: req.redirect,
+  });
+}
+
 async function __handleRequest(request, env, ctx) {
+  // Strip Next.js internal headers (e.g. \`x-middleware-set-cookie\`)
+  // from the incoming external request — see __INTERNAL_NEXT_HEADERS
+  // comment for why.
+  request = __filterInternalRequestHeaders(request);
   // Reset patch state so Next.js will re-wrap fetch for this request.
   globalThis.fetch = __ourFetchWrapper;
   globalThis[__NEXT_PATCH_SYMBOL] = false;
