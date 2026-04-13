@@ -3501,8 +3501,19 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
         }
       });
     }
-    if (!h.has("x-nextjs-cache") && h.get("x-nextjs-prerender") === "1") {
-      h.set("x-nextjs-cache", "PRERENDER");
+    // When the handler emits \`x-nextjs-prerender: 1\` the response is a
+    // build-time prerender. Real Next.js exposes \`x-nextjs-cache:
+    // PRERENDER\` (or HIT) for these — never MISS — because the content
+    // came from the build artifact, regardless of whether our in-memory
+    // runtime cache was warm. Override any handler-set MISS so the
+    // prerender signal is consistent.
+    // Fixes app-root-params-getters/generate-static-params
+    // "should be statically prerenderable".
+    if (h.get("x-nextjs-prerender") === "1") {
+      const current = h.get("x-nextjs-cache");
+      if (!current || current === "MISS") {
+        h.set("x-nextjs-cache", "PRERENDER");
+      }
     }
     // Pages Router client reads \`x-nextjs-rewrite\` on both data
     // responses and initial HTML responses to track the "virtual" URL
