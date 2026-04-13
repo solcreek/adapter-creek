@@ -2869,6 +2869,50 @@ async function __handleRequest(request, env, ctx) {
           }
         } catch {}
       }
+      // Pages Router 404 fallback: when getStaticProps returns
+      // \`{ notFound: true }\`, Pages Router's pages-handler invokes
+      // \`render404\` which we don't provide, so it falls back to writing
+      // the bare text \`This page could not be found\` (see
+      // pages-handler.ts:121). For fixtures with a custom \`pages/_error.js\`
+      // (and no \`pages/404.js\`), the user expects \`_error\` to be
+      // rendered with \`statusCode=404\` and the original req.url. Detect
+      // this fallback and re-invoke the \`/_error\` handler with the
+      // original request to render the user's _error component.
+      // Fixes error-handler-not-found-req-url.
+      if (
+        __invokedResponse &&
+        __invokedResponse.status === 404 &&
+        handler.type === "PAGES" &&
+        !staticPagesDataRoutePath &&
+        !nextDataAppRouterPath &&
+        HANDLERS["/_error"]
+      ) {
+        try {
+          const cloned = __invokedResponse.clone();
+          const ct = cloned.headers.get("content-type") || "";
+          // Only intercept the raw text fallback; if the handler already
+          // rendered an HTML 404 (e.g. via \`pages/404.js\`), keep it.
+          if (!ct.includes("text/html")) {
+            const text = await cloned.text();
+            if (text.trim() === "This page could not be found") {
+              const errorHandler = HANDLERS["/_error"];
+              const errorMod = await errorHandler.load();
+              const errorRes = await invokeNodeHandler(
+                request,
+                errorMod,
+                ctx,
+                result,
+                "/_error",
+              );
+              // _error renders with 200; force 404 to match original.
+              if (errorRes && errorRes.body) {
+                const headers = new Headers(errorRes.headers);
+                return new Response(errorRes.body, { status: 404, headers });
+              }
+            }
+          }
+        } catch {}
+      }
       return __invokedResponse;
     } catch (err) {
       const msg = err instanceof Error ? (err.stack || err.message) : String(err);
