@@ -100,6 +100,17 @@ export NEXT_ADAPTER_PATH="${ADAPTER_PATH}"
 # setup and the build would fail to resolve the mock package. Patch the
 # existing build script to carry our \`--experimental-next-config-strip-types\`
 # flag and delegate to it via \`pnpm run build\`.
+# Pre-allocate port and deployment ID BEFORE build. Real Vercel-style
+# deploys set NEXT_DEPLOYMENT_ID at build time so Next.js can bake
+# \`?dpl=<id>\` into static asset URLs (skew protection). Tests like
+# \`app-dir/worker\` observe browser network requests and assert that
+# every \`/_next/\` URL carries the right \`dpl\` query value matching
+# \`next.assetToken = next.deploymentId\`. Setting the env after build
+# means asset URLs lack the param and the test fails.
+PORT=$((3000 + RANDOM % 10000))
+export NEXT_DEPLOYMENT_ID="${NEXT_DEPLOYMENT_ID:-local-${PORT}}"
+log "Pre-allocated PORT=${PORT}, NEXT_DEPLOYMENT_ID=${NEXT_DEPLOYMENT_ID}"
+
 log "Running next build via pnpm..."
 node -e "
 const fs = require('fs');
@@ -148,8 +159,7 @@ HEALTHCHECK_PATH="${BASE_PATH}/_next/static/${BUILD_ID}/_buildManifest.js"
 ADAPTER_OUTPUT=".creek/adapter-output"
 WORKER_SERVER="${ADAPTER_DIR}/scripts/worker-dev-server.mjs"
 
-# Start local worker server in background on a random port
-PORT=$((3000 + RANDOM % 10000))
+# PORT was pre-allocated before build (see top of script).
 log "Starting local server on port ${PORT}..."
 node "${WORKER_SERVER}" \
   --worker "${ADAPTER_OUTPUT}/server/worker.js" \
@@ -188,10 +198,12 @@ if ! curl -fsS "http://localhost:${PORT}${HEALTHCHECK_PATH}" > /dev/null 2>&1; t
   exit 1
 fi
 
-# Save metadata for logs script
+# Save metadata for logs script. DEPLOYMENT_ID matches NEXT_DEPLOYMENT_ID
+# baked into the build so \`?dpl=\` query in asset URLs lines up with
+# what the test harness reads from \`next.deploymentId\`.
 {
   echo "BUILD_ID: ${BUILD_ID}"
-  echo "DEPLOYMENT_ID: local-${PORT}"
+  echo "DEPLOYMENT_ID: ${NEXT_DEPLOYMENT_ID}"
   echo "IMMUTABLE_ASSET_TOKEN: undefined"
 } > .adapter-build.log
 
