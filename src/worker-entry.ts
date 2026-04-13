@@ -2479,40 +2479,54 @@ async function __handleRequest(request, env, ctx) {
       // fallback shell when the URL matches one. Try the literal URL path
       // (with default locale prefix) before the bracket form.
       let servePath = resolvedPathname || url.pathname;
-      let staticEntry = STATIC_PAGES[servePath];
-      // Two fallback candidates worth trying:
-      //   1. The literal URL pathname (for SSG fallback shells matched
-      //      on the bracket route — e.g. resolvedPathname
-      //      \`/blog/[slug]\` but a real prerender exists at
-      //      \`/blog/first\`).
-      //   2. The URL pathname prefixed with the default i18n locale (for
-      //      Pages Router i18n: \`/new-home\` should serve
-      //      \`/en/new-home\` when the defaultLocale is \`en\` and no
-      //      locale appears in the URL). Without this, after a
-      //      middleware \`Response.redirect(url)\` where \`url.pathname =
-      //      "/new-home"\` the browser follows to an unprefixed URL
-      //      that 404s — breaks middleware-redirects.
-      if (!staticEntry && url.pathname) {
-        const candidates = [];
-        if (
-          resolvedPathname &&
-          resolvedPathname.includes("[") &&
-          url.pathname !== resolvedPathname
-        ) {
-          candidates.push(url.pathname);
+      // For SSG fallback:true pages, STATIC_PAGES holds BOTH the fallback
+      // shell (under the bracket route, e.g.
+      // \`/en/fallback-true-blog/[slug]\` → "Loading..." HTML) AND each
+      // build-time prerendered slug (\`/en/fallback-true-blog/first\`). If
+      // resolvedPathname is the bracket form, a direct lookup hits the
+      // shell — wrong for URLs that match a concrete prerender. Prefer
+      // the literal URL (with default-locale prefix if missing) whenever
+      // it's also in STATIC_PAGES, falling back to the bracket entry.
+      // Without this the browser sees the fallback shell for every
+      // build-time slug, breaking middleware-rewrites
+      // "should return HTML/data correctly for pre-rendered page".
+      const resolvedIsBracketShell =
+        resolvedPathname && resolvedPathname.includes("[");
+      const concreteCandidates = [];
+      if (url.pathname) {
+        if (resolvedIsBracketShell && url.pathname !== resolvedPathname) {
+          concreteCandidates.push(url.pathname);
         }
         if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
           const seg = url.pathname.split("/")[1] || "";
           if (!I18N.locales.includes(seg)) {
             const def = I18N.defaultLocale || I18N.locales[0];
-            candidates.push("/" + def + url.pathname);
+            concreteCandidates.push("/" + def + url.pathname);
           }
         }
-        for (const cand of candidates) {
+      }
+      let staticEntry = null;
+      if (resolvedIsBracketShell) {
+        // Try concrete prerenders before the shell.
+        for (const cand of concreteCandidates) {
           if (STATIC_PAGES[cand]) {
             servePath = cand;
             staticEntry = STATIC_PAGES[cand];
             break;
+          }
+        }
+        if (!staticEntry) {
+          staticEntry = STATIC_PAGES[servePath];
+        }
+      } else {
+        staticEntry = STATIC_PAGES[servePath];
+        if (!staticEntry && url.pathname) {
+          for (const cand of concreteCandidates) {
+            if (STATIC_PAGES[cand]) {
+              servePath = cand;
+              staticEntry = STATIC_PAGES[cand];
+              break;
+            }
           }
         }
       }
@@ -3745,6 +3759,14 @@ function getNormalizedRouteParams(routeResult, handlerPathname, fallbackUrl) {
   for (const [key, value] of Object.entries(routeResult?.routeMatches || {})) {
     if (value === "$nxtPrest" || value === "%24nxtPrest") continue;
     if (/^[0-9]+$/.test(key)) continue;
+    // \`nextLocale\` is i18n metadata from @next/routing's route regex
+    // (\`(?<nextLocale>[^/]{1,})\`). It is not a user-facing param — Next.js
+    // reads the active locale from \`renderOpts.locale\`/\`req.locale\`. If we
+    // forward it as a route param, Pages Router merges it into
+    // \`__NEXT_DATA__.query\`, leaking into \`router.query.nextLocale\`
+    // (observed on middleware-rewrites "should handle static dynamic
+    // rewrite from middleware correctly").
+    if (key === "nextLocale") continue;
     const normalizedKey = key.startsWith("nxtP") ? key.slice(4) : key;
     if (/^[0-9]+$/.test(normalizedKey)) continue;
     normalizedRouteParams[normalizedKey] = value;
@@ -3761,6 +3783,8 @@ function getNormalizedResolvedQuery(routeResult) {
   const normalizedResolvedQuery = {};
   for (const [key, value] of Object.entries(routeResult?.resolvedQuery || {})) {
     if (value === "$nxtPrest" || value === "%24nxtPrest") continue;
+    // Same i18n marker — never surfaces as a user-facing query param.
+    if (key === "nextLocale") continue;
     const normalizedKey = key.startsWith("nxtP") ? key.slice(4) : key;
     if (/^[0-9]+$/.test(normalizedKey)) continue;
     normalizedResolvedQuery[normalizedKey] = value;
@@ -3784,6 +3808,10 @@ function getRawResolvedQueryForUrl(routeResult) {
     // catch-all paths (e.g. \`$nxtPslug\`, \`$nxtPrest\`, plus URL-encoded forms).
     if (typeof value === "string" && (value.startsWith("$nxtP") || value.startsWith("%24nxtP"))) continue;
     if (/^[0-9]+$/.test(key)) continue;
+    // Never propagate i18n internal marker as a URL search param — Pages
+    // Router's parsedUrl.query fallback would pick it up and leak it into
+    // \`router.query\`.
+    if (key === "nextLocale") continue;
     result[key] = value;
   }
   return result;
@@ -3963,7 +3991,37 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       }
       return true;
     })();
-    if (isRewrite) {
+    // Middleware locale switch: when i18n middleware sets \`url.locale\` and
+    // rewrites (e.g. /country?my-locale=es → rewrite URL /es/country/us),
+    // the rewrite target carries a different locale prefix than the
+    // incoming URL's (detected/default) locale. Pages Router infers the
+    // active locale from \`req.url\` — if we preserve the original
+    // (locale-less) URL here, \`getStaticProps({locale})\` is called with
+    // the default locale and the page renders \`locale=en\` instead of
+    // \`locale=es\`. Detect the locale swap and carry the rewrite target's
+    // locale through req.url; App Router's \`usePathname\` still sees the
+    // canonical URL via \`initURL\` / \`mwRewrite\`.
+    // Fixes middleware-rewrites "should allow to rewrite to a different
+    // locale".
+    let localeSwitched = false;
+    if (
+      isRewrite &&
+      I18N &&
+      Array.isArray(I18N.locales) &&
+      routeResult?.mwRewrite
+    ) {
+      const targetFirstSeg = targetUrl.split("/")[1] || "";
+      const originalFirstSeg = url.pathname.split("/")[1] || "";
+      const targetHasLocale = I18N.locales.includes(targetFirstSeg);
+      const originalHasLocale = I18N.locales.includes(originalFirstSeg);
+      const originalLocale = originalHasLocale
+        ? originalFirstSeg
+        : I18N.defaultLocale;
+      if (targetHasLocale && targetFirstSeg !== originalLocale) {
+        localeSwitched = true;
+      }
+    }
+    if (isRewrite && !localeSwitched) {
       req.url = url.pathname + (url.search || "");
     } else {
       req.url = targetUrl + targetQuery;
