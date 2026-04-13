@@ -3190,10 +3190,10 @@ async function __handleRequest(request, env, ctx) {
         __invokedResponse = await __withMinimalWorkStore(
           handler.pathname,
           ctx,
-          () => invokeNodeHandler(request, mod, ctx, result, handler.pathname),
+          () => invokeNodeHandler(request, mod, ctx, result, handler.pathname, handler.type),
         );
       } else {
-        __invokedResponse = await invokeNodeHandler(request, mod, ctx, result, handler.pathname);
+        __invokedResponse = await invokeNodeHandler(request, mod, ctx, result, handler.pathname, handler.type);
       }
       // For Pages Router page errors (status 500 from getServerSideProps
       // throwing) on a NON-data URL navigation, replace our generic JSON
@@ -3292,6 +3292,7 @@ async function __handleRequest(request, env, ctx) {
                   ctx,
                   result,
                   "/_error",
+                  "PAGES",
                 );
                 if (errorRes && errorRes.body) {
                   const headers = new Headers(errorRes.headers);
@@ -3857,7 +3858,7 @@ function applyStaticAssetHeaders(headers, pathname) {
  * The Response is returned as soon as headers are sent (writeHead/first write),
  * enabling Server Components streaming, PPR, and progressive rendering.
  */
-async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname) {
+async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname, handlerType) {
   const url = new URL(request.url);
   const normalizedRouteParams = getNormalizedRouteParams(routeResult, handlerPathname, url);
   const isRSCRequest = request.headers.has("rsc");
@@ -3963,22 +3964,30 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     }
     req.url = dataPath + (targetQuery || "");
   } else {
-    // For config/middleware rewrites, preserve the ORIGINAL URL in
-    // req.url so that App Router's \`usePathname()\` returns the canonical
-    // (pre-rewrite) URL. The route module has already been pre-selected
-    // by the worker (we're invoking it directly), so \`req.url\` doesn't
-    // need to carry the rewrite target — app-render reads route params
-    // from \`renderOpts.params\` (not from re-parsing \`req.url\`).
-    //
-    // Detect rewrite: invocationTarget differs from the original URL path.
-    // Use original url.pathname in that case; otherwise fall back to
-    // targetUrl (unchanged for non-rewrite requests).
-    //
-    // Fixes app-dir/hooks "usePathname should have the canonical url
-    // pathname on rewrite".
+    // For config/middleware rewrites we have a router-type split:
+    //   • App Router (\`handler.type === "APP_PAGE"\`) reads
+    //     \`usePathname()\` from \`req.url\` — it does NOT fall back to
+    //     \`requestMeta.initURL\` when req.url has been rewritten. So we
+    //     must preserve the ORIGINAL URL on req.url to keep the
+    //     canonical pre-rewrite pathname (app-dir/hooks
+    //     "usePathname should have the canonical url pathname on
+    //     rewrite").
+    //   • Pages Router reads query + locale from \`req.url\`, so it
+    //     needs the REWRITE TARGET (with the mw-added search params
+    //     and the resolved locale prefix). Using the original URL
+    //     here drops:
+    //       – search params that \`NextResponse.rewrite(url)\` added
+    //         (\`from\`, \`some\`) — middleware-trailing-slash
+    //         "should have correct query values for rewrite to ssg
+    //         page" and the two route-param-merge tests.
+    //       – locale swaps via \`url.locale = '…'\` (which used to
+    //         need a dedicated carve-out).
+    //       – trailing slash preservation on data-request URLs
+    //         ("should normalize data requests into page requests").
     // Bracket-form invocationTarget and i18n locale-prefix additions
-    // are not rewrites — see isRewritten comment in the static-asset
-    // serve block.
+    // still aren't "rewrites" — they resolve dynamically on the same
+    // URL — so fall back to targetUrl only when we have a true
+    // rewrite detected below.
     const isRewrite = (() => {
       if (targetUrl === url.pathname) return false;
       if (!routeResult?.invocationTarget?.pathname) return false;
@@ -3991,37 +4000,8 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       }
       return true;
     })();
-    // Middleware locale switch: when i18n middleware sets \`url.locale\` and
-    // rewrites (e.g. /country?my-locale=es → rewrite URL /es/country/us),
-    // the rewrite target carries a different locale prefix than the
-    // incoming URL's (detected/default) locale. Pages Router infers the
-    // active locale from \`req.url\` — if we preserve the original
-    // (locale-less) URL here, \`getStaticProps({locale})\` is called with
-    // the default locale and the page renders \`locale=en\` instead of
-    // \`locale=es\`. Detect the locale swap and carry the rewrite target's
-    // locale through req.url; App Router's \`usePathname\` still sees the
-    // canonical URL via \`initURL\` / \`mwRewrite\`.
-    // Fixes middleware-rewrites "should allow to rewrite to a different
-    // locale".
-    let localeSwitched = false;
-    if (
-      isRewrite &&
-      I18N &&
-      Array.isArray(I18N.locales) &&
-      routeResult?.mwRewrite
-    ) {
-      const targetFirstSeg = targetUrl.split("/")[1] || "";
-      const originalFirstSeg = url.pathname.split("/")[1] || "";
-      const targetHasLocale = I18N.locales.includes(targetFirstSeg);
-      const originalHasLocale = I18N.locales.includes(originalFirstSeg);
-      const originalLocale = originalHasLocale
-        ? originalFirstSeg
-        : I18N.defaultLocale;
-      if (targetHasLocale && targetFirstSeg !== originalLocale) {
-        localeSwitched = true;
-      }
-    }
-    if (isRewrite && !localeSwitched) {
+    const isAppRouterHandler = handlerType === "APP_PAGE";
+    if (isRewrite && isAppRouterHandler) {
       req.url = url.pathname + (url.search || "");
     } else {
       req.url = targetUrl + targetQuery;
