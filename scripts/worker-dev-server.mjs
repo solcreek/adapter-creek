@@ -78,7 +78,13 @@ function getContentType(filePath) {
     case ".txt":
       return "text/plain; charset=utf-8";
     case ".xml":
-      return "application/xml; charset=utf-8";
+      // Match real CF Workers Assets behavior and the content-type that
+      // Next.js's sitemap route handler sets. Adding \`; charset=utf-8\`
+      // breaks tests that assert an exact match on the content-type
+      // (sitemap-group, use-cache-metadata-route-handler).
+      return "application/xml";
+    case ".webmanifest":
+      return "application/manifest+json";
     case ".svg":
       return "image/svg+xml";
     case ".png":
