@@ -3479,12 +3479,24 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
         h.set(key, String(val));
       }
     }
-    // Merge resolved headers from middleware (e.g., Set-Cookie, custom headers)
+    // Merge resolved headers from middleware. Middleware-set response
+    // headers (via \`NextResponse.next({ headers })\`) should OVERRIDE
+    // handler defaults — e.g. \`Cache-Control: max-age=1234\` from
+    // middleware must win over the handler's default cache-control on
+    // a static-asset response. Tests like
+    // no-duplicate-headers-middleware "should prioritise headers in
+    // middleware for static assets" depend on this. Skip
+    // content-encoding / content-length / transfer-encoding which
+    // describe the body the handler emitted.
     if (routeResult?.resolvedHeaders) {
       routeResult.resolvedHeaders.forEach((val, key) => {
-        if (key.toLowerCase() === "set-cookie") {
+        const k = key.toLowerCase();
+        if (k === "set-cookie") {
           h.append(key, val);
-        } else if (!h.has(key)) {
+        } else if (k === "content-encoding" || k === "content-length" || k === "transfer-encoding") {
+          // Don't let middleware overwrite body-describing headers.
+          if (!h.has(key)) h.set(key, val);
+        } else {
           h.set(key, val);
         }
       });
