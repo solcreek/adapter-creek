@@ -2461,6 +2461,18 @@ async function __handleRequest(request, env, ctx) {
         }
         return true;
       })();
+      // Only skip the prerendered-HTML serve for rewrites when we have
+      // a HANDLER we can invoke dynamically. For Pages Router auto-
+      // optimized / purely static App Router pages, there's no handler
+      // — the prerendered HTML is the only way to produce a response.
+      // Serving it for a rewrite may bake the target's pathname into
+      // the output, but that's the correct Pages Router behavior
+      // (auto-static pages don't use \`usePathname()\`); and test
+      // expectations match the prerender. Fixes middleware-general
+      // "should rewrite correctly for non-SSG/SSP page" where
+      // /rewrite-2 rewrites to /about/a (purely static).
+      const hasHandlerForTarget =
+        result?.resolvedPathname && !!HANDLERS[result.resolvedPathname];
       const canServeStaticPage =
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
@@ -2469,7 +2481,7 @@ async function __handleRequest(request, env, ctx) {
         // Pages Router's fetchNextData calls .json() on the body —
         // serving HTML breaks soft navigation and skew detection.
         !nextDataAppRouterPath &&
-        !isRewritten;
+        (!isRewritten || !hasHandlerForTarget);
       if (staticAssetPath && canServeStaticPage) {
         try {
           const assetRes = await env.ASSETS.fetch(
