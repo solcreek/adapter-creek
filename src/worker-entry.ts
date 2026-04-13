@@ -2314,6 +2314,17 @@ async function __handleRequest(request, env, ctx) {
         request.headers.has("rsc") ||
         request.headers.has("next-router-state-tree") ||
         url.searchParams.has("_rsc");
+      // When routing rewrote the URL, skip the prerendered-HTML serve so
+      // the handler is invoked dynamically. The prerendered HTML has the
+      // REWRITE TARGET's pathname baked in (via \`usePathname\` / metadata),
+      // but App Router's \`usePathname()\` must return the ORIGINAL URL
+      // (canonical, pre-rewrite). Dynamic invocation with \`req.url\` set
+      // to the original URL renders the correct canonical pathname.
+      // Fixes app-dir/hooks "usePathname should have the canonical url
+      // pathname on rewrite".
+      const isRewritten =
+        result?.invocationTarget?.pathname &&
+        result.invocationTarget.pathname !== url.pathname;
       const canServeStaticPage =
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
@@ -2321,7 +2332,8 @@ async function __handleRequest(request, env, ctx) {
         // Data URL requests must return JSON, not the prerendered HTML.
         // Pages Router's fetchNextData calls .json() on the body —
         // serving HTML breaks soft navigation and skew detection.
-        !nextDataAppRouterPath;
+        !nextDataAppRouterPath &&
+        !isRewritten;
       if (staticAssetPath && canServeStaticPage) {
         try {
           const assetRes = await env.ASSETS.fetch(
@@ -3588,7 +3600,26 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     }
     req.url = dataPath + (targetQuery || "");
   } else {
-    req.url = targetUrl + targetQuery;
+    // For config/middleware rewrites, preserve the ORIGINAL URL in
+    // req.url so that App Router's \`usePathname()\` returns the canonical
+    // (pre-rewrite) URL. The route module has already been pre-selected
+    // by the worker (we're invoking it directly), so \`req.url\` doesn't
+    // need to carry the rewrite target — app-render reads route params
+    // from \`renderOpts.params\` (not from re-parsing \`req.url\`).
+    //
+    // Detect rewrite: invocationTarget differs from the original URL path.
+    // Use original url.pathname in that case; otherwise fall back to
+    // targetUrl (unchanged for non-rewrite requests).
+    //
+    // Fixes app-dir/hooks "usePathname should have the canonical url
+    // pathname on rewrite".
+    const isRewrite = targetUrl !== url.pathname &&
+      !!routeResult?.invocationTarget?.pathname;
+    if (isRewrite) {
+      req.url = url.pathname + (url.search || "");
+    } else {
+      req.url = targetUrl + targetQuery;
+    }
   }
   // Prefer middleware-overridden request headers when available. These come
   // from \`NextResponse.next({ request: { headers } })\` and are required for
