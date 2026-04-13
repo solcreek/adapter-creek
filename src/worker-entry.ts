@@ -2310,10 +2310,16 @@ async function __handleRequest(request, env, ctx) {
         }
       }
       const staticAssetPath = staticEntry?.assetPath;
+      // \`_rsc\` query param alone does NOT indicate an RSC request — Next.js
+      // uses it as a cache-busting key for prefetches (NEXT_RSC_UNION_QUERY),
+      // and browsers legitimately issue HTML GETs with it present. Only the
+      // \`rsc\` / \`next-router-state-tree\` headers signal a true RSC request.
+      // Fixes app-inline-css "should not return rsc payload with inlined style
+      // as a dynamic client nav" (test fetches with \`_rsc\` query but no rsc
+      // header, expecting HTML + inlined <style>).
       const isAppRouterRSCRequest =
         request.headers.has("rsc") ||
-        request.headers.has("next-router-state-tree") ||
-        url.searchParams.has("_rsc");
+        request.headers.has("next-router-state-tree");
       // When routing rewrote the URL, skip the prerendered-HTML serve so
       // the handler is invoked dynamically. The prerendered HTML has the
       // REWRITE TARGET's pathname baked in (via \`usePathname\` / metadata),
