@@ -238,7 +238,23 @@ const env = {
 // Keeping the binding and the origin on "localhost" lets test assertions that
 // compare against `next.url` match without a hostname mismatch.
 const server = createServer(async (req, res) => {
-  const origin = `http://localhost:${port}`;
+  // Honor an explicit Host header when it differs from the loopback
+  // address we're listening on. Real CF Workers builds request.url
+  // from the actual Host, so routing/middleware can match on it
+  // (e.g. domain-based has-conditions). Our dev server previously
+  // always pinned origin to localhost, breaking tests like
+  // rewrite-with-search-params that force a non-loopback Host. We
+  // still fall back to localhost when no Host is present or when it
+  // points at the loopback, preserving NextURL's loopback
+  // normalization behavior for the common test path.
+  const hostHeader = req.headers.host;
+  let origin = `http://localhost:${port}`;
+  if (
+    hostHeader &&
+    !/^(localhost|127\.0\.0\.1|\[?::1\]?)(:|$)/i.test(hostHeader)
+  ) {
+    origin = `http://${hostHeader}`;
+  }
   const url = new URL(req.url || "/", origin);
   const headers = new Headers();
   for (const [key, value] of Object.entries(req.headers)) {

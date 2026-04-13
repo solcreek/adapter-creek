@@ -234,6 +234,65 @@ const ROUTING = ${JSON.stringify(opts.routing)};
 // same for direct visit and client-transition" expects /somewhere/else, we
 // were returning /en/somewhere/else. Fill in \`destination\` from the
 // Location header so the first match wins.
+// Build a per-request ROUTING copy with host-regex named captures
+// pre-substituted into rule destinations. Returns the original routing
+// object unchanged when no rule has host-regex named groups (common
+// case — costs one shallow scan).
+function __substituteHostCaptures(routing, url, headers) {
+  if (!routing || typeof routing !== "object") return routing;
+  const host = headers.get("host") || url.hostname;
+  if (!host) return routing;
+  const listNames = ["beforeFiles", "afterFiles", "fallback", "beforeMiddleware"];
+  let changed = false;
+  const patchList = (rules) => {
+    if (!Array.isArray(rules)) return rules;
+    let listChanged = false;
+    const out = [];
+    for (const rule of rules) {
+      if (!rule || !Array.isArray(rule.has)) { out.push(rule); continue; }
+      const hostCond = rule.has.find(
+        (c) => c && c.type === "host" && typeof c.value === "string"
+      );
+      if (!hostCond) { out.push(rule); continue; }
+      let groups = null;
+      try {
+        const m = host.match(new RegExp(hostCond.value));
+        if (m && m.groups) groups = m.groups;
+      } catch {}
+      if (!groups) { out.push(rule); continue; }
+      // Substitute $<name> references in destination + header values.
+      const substitute = (str) => {
+        if (typeof str !== "string") return str;
+        let next = str;
+        for (const [name, value] of Object.entries(groups)) {
+          if (value == null) continue;
+          // Replace $name and :name (both destination formats seen in
+          // routes-manifest.json).
+          next = next.replace(new RegExp("\\\\$" + name + "(?![a-zA-Z0-9_])", "g"), value);
+          next = next.replace(new RegExp(":" + name + "(?![a-zA-Z0-9_])", "g"), value);
+        }
+        return next;
+      };
+      const patched = { ...rule };
+      if (rule.destination) patched.destination = substitute(rule.destination);
+      if (rule.headers && typeof rule.headers === "object") {
+        const h = {};
+        for (const [k, v] of Object.entries(rule.headers)) h[k] = substitute(v);
+        patched.headers = h;
+      }
+      out.push(patched);
+      listChanged = true;
+    }
+    if (listChanged) changed = true;
+    return listChanged ? out : rules;
+  };
+  const patched = { ...routing };
+  for (const name of listNames) {
+    patched[name] = patchList(routing[name]);
+  }
+  return changed ? patched : routing;
+}
+
 function __normalizeRoutingRedirects(routing) {
   if (!routing || typeof routing !== "object") return routing;
   const patchList = (rules) => {
@@ -1862,6 +1921,23 @@ async function __handleRequest(request, env, ctx) {
       const __routingUrl = staticPagesDataRoutePath
         ? new URL((BASE_PATH || "") + staticPagesDataRoutePath + (url.search || ""), url.origin)
         : new URL(request.url);
+      // @next/routing workaround: its \`replaceDestination\` never exposes
+      // NAMED host-regex captures to the destination. A rule like
+      //   source: '/:path*',
+      //   has: [{ type: 'host', value: '(?<subdomain>[^.]+)\\\\.(?<domain>.*)' }],
+      //   destination: '/:subdomain/:path*'
+      // leaves \`$subdomain\` as a literal in the destination, then the
+      // subsequent dynamic-route match captures literal "$subdomain" as the
+      // route param. Pre-substitute host named groups into the destinations
+      // of any rules whose host regex matches the current request host so
+      // routing sees a fully-resolved destination.
+      // Fixes app-dir/rewrite-with-search-params and unblocks any build
+      // using subdomain-based rewrites.
+      const __routingForRequest = __substituteHostCaptures(
+        ROUTING,
+        __routingUrl,
+        routingClone.headers,
+      );
       let result = await resolveRoutes({
         url: __routingUrl,
         buildId: BUILD_ID,
@@ -1879,7 +1955,7 @@ async function __handleRequest(request, env, ctx) {
         headers: routingClone.headers,
         requestBody: routingClone.body,
         pathnames: PATHNAMES,
-        routes: ROUTING,
+        routes: __routingForRequest,
         invokeMiddleware: wrappedMiddlewareHandler,
       });
       if (mwModifiedRequestHeaders) {
