@@ -1950,11 +1950,37 @@ async function __handleRequest(request, env, ctx) {
       // routing sees a fully-resolved destination.
       // Fixes app-dir/rewrite-with-search-params and unblocks any build
       // using subdomain-based rewrites.
-      const __routingForRequest = __substituteHostCaptures(
+      let __routingForRequest = __substituteHostCaptures(
         ROUTING,
         __routingUrl,
         routingClone.headers,
       );
+      // For Pages Router data URLs, filter out the trailingSlash:true
+      // beforeMiddleware "add slash" rule. Real Next.js applies this
+      // rule to the human-facing page path, but @next/routing uses the
+      // denormalized form (\`/<page>\`) for data URLs too — so the rule
+      // matches and would emit a redirect for what should be a normal
+      // data URL fetch. Strip the rule for this request only.
+      if (assetPath.startsWith("/_next/data/")) {
+        const filtered = (__routingForRequest.beforeMiddleware || []).filter(
+          (r) => {
+            // Keep rules that are NOT a trailing-slash-add: rule must
+            // have status 308, Location ending with "/$1/", priority,
+            // and no \`missing\` clause to be the trailing-slash adder.
+            const loc = r?.headers?.Location || r?.headers?.location;
+            return !(
+              r.status === 308 &&
+              r.priority &&
+              !r.missing &&
+              typeof loc === "string" &&
+              loc.endsWith("/$1/")
+            );
+          },
+        );
+        if (filtered.length !== (__routingForRequest.beforeMiddleware || []).length) {
+          __routingForRequest = { ...__routingForRequest, beforeMiddleware: filtered };
+        }
+      }
       let result = await resolveRoutes({
         url: __routingUrl,
         buildId: BUILD_ID,
@@ -1998,18 +2024,31 @@ async function __handleRequest(request, env, ctx) {
       if (
         result.resolvedPathname &&
         result.invocationTarget?.pathname &&
-        result.invocationTarget.pathname !== result.resolvedPathname &&
-        PATHNAMES.includes(result.invocationTarget.pathname) &&
-        HANDLERS[result.invocationTarget.pathname]
+        result.invocationTarget.pathname !== result.resolvedPathname
       ) {
-        result = {
-          ...result,
-          resolvedPathname: result.invocationTarget.pathname,
-          // Drop the bogus dynamic-route params captured for the wrong
-          // handler — they carry the rewrite source's segments, not the
-          // target's params.
-          routeMatches: undefined,
-        };
+        const target = result.invocationTarget.pathname;
+        // Try literal target, then trailing-slash-stripped (for
+        // \`trailingSlash: true\` configs where mw rewrite produces
+        // \`/page/\` but PATHNAMES holds \`/page\`).
+        const candidates = [target];
+        if (target.length > 1 && target.endsWith("/")) {
+          candidates.push(target.slice(0, -1));
+        } else if (!target.endsWith("/")) {
+          candidates.push(target + "/");
+        }
+        for (const cand of candidates) {
+          if (PATHNAMES.includes(cand) && HANDLERS[cand]) {
+            result = {
+              ...result,
+              resolvedPathname: cand,
+              // Drop the bogus dynamic-route params captured for the
+              // wrong handler — they carry the rewrite source's
+              // segments, not the target's params.
+              routeMatches: undefined,
+            };
+            break;
+          }
+        }
       }
       // @next/routing bug workaround: \`replaceDestination\` replaces
       // \`$nxtPid\` before \`$nxtPid2\` via \`new RegExp("\\$" + key, "g")\`,
@@ -2114,6 +2153,13 @@ async function __handleRequest(request, env, ctx) {
       // smuggle the original query back in.
       if (result.status && result.status >= 300 && result.status < 400 && result.resolvedHeaders) {
         const location = result.resolvedHeaders.get("location") || result.resolvedHeaders.get("Location");
+        // Skip trailing-slash beforeMiddleware redirects for Pages Router
+        // data URLs: the data URL is the canonical form
+        // (\`/_next/data/<id>/<page>.json\`) — \`trailingSlash: true\` should
+        // never redirect it. @next/routing applies the rule to the
+        // denormalized form (\`/<page>\`) which DOES trigger the rule, so
+        // we have to filter it out at this layer. Detect: same status
+        // (308), location target equals the page-path with trailing
         if (location) {
           const shouldPreserveQuery = !!result.resolvedPathname;
           const finalLocation = shouldPreserveQuery
