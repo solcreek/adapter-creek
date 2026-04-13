@@ -2006,6 +2006,35 @@ async function __handleRequest(request, env, ctx) {
       }
       if (mwCapturedRewrite) {
         result = { ...result, mwRewrite: mwCapturedRewrite };
+        // When @next/routing fails to match the mw rewrite target
+        // (e.g. PATHNAMES holds only the bracket form \`/en/ssg/[slug]\`
+        // but the rewrite target is the prerendered slug
+        // \`/en/ssg/hello\`), surface the rewrite target as
+        // \`invocationTarget.pathname\`. The downstream static-page serve
+        // branch does \`STATIC_PAGES[invocationTarget.pathname]\` lookup
+        // and can find the prerendered HTML. Without this, the routing
+        // returns no resolvedPathname and we 404 even though the page
+        // exists on disk.
+        // Fixes middleware-general "should have correct query values
+        // for rewrite to ssg page" + similar mw-rewrite-to-prerender
+        // tests.
+        if (!result.resolvedPathname && !result.invocationTarget) {
+          try {
+            const rwPath = mwCapturedRewrite.split("?")[0];
+            // Pre-fill invocationTarget. The static-page serve will
+            // try STATIC_PAGES[rwPath]; the handler-resolution loop
+            // will try HANDLERS[rwPath].
+            result = {
+              ...result,
+              invocationTarget: { pathname: rwPath, query: {} },
+            };
+            // Also try to fill resolvedPathname by checking PATHNAMES
+            // and HANDLERS / STATIC_PAGES for the rewrite target.
+            if (PATHNAMES.includes(rwPath) || HANDLERS[rwPath] || STATIC_PAGES[rwPath]) {
+              result = { ...result, resolvedPathname: rwPath };
+            }
+          } catch {}
+        }
       }
       if (mwCapturedRedirect) {
         result = { ...result, mwRedirect: mwCapturedRedirect };
@@ -2087,32 +2116,43 @@ async function __handleRequest(request, env, ctx) {
           result = { ...result, resolvedQuery: fixedQuery };
         }
       }
-      // When resolvedPathname is a STATIC page (no bracket params),
-      // routing's matchesPathname-then-dynamicRoutes loop may have
-      // matched a sibling dynamic route (e.g. \`/[param]\`) and merged
-      // its destination query (\`nxtPparam=...\`) plus the
-      // \`nextLocale\` capture into resolvedQuery. The static handler
-      // doesn't have route params, so these markers leak into
-      // \`req.query\` and pollute the page's \`getServerSideProps\` /
-      // \`getStaticProps\` query argument. Strip them.
-      // Fixes middleware-rewrites "should clear query parameters".
-      if (
-        result.resolvedPathname &&
-        !/\\[/.test(result.resolvedPathname) &&
-        result.resolvedQuery
-      ) {
+      // Strip routing-internal markers from resolvedQuery before they
+      // reach the page. \`nextLocale\` is i18n metadata; the Pages Router
+      // client never adds it to user-facing \`router.query\`. nxtP* keys
+      // are the dynamic-route param captures: for STATIC pages they're
+      // bogus (no route params), for DYNAMIC pages they're already
+      // surfaced via routeMatches/params and shouldn't appear in
+      // \`router.query\` either.
+      // Fixes:
+      //   • middleware-rewrites "should clear query parameters"
+      //     (static rewrite target)
+      //   • middleware-general "should have correct query values for
+      //     rewrite to ssg page" (\`/[slug]\` target with i18n —
+      //     nextLocale leaked)
+      if (result.resolvedPathname && result.resolvedQuery) {
+        const isStatic = !result.resolvedPathname.includes("[");
         const cleanedQuery = {};
         for (const [k, v] of Object.entries(result.resolvedQuery)) {
+          // Always strip i18n marker — never user-visible.
           if (k === "nextLocale") continue;
-          if (k.startsWith("nxtP")) continue;
+          // Strip positional regex captures (numeric keys).
           if (/^[0-9]+$/.test(k)) continue;
+          // For static pages, also strip nxtP* (no route params).
+          if (isStatic && k.startsWith("nxtP")) continue;
           cleanedQuery[k] = v;
         }
-        result = {
-          ...result,
-          resolvedQuery: cleanedQuery,
-          routeMatches: undefined,
-        };
+        // Only mutate if changed.
+        const oldKeys = Object.keys(result.resolvedQuery);
+        const newKeys = Object.keys(cleanedQuery);
+        if (oldKeys.length !== newKeys.length) {
+          result = {
+            ...result,
+            resolvedQuery: cleanedQuery,
+            // Drop routeMatches only when we touched a static page —
+            // dynamic pages still need them to drive params.
+            routeMatches: isStatic ? undefined : result.routeMatches,
+          };
+        }
       }
       if (result.redirect) {
         // For Pages Router data requests, return 200 with
