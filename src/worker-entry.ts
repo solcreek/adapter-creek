@@ -1918,6 +1918,43 @@ async function __handleRequest(request, env, ctx) {
           routeMatches: undefined,
         };
       }
+      // @next/routing bug workaround: \`replaceDestination\` replaces
+      // \`$nxtPid\` before \`$nxtPid2\` via \`new RegExp("\\$" + key, "g")\`,
+      // which matches \`$nxtPid\` as a prefix of \`$nxtPid2\`. For a request
+      // /a/b to /[id]/[id2]:
+      //   - routeMatches.nxtPid  = "a" (correct)
+      //   - routeMatches.nxtPid2 = "b" (correct — from regex named groups)
+      //   - resolvedQuery.nxtPid2 = "a2" (WRONG — replaceDestination set
+      //     \`$nxtPid\` → "a" in the destination string "nxtPid2=$nxtPid2",
+      //     producing "a2" and leaving the literal "2" suffix)
+      // Fix: override resolvedQuery's nxtP* values from routeMatches, which
+      // holds the authoritative captures. App Router derives params from the
+      // URL search params (\`nxtPxxx=...\`), so fixing resolvedQuery
+      // propagates into handler invocation.
+      // Fixes use-params "should work for nested dynamic params".
+      if (
+        result.routeMatches &&
+        result.resolvedQuery &&
+        result.resolvedPathname
+      ) {
+        const fixedQuery = { ...result.resolvedQuery };
+        let changed = false;
+        // Sort keys by length desc so longer named groups don't shadow.
+        const sortedKeys = Object.keys(result.routeMatches)
+          .filter((k) => k.startsWith("nxtP") && !/^[0-9]+$/.test(k.slice(4)))
+          .sort((a, b) => b.length - a.length);
+        for (const key of sortedKeys) {
+          const authoritative = result.routeMatches[key];
+          if (authoritative == null) continue;
+          if (fixedQuery[key] !== authoritative) {
+            fixedQuery[key] = authoritative;
+            changed = true;
+          }
+        }
+        if (changed) {
+          result = { ...result, resolvedQuery: fixedQuery };
+        }
+      }
       // When resolvedPathname is a STATIC page (no bracket params),
       // routing's matchesPathname-then-dynamicRoutes loop may have
       // matched a sibling dynamic route (e.g. \`/[param]\`) and merged
@@ -2893,19 +2930,26 @@ async function __handleRequest(request, env, ctx) {
       // \`{ notFound: true }\`, Pages Router's pages-handler invokes
       // \`render404\` which we don't provide, so it falls back to writing
       // the bare text \`This page could not be found\` (see
-      // pages-handler.ts:121). For fixtures with a custom \`pages/_error.js\`
-      // (and no \`pages/404.js\`), the user expects \`_error\` to be
-      // rendered with \`statusCode=404\` and the original req.url. Detect
-      // this fallback and re-invoke the \`/_error\` handler with the
-      // original request to render the user's _error component.
-      // Fixes error-handler-not-found-req-url.
+      // pages-handler.ts:121).
+      //
+      // Two cases to handle:
+      //   (a) fixture has NO custom _error (framework default) — Next.js
+      //       prerenders /404/index.html at build time (framework default
+      //       says "This page could not be found"). Serve that.
+      //   (b) fixture has custom pages/_error.js that uses request-scoped
+      //       props (e.g. ctx.req.url) — Next.js SKIPS prerendering /404
+      //       because _error.getInitialProps makes it dynamic. Fall back
+      //       to re-invoking _error with the original request.
+      //
+      // Try (a) first via ASSETS; if /404 isn't prerendered, fall to (b).
+      // Fixes error-handler-not-found-req-url (case b) and
+      // middleware-general notFound:true (case a).
       if (
         __invokedResponse &&
         __invokedResponse.status === 404 &&
         handler.type === "PAGES" &&
         !staticPagesDataRoutePath &&
-        !nextDataAppRouterPath &&
-        HANDLERS["/_error"]
+        !nextDataAppRouterPath
       ) {
         try {
           const cloned = __invokedResponse.clone();
@@ -2915,19 +2959,46 @@ async function __handleRequest(request, env, ctx) {
           if (!ct.includes("text/html")) {
             const text = await cloned.text();
             if (text.trim() === "This page could not be found") {
-              const errorHandler = HANDLERS["/_error"];
-              const errorMod = await errorHandler.load();
-              const errorRes = await invokeNodeHandler(
-                request,
-                errorMod,
-                ctx,
-                result,
-                "/_error",
-              );
-              // _error renders with 200; force 404 to match original.
-              if (errorRes && errorRes.body) {
-                const headers = new Headers(errorRes.headers);
-                return new Response(errorRes.body, { status: 404, headers });
+              // Case (a): try prerendered /404/index.html from ASSETS.
+              const notFoundCandidates = [];
+              if (STATIC_PAGES["/404"]?.assetPath) {
+                notFoundCandidates.push(STATIC_PAGES["/404"].assetPath);
+              }
+              if (BASE_PATH) notFoundCandidates.push(BASE_PATH + "/404/index.html");
+              if (I18N && I18N.defaultLocale) {
+                const loc = I18N.defaultLocale;
+                if (BASE_PATH) notFoundCandidates.push(BASE_PATH + "/" + loc + "/404/index.html");
+                notFoundCandidates.push("/" + loc + "/404/index.html");
+              }
+              notFoundCandidates.push("/404/index.html");
+              for (const candidate of notFoundCandidates) {
+                try {
+                  const notFound = await env.ASSETS.fetch(new Request(new URL(candidate, url.origin)));
+                  if (notFound.ok) {
+                    const headers = new Headers();
+                    notFound.headers.forEach((val, key) => headers.set(key, val));
+                    headers.set("content-type", "text/html; charset=utf-8");
+                    return new Response(notFound.body, { status: 404, headers });
+                  }
+                } catch {}
+              }
+              // Case (b): no prerendered /404 — custom _error has
+              // getInitialProps. Re-invoke /_error so it renders with the
+              // original req context.
+              if (HANDLERS["/_error"]) {
+                const errorHandler = HANDLERS["/_error"];
+                const errorMod = await errorHandler.load();
+                const errorRes = await invokeNodeHandler(
+                  request,
+                  errorMod,
+                  ctx,
+                  result,
+                  "/_error",
+                );
+                if (errorRes && errorRes.body) {
+                  const headers = new Headers(errorRes.headers);
+                  return new Response(errorRes.body, { status: 404, headers });
+                }
               }
             }
           }
