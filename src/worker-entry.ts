@@ -2785,7 +2785,19 @@ async function __handleRequest(request, env, ctx) {
             ? { ...(result.resolvedQuery || {}), ...edgeRouteParams }
             : edgeRouteParams;
         const edgeRequestUrl = new URL(request.url);
-        if (result.invocationTarget?.pathname) {
+        // Only overwrite pathname when the invocation target matches the
+        // original URL (non-rewrite). For rewrites, keep the original URL
+        // so \`req.url\` / \`request.url\` seen by the handler reflects the
+        // canonical (pre-rewrite) URL. Pages Router's getServerSideProps
+        // returns \`props.url = req.url\`, which the test for
+        // \`edge-render-getserversideprops\` "should have correct query/params
+        // on rewrite" verifies matches the original URL. Route params come
+        // from \`edgeRouteParams\` below (not URL re-parsing), so the handler
+        // still gets the correct params for the rewritten route.
+        const isEdgeRewrite =
+          result.invocationTarget?.pathname &&
+          result.invocationTarget.pathname !== url.pathname;
+        if (result.invocationTarget?.pathname && !isEdgeRewrite) {
           edgeRequestUrl.pathname = result.invocationTarget.pathname;
         }
         // Merge middleware-rewritten query params. When middleware calls
