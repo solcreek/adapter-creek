@@ -114,9 +114,16 @@ if (script && !script.includes('--experimental-next-config-strip-types')) {
 }
 " >&2 2>&1
 if node -e "const p=JSON.parse(require('fs').readFileSync('package.json','utf8'));process.exit(p.scripts&&p.scripts.build?0:1);" 2>/dev/null; then
-  pnpm run build >&2 2>&1
+  # Tee build output both to stderr (for live debugging) and to
+  # \`.adapter-build-cli.log\` so the logs script can later replay it
+  # into \`cliOutput\`. Tests like
+  # \`app-dir/app-middleware.should warn when deprecated middleware file\`
+  # and \`cache-components-unstable-deprecations\` assert on warnings
+  # Next.js emits during \`next build\`; without capturing the build
+  # output those assertions see only the empty worker-dev-server log.
+  pnpm run build 2>&1 | tee .adapter-build-cli.log >&2
 else
-  npx next build --experimental-next-config-strip-types >&2 2>&1
+  npx next build --experimental-next-config-strip-types 2>&1 | tee .adapter-build-cli.log >&2
 fi
 log "next build complete"
 
