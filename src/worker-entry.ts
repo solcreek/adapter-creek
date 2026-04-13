@@ -2670,6 +2670,26 @@ async function __handleRequest(request, env, ctx) {
       // /rewrite-2 rewrites to /about/a (purely static).
       const hasHandlerForTarget =
         result?.resolvedPathname && !!HANDLERS[result.resolvedPathname];
+      // Draft mode bypass: when the request carries a valid
+      // \`__prerender_bypass\` cookie (value matching the build's
+      // previewModeId), we must invoke the handler dynamically so
+      // \`draftMode().isEnabled\` reflects ENABLED. Serving the cached
+      // prerender would bake DISABLED into the HTML — the cookie round-
+      // trip to /enable succeeds but the page read silently stays on
+      // the static shell.
+      // Fixes app-dir/draft-mode "should generate rand when draft mode
+      // enabled" and "should read other cookies when draft mode enabled".
+      const isDraftModeRequest = (() => {
+        const cookieHeader = request.headers.get("cookie");
+        if (!cookieHeader) return false;
+        const m = cookieHeader.match(/(?:^|;\\s*)__prerender_bypass=([^;]+)/);
+        if (!m) return false;
+        const cookieVal = m[1];
+        if (!cookieVal) return false;
+        const pm = __getPrerenderManifest();
+        const pid = pm?.preview?.previewModeId;
+        return !!pid && cookieVal === pid;
+      })();
       const canServeStaticPage =
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
@@ -2678,6 +2698,7 @@ async function __handleRequest(request, env, ctx) {
         // Pages Router's fetchNextData calls .json() on the body —
         // serving HTML breaks soft navigation and skew detection.
         !nextDataAppRouterPath &&
+        !isDraftModeRequest &&
         (!isRewritten || !hasHandlerForTarget);
       if (staticAssetPath && canServeStaticPage) {
         try {
@@ -3221,6 +3242,32 @@ async function __handleRequest(request, env, ctx) {
           } catch {}
         }
 
+        // Merge middleware-emitted response headers (Set-Cookie from
+        // \`NextResponse.next()\` / \`response.cookies.set()\` /
+        // \`draftMode().enable()\`) onto the edge handler's final response.
+        // Without this, edge API routes swallow Set-Cookie from middleware
+        // (node-runtime API routes + app pages go through \`invokeNodeHandler\`
+        // which already appends resolvedHeaders, so this only shows up on
+        // edge handlers). Fixes app-dir/app-middleware "Supports draft mode"
+        // for Edge Functions.
+        const __applyMwResponseHeaders = (edgeRes) => {
+          if (!(edgeRes instanceof Response)) return edgeRes;
+          if (!result?.resolvedHeaders) return edgeRes;
+          let touched = false;
+          const merged = new Headers(edgeRes.headers);
+          result.resolvedHeaders.forEach((val, key) => {
+            if (key.toLowerCase() === "set-cookie") {
+              merged.append(key, val);
+              touched = true;
+            }
+          });
+          if (!touched) return edgeRes;
+          return new Response(edgeRes.body, {
+            status: edgeRes.status,
+            statusText: edgeRes.statusText,
+            headers: merged,
+          });
+        };
         if (handler.entryKey && self._ENTRIES?.[handler.entryKey]) {
           try {
             const entry = self._ENTRIES[handler.entryKey];
@@ -3234,12 +3281,14 @@ async function __handleRequest(request, env, ctx) {
                 handler.entryKey,
                 () => proxiedHandler(edgeRequest, edgeHandlerContext),
               );
-              if (edgeResult instanceof Response) return edgeResult;
+              if (edgeResult instanceof Response) {
+                return __applyMwResponseHeaders(edgeResult);
+              }
               if (edgeResult?.response instanceof Response) {
                 if (edgeResult.waitUntil) {
                   ctx.waitUntil(Promise.resolve(edgeResult.waitUntil).catch(() => {}));
                 }
-                return edgeResult.response;
+                return __applyMwResponseHeaders(edgeResult.response);
               }
             }
 
@@ -3251,12 +3300,14 @@ async function __handleRequest(request, env, ctx) {
                   handler.entryKey,
                   () => fn(edgeRequest, edgeHandlerContext),
                 );
-                if (edgeResult instanceof Response) return edgeResult;
+                if (edgeResult instanceof Response) {
+                  return __applyMwResponseHeaders(edgeResult);
+                }
                 if (edgeResult?.response instanceof Response) {
                   if (edgeResult.waitUntil) {
                     ctx.waitUntil(Promise.resolve(edgeResult.waitUntil).catch(() => {}));
                   }
-                  return edgeResult.response;
+                  return __applyMwResponseHeaders(edgeResult.response);
                 }
               }
             }
