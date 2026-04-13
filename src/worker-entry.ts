@@ -3827,6 +3827,20 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
 
   // Build ServerResponse with streaming output
   const res = new ServerResponse(req);
+  // Pre-seed res.statusCode from routeResult.status so app-render's
+  // \`is404: res.statusCode === 404\` check (and equivalent checks for
+  // other error statuses) sees the correct status DURING rendering,
+  // not just at response-flush time. This is the signal the framework
+  // uses to inject default-404 metadata (e.g. \`<meta name="robots"
+  // content="noindex">\`) when rendering the not-found boundary for
+  // an unmatched URL. Without this the statusCode appears as 200 to
+  // the render layer, \`is404\` is false, and the noindex tag never
+  // gets emitted.
+  // Fixes metadata-navigation "should render root not-found with
+  // default metadata".
+  if (routeResult?.status && typeof routeResult.status === "number") {
+    res.statusCode = routeResult.status;
+  }
   let streamController;
   let streamClosed = false;
   const readable = new ReadableStream({
