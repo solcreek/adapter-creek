@@ -2421,9 +2421,20 @@ async function __handleRequest(request, env, ctx) {
       // to the original URL renders the correct canonical pathname.
       // Fixes app-dir/hooks "usePathname should have the canonical url
       // pathname on rewrite".
+      // A "rewrite" in the sense that should skip the prerendered-HTML
+      // serve is a CONFIG or MIDDLEWARE rewrite that points the URL at a
+      // different route (e.g. /source → /dest). @next/routing also
+      // exposes dynamic-route matching via \`invocationTarget.pathname\`,
+      // but with the bracket form (e.g. /[key]) — that's not a rewrite,
+      // just the route pattern. Treat bracket-form invocationTargets as
+      // normal dynamic matches so their prerendered variants still get
+      // served. Fixes next-after-app-deploy (and other ISR/SSG fixtures
+      // where the request URL matches a prerendered key that differs
+      // from the route pattern).
       const isRewritten =
         result?.invocationTarget?.pathname &&
-        result.invocationTarget.pathname !== url.pathname;
+        result.invocationTarget.pathname !== url.pathname &&
+        !result.invocationTarget.pathname.includes("[");
       const canServeStaticPage =
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
@@ -2887,9 +2898,12 @@ async function __handleRequest(request, env, ctx) {
         // on rewrite" verifies matches the original URL. Route params come
         // from \`edgeRouteParams\` below (not URL re-parsing), so the handler
         // still gets the correct params for the rewritten route.
+        // See isRewritten comment in static-asset block — bracket-form
+        // invocationTargets are dynamic matches, not rewrites.
         const isEdgeRewrite =
           result.invocationTarget?.pathname &&
-          result.invocationTarget.pathname !== url.pathname;
+          result.invocationTarget.pathname !== url.pathname &&
+          !result.invocationTarget.pathname.includes("[");
         if (result.invocationTarget?.pathname && !isEdgeRewrite) {
           edgeRequestUrl.pathname = result.invocationTarget.pathname;
         }
@@ -3787,8 +3801,11 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     //
     // Fixes app-dir/hooks "usePathname should have the canonical url
     // pathname on rewrite".
+    // Bracket-form invocationTarget means dynamic-route matching, not a
+    // rewrite — see isRewritten comment in the static-asset serve block.
     const isRewrite = targetUrl !== url.pathname &&
-      !!routeResult?.invocationTarget?.pathname;
+      !!routeResult?.invocationTarget?.pathname &&
+      !targetUrl.includes("[");
     if (isRewrite) {
       req.url = url.pathname + (url.search || "");
     } else {

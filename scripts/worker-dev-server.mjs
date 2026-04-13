@@ -113,7 +113,13 @@ async function fileExists(filePath) {
 }
 
 function toAssetPathname(urlPathname) {
-  const pathname = decodeURIComponent(urlPathname);
+  // Don't decode the URL — Next.js writes prerendered files with
+  // URL-encoded literal names (e.g. a page with param
+  // \`key=/nodejs/dynamic-page\` lives at
+  // \`assets/timestamp/key/%2Fnodejs%2Fdynamic-page/index.html\`). Decoding
+  // the \`%2F\` sequences turns them into real path separators and the
+  // file lookup misses.
+  const pathname = urlPathname;
   if (pathname.endsWith("/")) return pathname + "index.html";
   if (!path.extname(pathname)) return pathname + "/index.html";
   return pathname;
