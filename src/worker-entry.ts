@@ -438,6 +438,20 @@ if (
 ) {
   globalThis.__SERVER_FILES_MANIFEST.config.deploymentId = BUILD_ID;
 }
+// Effective deployment id used in skew-protection handshakes. Falls back to
+// BUILD_ID when the build didn't declare a \`nextConfig.deploymentId\` (or
+// NEXT_DEPLOYMENT_ID env var). When a build-time id IS declared, HTML
+// rendered by Next.js stamps \`data-dpl-id="\${deploymentId}"\` and asset URLs
+// carry \`?dpl=\${deploymentId}\`. Responses for \`/_next/data/*\` must echo
+// this same value in \`x-nextjs-deployment-id\`, otherwise the Pages Router
+// client detects a version skew and forces a hard navigation — which
+// breaks middleware-redirects / middleware-rewrites tests that assert
+// \`window.__SAME_PAGE === true\`.
+const DEPLOYMENT_ID =
+  (globalThis.__SERVER_FILES_MANIFEST &&
+    globalThis.__SERVER_FILES_MANIFEST.config &&
+    globalThis.__SERVER_FILES_MANIFEST.config.deploymentId) ||
+  BUILD_ID;
 globalThis.__BUILD_MANIFEST =
   globalThis.__BUILD_MANIFEST ||
   __parseJsonManifest("build-manifest.json") ||
@@ -2814,7 +2828,7 @@ async function __handleRequest(request, env, ctx) {
           const headers = new Headers();
           headers.set("content-type", "application/json");
           headers.set("x-nextjs-rewrite", result.mwRewrite);
-          headers.set("x-nextjs-deployment-id", BUILD_ID);
+          headers.set("x-nextjs-deployment-id", DEPLOYMENT_ID);
           headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
           if (result.resolvedHeaders) {
             result.resolvedHeaders.forEach((val, key) => {
@@ -2849,7 +2863,7 @@ async function __handleRequest(request, env, ctx) {
             if (dataAssetRes.ok) {
               const headers = new Headers(dataAssetRes.headers);
               if (!headers.has("x-nextjs-deployment-id")) {
-                headers.set("x-nextjs-deployment-id", BUILD_ID);
+                headers.set("x-nextjs-deployment-id", DEPLOYMENT_ID);
               }
               return new Response(dataAssetRes.body, {
                 status: 200,
@@ -2881,7 +2895,7 @@ async function __handleRequest(request, env, ctx) {
           if (isKnownStatic) {
             const headers = new Headers();
             headers.set("content-type", "application/json");
-            headers.set("x-nextjs-deployment-id", BUILD_ID);
+            headers.set("x-nextjs-deployment-id", DEPLOYMENT_ID);
             headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
             return new Response(JSON.stringify({ pageProps: {} }), {
               status: 200,
@@ -3307,7 +3321,7 @@ async function __handleRequest(request, env, ctx) {
       !response.headers.has("x-nextjs-deployment-id")
     ) {
       const headers = new Headers(response.headers);
-      headers.set("x-nextjs-deployment-id", BUILD_ID);
+      headers.set("x-nextjs-deployment-id", DEPLOYMENT_ID);
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
@@ -4156,7 +4170,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   const __DOCTYPE_BYTES = new TextEncoder().encode("<!DOCTYPE");
   const __HEAD_CLOSE_BYTES = new TextEncoder().encode("</head>");
   const __HTML_OPEN_BYTES = new TextEncoder().encode("<html");
-  const __DPL_ID_ATTR = new TextEncoder().encode(\` data-dpl-id="\${BUILD_ID}"\`);
+  const __DPL_ID_ATTR = new TextEncoder().encode(\` data-dpl-id="\${DEPLOYMENT_ID}"\`);
   function __indexOfBytes(haystack, needle) {
     if (needle.length === 0) return 0;
     const max = haystack.length - needle.length;
