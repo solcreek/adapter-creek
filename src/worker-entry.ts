@@ -3377,6 +3377,29 @@ async function __handleRequest(request, env, ctx) {
             }
           }
         } catch {}
+        // If no static 500.html is prerendered (e.g. pages/500.js is
+        // dynamic — uses getInitialProps or Error class), invoke the
+        // /500 handler directly to render "custom pages/500" HTML
+        // rather than the generic JSON \`render_error\` body.
+        // Fixes getserversideprops "should handle throw ENOENT correctly".
+        if (HANDLERS["/500"]) {
+          try {
+            const error500Handler = HANDLERS["/500"];
+            const error500Mod = await error500Handler.load();
+            const error500Res = await invokeNodeHandler(
+              request,
+              error500Mod,
+              ctx,
+              result,
+              "/500",
+              "PAGES",
+            );
+            if (error500Res && error500Res.body) {
+              const headers = new Headers(error500Res.headers);
+              return new Response(error500Res.body, { status: 500, headers });
+            }
+          } catch {}
+        }
       }
       // Pages Router 404 fallback: when getStaticProps returns
       // \`{ notFound: true }\`, Pages Router's pages-handler invokes
