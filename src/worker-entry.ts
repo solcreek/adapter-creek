@@ -3935,7 +3935,15 @@ function fillRouteParamsFromPath(routePattern, pathname, params) {
 function getNormalizedRouteParams(routeResult, handlerPathname, fallbackUrl) {
   const normalizedRouteParams = {};
   for (const [key, value] of Object.entries(routeResult?.routeMatches || {})) {
-    if (value === "$nxtPrest" || value === "%24nxtPrest") continue;
+    // Any \`$nxtP{paramName}\` sentinel represents a MISSING optional
+    // catch-all / optional dynamic segment. @next/routing uses these
+    // as placeholders (\`$nxtPrest\`, \`$nxtPlocale\`, \`$nxtPslug\`, …)
+    // when the URL didn't actually provide the param. They must never
+    // leak to the rendered page — Pages Router would render
+    // \`Locale: $nxtPlocale\` instead of the real locale.
+    // Fixes parallel-route-not-found-params \`$nxtPlocale\` leak on
+    // interception routes.
+    if (typeof value === "string" && (value.startsWith("$nxtP") || value.startsWith("%24nxtP"))) continue;
     if (/^[0-9]+$/.test(key)) continue;
     // \`nextLocale\` is i18n metadata from @next/routing's route regex
     // (\`(?<nextLocale>[^/]{1,})\`). It is not a user-facing param — Next.js
@@ -3960,7 +3968,9 @@ function getNormalizedRouteParams(routeResult, handlerPathname, fallbackUrl) {
 function getNormalizedResolvedQuery(routeResult) {
   const normalizedResolvedQuery = {};
   for (const [key, value] of Object.entries(routeResult?.resolvedQuery || {})) {
-    if (value === "$nxtPrest" || value === "%24nxtPrest") continue;
+    // Strip all \`$nxtP*\` sentinels (missing optional params) — see
+    // getNormalizedRouteParams for rationale.
+    if (typeof value === "string" && (value.startsWith("$nxtP") || value.startsWith("%24nxtP"))) continue;
     // Same i18n marker — never surfaces as a user-facing query param.
     if (key === "nextLocale") continue;
     const normalizedKey = key.startsWith("nxtP") ? key.slice(4) : key;
