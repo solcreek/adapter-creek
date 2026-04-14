@@ -4708,9 +4708,30 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     // parsedUrl.query before it becomes searchParams. If we pre-populate
     // \`query\` with our normalized (un-prefixed) version, Next.js sees those
     // keys as real search params and they leak into the page's searchParams.
+    // For a NON-dynamic route (no \`[…]\` segment in the handler path),
+    // pass \`params: undefined\` instead of \`{}\` through both the
+    // handler context and requestMeta. Next.js's app-route module
+    // reads \`context.params\` and calls
+    // \`createServerParamsForRoute(parsedUrlQueryToParams(context.params))\`
+    // only when params is truthy — \`{}\` is truthy, so we'd end up
+    // with \`params = Promise<{}>\` and user code doing
+    // \`params ? await params : null\` takes the truthy branch and
+    // returns \`{}\` where \`null\` was expected. Pages Router's
+    // \`RouteModule.prepare()\` similarly reads \`getRequestMeta(req,
+    // 'params')\` and uses that verbatim if present, so the
+    // requestMeta variant also needs to be undefined for non-dynamic
+    // routes.
+    // Fixes app-custom-routes "does not provide params to routes
+    // without dynamic parameters".
+    const isDynamicRoute =
+      typeof handlerPathname === "string" && handlerPathname.includes("[");
+    const paramsForHandler =
+      isDynamicRoute || Object.keys(normalizedRouteParams).length > 0
+        ? normalizedRouteParams
+        : undefined;
     const requestMeta = {
       minimalMode: false,
-      params: normalizedRouteParams,
+      params: paramsForHandler,
       resolvedPathname: routeResult?.resolvedPathname || handlerPathname,
       initURL: request.url,
       isRSCRequest,
@@ -4723,7 +4744,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       waitUntil: (p) => ctx.waitUntil(p.catch(() => {})),
       // Some Next.js handler templates still read params directly from ctx,
       // but App Router handlers consume requestMeta.params/query instead.
-      params: normalizedRouteParams,
+      params: paramsForHandler,
       requestMeta: {
         ...requestMeta,
         relativeProjectDir: ".",
