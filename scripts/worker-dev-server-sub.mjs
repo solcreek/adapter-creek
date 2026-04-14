@@ -185,14 +185,35 @@ console.error(
 
 // --- forward signals -------------------------------------------------------
 const shutdown = (sig) => {
+  console.error(`[worker-dev-server-sub] Received ${sig || "SIGTERM"}, shutting down...`);
+  // Forward signal to wrangler and all its children
   try {
-    wrangler.kill(sig || "SIGTERM");
-  } catch {}
+    // Kill the process group to ensure workerd also dies
+    process.kill(-wrangler.pid, sig || "SIGTERM");
+  } catch {
+    // If killing the group fails, try just the process
+    try {
+      wrangler.kill(sig || "SIGTERM");
+    } catch {}
+  }
   // Give wrangler a moment to clean up workerd then force-exit
-  setTimeout(() => process.exit(0), 2000).unref();
+  setTimeout(() => {
+    // Final force-kill if still running
+    try {
+      process.kill(-wrangler.pid, "SIGKILL");
+    } catch {}
+    process.exit(0);
+  }, 2000).unref();
 };
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
+
+// Handle uncaught errors to ensure cleanup
+process.on("uncaughtException", (err) => {
+  console.error("[worker-dev-server-sub] Uncaught exception:", err.message);
+  shutdown("SIGTERM");
+});
+
 wrangler.on("exit", (code) => {
   console.error(`[worker-dev-server-sub] wrangler exited code=${code}`);
   process.exit(code ?? 0);
