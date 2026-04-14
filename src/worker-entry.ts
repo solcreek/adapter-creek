@@ -4816,6 +4816,46 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
           res.end(JSON.stringify({ error: "render_error", message: err instanceof Error ? err.message : String(err) }));
         }
       });
+      // When the handler's Promise resolves, close the stream after a
+      // short write-idle window. Next.js's App Router streaming SSR
+      // pipeline does NOT always call res.end() — on Node the pipe
+      // machinery ends the socket implicitly, but under workerd the
+      // ReadableStream stays open indefinitely, so the browser never
+      // fires \`load\` and every Playwright waitForSelector times out.
+      //
+      // The window is necessary because React/Flight streaming can
+      // write in multiple bursts — a handler Promise may resolve
+      // before the last self.__next_f.push(...) script lands. We
+      // reset the timer on every res.write() so a steadily-streaming
+      // response stays open as long as chunks keep arriving; once
+      // chunks stop, we close within \`IDLE_MS\`.
+      const IDLE_MS = 250;
+      let idleTimer = null;
+      let handlerDone = false;
+      const armIdleClose = () => {
+        if (streamClosed || res.finished) return;
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          if (!handlerDone) return; // require handler to have resolved first
+          if (streamClosed || res.finished) return;
+          res.finished = true;
+          pendingWrites.then(() => {
+            if (!streamClosed && !responseDisallowsBody) {
+              streamClosed = true;
+              try { streamController.close(); } catch {}
+            }
+          }).catch(() => {});
+        }, IDLE_MS);
+      };
+      // Hook into write so we bump the idle timer on each chunk.
+      const prevWrite = res.write.bind(res);
+      res.write = function(chunk, encoding, cb) {
+        const r = prevWrite(chunk, encoding, cb);
+        if (handlerDone) armIdleClose();
+        return r;
+      };
+      handlerPromise.then(() => { handlerDone = true; armIdleClose(); },
+                         () => { handlerDone = true; armIdleClose(); });
       ctx.waitUntil(handlerPromise.catch(() => {}));
     }
   } catch (err) {
