@@ -4704,6 +4704,22 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     return res;
   };
 
+  // Override \`res.flushHeaders()\` so callers like Next.js's
+  // \`pipeToNodeResponse\` writer (pipe-readable.ts:71) route through our
+  // own header-flush path instead of the built-in ServerResponse._send.
+  // Under workerd our \`res.socket\` is a disconnected \`new Socket()\`,
+  // so Node's _send writes to a dead socket and synchronously emits
+  // \`close\` on the response. Next.js's \`createAbortController\` listens
+  // for that \`close\` event and aborts the pipe, chopping off everything
+  // after the first HTML chunk — notably the \`self.__next_f.push(...)\`
+  // Flight payload that the App Router client runtime needs to bootstrap.
+  // Fixes App Router client-side navigation (router.push → RSC fetch)
+  // by keeping the response stream alive until the render naturally
+  // completes.
+  res.flushHeaders = function() {
+    flushHeaders();
+  };
+
   // Invoke the handler — try multiple export patterns:
   // - mod.handler: standard Next.js handler export (app pages, routes)
   // - mod.routeModule.handle: route module instance method
