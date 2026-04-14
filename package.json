@@ -45,7 +45,7 @@
   },
   "dependencies": {
     "@next/routing": "16.2.3",
-    "wrangler": "^4.0.0"
+    "wrangler": "^4.82.2"
   },
   "peerDependencies": {
     "next": ">=16.2.3"
@@ -56,5 +56,6 @@
     "typescript": "^5.8.2",
     "urlpattern-polyfill": "^10.1.0",
     "vitest": "^4.1.2"
-  }
+  },
+  "packageManager": "pnpm@10.33.0"
 }

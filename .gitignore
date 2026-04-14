@@ -5,3 +5,4 @@ dist/
 *.tsbuildinfo
 package-lock.json
 nextjs/
+.wrangler/

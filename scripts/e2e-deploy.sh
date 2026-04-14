@@ -64,7 +64,7 @@ log "Running pnpm install..."
 # install into a ~5s link operation once the store is warm.
 # Dropping --force so pnpm can actually use the cached store. --force
 # would re-download every package.
-pnpm install --store-dir "${PNPM_STORE_DIR}" --no-frozen-lockfile --prefer-offline >&2 2>&1
+pnpm install --store-dir "${PNPM_STORE_DIR}" --no-frozen-lockfile --prefer-offline --ignore-scripts >&2 2>&1
 log "pnpm install complete"
 
 # Patch Next.js: fix invariant error for dynamic metadata routes in handleBuildComplete.
@@ -154,10 +154,12 @@ BASE_PATH=$(node -e "
 " 2>/dev/null || echo "")
 HEALTHCHECK_PATH="${BASE_PATH}/_next/static/${BUILD_ID}/_buildManifest.js"
 
-# Local test server runs the generated worker directly in Node to avoid
-# wrangler/miniflare buffering streamed action responses.
+# Local test server runs the generated worker in workerd (via wrangler dev),
+# the same runtime CF Workers prod uses. We previously ran in Node.js for
+# speed, but that hid streaming/HTTP-edge-case bugs that surface under
+# workerd — swapping here keeps dev/prod behavior consistent.
 ADAPTER_OUTPUT=".creek/adapter-output"
-WORKER_SERVER="${ADAPTER_DIR}/scripts/worker-dev-server.mjs"
+WORKER_SERVER="${ADAPTER_DIR}/scripts/worker-dev-server-sub.mjs"
 
 # PORT was pre-allocated before build (see top of script).
 log "Starting local server on port ${PORT}..."
