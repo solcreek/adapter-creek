@@ -1762,6 +1762,10 @@ async function __handleRequest(request, env, ctx) {
           const assetUrl = new URL(lookupPath, url.origin);
           const assetReq = new Request(assetUrl, { headers: request.headers });
           const assetRes = await env.ASSETS.fetch(assetReq);
+          // 304 Not Modified: pass through so the browser uses its cached
+          // copy. Falling through to "Not Found" on 304 would break every
+          // conditional GET for static chunks.
+          if (assetRes.status === 304) return assetRes;
           if (assetRes.ok) return assetRes;
         } catch {}
         // For /_next/static/ paths that aren't found, return plain 404
@@ -1847,6 +1851,12 @@ async function __handleRequest(request, env, ctx) {
       ) {
         try {
           const assetRes = await env.ASSETS.fetch(request);
+          // Pass 304 through on conditional GETs so the browser can reuse
+          // its cached copy; see the prerender-serving branch for why this
+          // matters under wrangler dev / CF Assets.
+          if (assetRes.status === 304) {
+            return assetRes;
+          }
           if (assetRes.ok) {
             // Apply \`headers()\` config rules to static assets. @next/routing
             // encodes those rules into \`ROUTING.beforeMiddleware\` with a
@@ -2725,6 +2735,15 @@ async function __handleRequest(request, env, ctx) {
           const assetRes = await env.ASSETS.fetch(
             new Request(new URL(staticAssetPath, url.origin), { headers: request.headers })
           );
+          // 304 Not Modified: browser sent If-None-Match and the asset's
+          // ETag matches. Pass the 304 through so the browser uses its
+          // cached copy. Falling through here would eventually return
+          // the 404.html asset (the asset binding's not_found_handling
+          // fallback on subsequent lookups), breaking conditional GETs
+          // under wrangler dev / real CF Workers alike.
+          if (assetRes.status === 304) {
+            return assetRes;
+          }
           if (assetRes.ok) {
             const headers = new Headers(assetRes.headers);
             headers.set("Content-Type", "text/html; charset=utf-8");
@@ -2794,6 +2813,13 @@ async function __handleRequest(request, env, ctx) {
           const assetRes = await env.ASSETS.fetch(
             new Request(new URL(assetUrlPath, url.origin), { headers: request.headers })
           );
+          // Conditional GET: pass 304 through so the browser can use its
+          // cached copy. See the prerender-serving branch above for
+          // background — falling through on 304 causes the request to
+          // eventually land on our 404.html fallback.
+          if (assetRes.status === 304) {
+            return assetRes;
+          }
           if (assetRes.ok) {
             const assetHeaders = applyStaticAssetHeaders(
               new Headers(assetRes.headers),
@@ -2943,7 +2969,7 @@ async function __handleRequest(request, env, ctx) {
                 const assetRes = await env.ASSETS.fetch(
                   new Request(new URL(cand, url.origin))
                 );
-                if (assetRes.ok) return assetRes;
+                if (assetRes.status === 304 || assetRes.ok) return assetRes;
               }
             } catch {}
           }
