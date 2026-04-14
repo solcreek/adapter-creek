@@ -444,6 +444,26 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
 
     workerCode = patchBundledManifestSingleton(workerCode);
 
+    // depd (via raw-body) uses `eval("(function ("+args+") {...})")` to build a
+    // deprecation-wrapping thunk. workerd + CF Workers block code generation
+    // from strings ("Code generation from strings disallowed for this context"),
+    // so any module that pulls in raw-body — notably the Pages Router API
+    // body parser — throws at module load time, and the outer try/catch in
+    // parse-body.ts surfaces it to the browser as `400 Invalid body`.
+    //
+    // Replace the minified eval expression with a direct function literal
+    // that preserves the runtime semantics (log + call). We lose the
+    // `function.length` preservation the eval form achieved, but nothing
+    // in the raw-body → parse-body call chain reads it.
+    //
+    // Fixes middleware-redirects "should redirect to api route with locale"
+    // (and the /fr variant) — both fail because their navigation ends at
+    // an API route whose parse-body path can't load raw-body.
+    workerCode = workerCode.replace(
+      /var\s+(\w+)\s*=\s*eval\("\(function \(".*?return\s+\1\s*;?\s*\}/s,
+      "return function(){log.call(deprecate,message,site);return fn.apply(this,arguments)}}",
+    );
+
     await fs.writeFile(workerPath, workerCode);
   } catch {}
 
