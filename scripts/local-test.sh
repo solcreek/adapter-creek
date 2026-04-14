@@ -17,6 +17,20 @@
 #   NEXT_REF     — Next.js branch/tag to use (default: canary)
 set -euo pipefail
 
+# Cleanup zombie wrangler/workerd processes on exit or kill
+# This runs even if the script is killed by the 420s watchdog
+cleanup_zombies() {
+  echo "[local-test] Cleaning up potential zombie processes..." >&2
+  if command -v pkill >/dev/null 2>&1; then
+    pkill -f "wrangler.*dev.*localhost" 2>/dev/null || true
+    # Give them a moment to exit
+    sleep 1
+    # Force kill any remaining
+    pkill -9 -f "wrangler.*dev.*localhost" 2>/dev/null || true
+  fi
+}
+trap cleanup_zombies EXIT SIGINT SIGTERM
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ADAPTER_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 NEXTJS_DIR="${ADAPTER_DIR}/nextjs"
@@ -68,8 +82,8 @@ echo ""
 
 cd "${NEXTJS_DIR}"
 
+# Core test configuration
 export NEXT_TEST_MODE=deploy
-export NEXT_E2E_TEST_TIMEOUT=240000
 export ADAPTER_DIR="${ADAPTER_DIR}"
 export IS_TURBOPACK_TEST=1
 export NEXT_TEST_JOB=1
@@ -78,5 +92,19 @@ export NEXT_EXTERNAL_TESTS_FILTERS=test/deploy-tests-manifest.json
 export NEXT_TEST_DEPLOY_SCRIPT_PATH="${ADAPTER_DIR}/scripts/e2e-deploy.sh"
 export NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH="${ADAPTER_DIR}/scripts/e2e-logs.sh"
 export NEXT_TEST_CLEANUP_SCRIPT_PATH="${ADAPTER_DIR}/scripts/e2e-cleanup.sh"
+
+# Timeout configuration - increased for wrangler dev streaming latency
+# wrangler dev has ~2-5s overhead vs Node.js for initial page load
+export NEXT_E2E_TEST_TIMEOUT=300000  # 5 minutes (was 240s)
+
+# Playwright configuration for wrangler dev streaming behavior
+# wrangler dev buffers HTTP responses differently than Node.js
+# causing Playwright to see elements in DOM but not "visible" immediately
+# PAGE_WAIT_FOR_NETWORK_IDLE ensures we wait for full response before checks
+export PAGE_WAIT_FOR_NETWORK_IDLE=true
+
+# Tell Playwright to wait for network idle after navigation/click
+# This compensates for wrangler's chunked transfer encoding behavior
+export NEXT_PLAYWRIGHT_NAVIGATION_TIMEOUT=15000  # 15s (default is 5s)
 
 node run-tests.js --type e2e -c "${CONCURRENCY}" "${TEST_ARGS[@]}"
