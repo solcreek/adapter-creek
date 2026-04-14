@@ -163,13 +163,28 @@ WORKER_SERVER="${ADAPTER_DIR}/scripts/worker-dev-server-sub.mjs"
 
 # PORT was pre-allocated before build (see top of script).
 log "Starting local server on port ${PORT}..."
-node "${WORKER_SERVER}" \
-  --worker "${ADAPTER_OUTPUT}/server/worker.js" \
-  --assets "${ADAPTER_OUTPUT}/assets" \
-  --port "${PORT}" > .adapter-server.log 2>&1 &
-SERVER_PID=$!
 
-# Save PID for cleanup
+# Use setsid to create a new process group. This allows the cleanup script
+# to kill the entire group (including wrangler and workerd children) by
+# sending signals to the negative PID. Prevents zombie processes when
+# the test watchdog SIGKILLs the test runner.
+if command -v setsid >/dev/null 2>&1; then
+  # setsid creates new process group, leader is the node process
+  setsid node "${WORKER_SERVER}" \
+    --worker "${ADAPTER_OUTPUT}/server/worker.js" \
+    --assets "${ADAPTER_OUTPUT}/assets" \
+    --port "${PORT}" > .adapter-server.log 2>&1 &
+  SERVER_PID=$!
+else
+  # Fallback for macOS which doesn't have setsid - use bash to create process group
+  (exec node "${WORKER_SERVER}" \
+    --worker "${ADAPTER_OUTPUT}/server/worker.js" \
+    --assets "${ADAPTER_OUTPUT}/assets" \
+    --port "${PORT}" > .adapter-server.log 2>&1) &
+  SERVER_PID=$!
+fi
+
+# Save PID for cleanup (this is the process group leader PID)
 echo "${SERVER_PID}" > .adapter-server.pid
 {
   echo "PORT=${PORT}"
