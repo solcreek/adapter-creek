@@ -203,10 +203,193 @@ import * as __turbopack_runtime from ${JSON.stringify(opts.turbopackRuntimePath)
 void __turbopack_runtime;
 ` : ""}
 
-// DO class stubs — required by control-plane for Next.js ISR bindings.
-export class DOQueueHandler extends DurableObject {}
-export class DOShardedTagCache extends DurableObject {}
-export class BucketCachePurge extends DurableObject {}
+// ------------------------------------------------------------------
+// Cache-layer Durable Objects — auto-provisioned by Creek control plane.
+// All DO ID derivation is scoped by an unguessable \`projectId\` (UUID)
+// so tenants sharing Creek's dispatch namespace cannot step on each
+// other's DO instances. See CLAUDE.md / memory for the isolation design.
+// ------------------------------------------------------------------
+
+const CREEK_CACHE_SHARD_COUNT = 4;
+const CREEK_SOFT_TAG_PREFIX = "_N_T_/";
+
+// FNV-1a — no crypto needed; we only need uniform distribution across
+// shard indices, not cryptographic strength.
+function __creekHash(s) {
+  let h = 2166136261;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
+function __creekProjectId(env) {
+  // Prefer the unguessable UUID (to be injected by Creek's control plane).
+  // Fall back to slug during adapter development + local wrangler dev.
+  return (env && (env.CREEK_PROJECT_ID || env.CREEK_PROJECT_SLUG)) || "creek-dev";
+}
+
+function __creekShardForTag(tag) {
+  const idx = __creekHash(tag) % CREEK_CACHE_SHARD_COUNT;
+  const kind = typeof tag === "string" && tag.startsWith(CREEK_SOFT_TAG_PREFIX) ? "soft" : "hard";
+  return kind + ":" + idx;
+}
+
+function __creekShardForKey(key) {
+  return String(__creekHash(key) % CREEK_CACHE_SHARD_COUNT);
+}
+
+function __creekGetTagCacheStub(env, tag) {
+  const projectId = __creekProjectId(env);
+  const shard = __creekShardForTag(tag);
+  const ns = env.NEXT_TAG_CACHE_DO_SHARDED;
+  if (!ns) return null;
+  return ns.get(ns.idFromName(projectId + ":tag:" + shard));
+}
+
+function __creekGetCachePurgeStub(env) {
+  const projectId = __creekProjectId(env);
+  const ns = env.NEXT_CACHE_DO_BUCKET_PURGE;
+  if (!ns) return null;
+  // Single DO instance per project is fine — purge is batched by alarm.
+  return ns.get(ns.idFromName(projectId + ":purge"));
+}
+
+// DOShardedTagCache — tracks \`revalidateTag\` / \`revalidatePath\` timestamps
+// so IncrementalCache.get can mark entries stale without evicting them.
+// Schema is SQLite-backed; one shard per DO instance.
+export class DOShardedTagCache extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
+    this.sql.exec(
+      "CREATE TABLE IF NOT EXISTS tags (" +
+        "tag TEXT PRIMARY KEY, " +
+        "revalidated_at INTEGER NOT NULL" +
+      ")"
+    );
+  }
+
+  // Mark each tag revalidated at the given timestamp (default: now).
+  // Keeps max(existing, new) so concurrent writes don't go backwards.
+  async writeTags(tags, timestamp) {
+    if (!Array.isArray(tags) || tags.length === 0) return;
+    // Cap input to defend against pathological inputs from malicious workers
+    // in the shared WfP namespace.
+    const capped = tags.slice(0, 256);
+    const ts = typeof timestamp === "number" ? timestamp : Date.now();
+    for (const tag of capped) {
+      if (typeof tag !== "string" || tag.length > 1024) continue;
+      this.sql.exec(
+        "INSERT INTO tags (tag, revalidated_at) VALUES (?, ?) " +
+          "ON CONFLICT(tag) DO UPDATE SET revalidated_at = MAX(revalidated_at, excluded.revalidated_at)",
+        tag,
+        ts,
+      );
+    }
+  }
+
+  // Returns true if ANY tag has been revalidated strictly after \`since\`.
+  // Used by IncrementalCache.get to decide fresh vs stale.
+  async hasBeenRevalidated(tags, since) {
+    if (!Array.isArray(tags) || tags.length === 0) return false;
+    const capped = tags.slice(0, 256).filter((t) => typeof t === "string" && t.length <= 1024);
+    if (capped.length === 0) return false;
+    const sinceTs = typeof since === "number" ? since : 0;
+    const placeholders = capped.map(() => "?").join(",");
+    const rows = this.sql
+      .exec(
+        "SELECT 1 FROM tags WHERE tag IN (" + placeholders + ") AND revalidated_at > ? LIMIT 1",
+        ...capped,
+        sinceTs,
+      )
+      .toArray();
+    return rows.length > 0;
+  }
+
+  // Returns a map { tag -> revalidated_at } for known tags. Unknown tags
+  // are omitted. The caller treats "omitted" as never-revalidated (0).
+  async getRevalidatedAt(tags) {
+    if (!Array.isArray(tags) || tags.length === 0) return {};
+    const capped = tags.slice(0, 256).filter((t) => typeof t === "string" && t.length <= 1024);
+    if (capped.length === 0) return {};
+    const placeholders = capped.map(() => "?").join(",");
+    const rows = this.sql
+      .exec("SELECT tag, revalidated_at FROM tags WHERE tag IN (" + placeholders + ")", ...capped)
+      .toArray();
+    const out = {};
+    for (const row of rows) out[row.tag] = row.revalidated_at;
+    return out;
+  }
+}
+
+// BucketCachePurge — batches cache-key purge requests. Alarm-driven to
+// amortize Cache API purges. The MVP logs intended purges; real Cache
+// Purge API wiring arrives when Creek's control plane confirms the
+// domain / zone setup available at runtime.
+export class BucketCachePurge extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.ctx = ctx;
+    this.sql = ctx.storage.sql;
+    this.sql.exec(
+      "CREATE TABLE IF NOT EXISTS purge_queue (key TEXT PRIMARY KEY, queued_at INTEGER NOT NULL)",
+    );
+  }
+
+  async enqueue(keys) {
+    if (!Array.isArray(keys) || keys.length === 0) return;
+    const capped = keys.slice(0, 512).filter((k) => typeof k === "string" && k.length <= 2048);
+    if (capped.length === 0) return;
+    const now = Date.now();
+    for (const key of capped) {
+      this.sql.exec(
+        "INSERT INTO purge_queue (key, queued_at) VALUES (?, ?) " +
+          "ON CONFLICT(key) DO UPDATE SET queued_at = ?",
+        key,
+        now,
+        now,
+      );
+    }
+    const existing = await this.ctx.storage.getAlarm();
+    if (existing === null) {
+      await this.ctx.storage.setAlarm(Date.now() + 5000);
+    }
+  }
+
+  async alarm() {
+    const batch = this.sql
+      .exec("SELECT key FROM purge_queue ORDER BY queued_at ASC LIMIT 100")
+      .toArray();
+    if (batch.length === 0) return;
+    // MVP: no actual CF Cache API call — just drain the queue so
+    // memory doesn't grow unbounded. When cache-purge wiring lands,
+    // invoke fetch against the CF API here.
+    const keys = batch.map((r) => r.key);
+    const placeholders = keys.map(() => "?").join(",");
+    this.sql.exec("DELETE FROM purge_queue WHERE key IN (" + placeholders + ")", ...keys);
+    const remaining = this.sql.exec("SELECT COUNT(*) AS c FROM purge_queue").one();
+    if (remaining && remaining.c > 0) {
+      await this.ctx.storage.setAlarm(Date.now() + 5000);
+    }
+  }
+}
+
+// DOQueueHandler — revalidation queue for background ISR refreshes.
+// MVP is a no-op: the main worker uses \`ctx.waitUntil\` for revalidation
+// tasks. Keeping the class exported so Creek's control-plane bindings
+// and migrations stay stable; method implementations arrive when the
+// queue pattern proves needed for high-traffic ISR paths.
+export class DOQueueHandler extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.ctx = ctx;
+  }
+  async send(_message) {
+    // Placeholder. Callers fall back to in-process ctx.waitUntil.
+  }
+}
 
 const BUILD_ID = ${JSON.stringify(opts.buildId)};
 const BASE_PATH = ${JSON.stringify(opts.basePath)};
@@ -880,8 +1063,118 @@ async function __withEdgeRouteEnv(entryKey, fn) {
   }
 }
 
+// ---------------------------------------------------------------
+// IncrementalCache data/tag helpers — bridge CreekCacheHandler to the
+// auto-provisioned DOs and (eventually) R2.
+// ---------------------------------------------------------------
+
+// Best-effort: get env from the current request's fetch context so handler
+// methods can reach the DO bindings without threading env through the
+// Next.js IncrementalCache constructor (which has no slot for arbitrary
+// runtime handles).
+function __creekCurrentEnv() {
+  try {
+    return __INTERNAL_FETCH_CONTEXT.getStore()?.env ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// Group tags into {shardKey: tags[]} so we hit each DO instance at most
+// once per operation (avoids fan-out + 2x/3x RPC cost for entries that
+// carry many tags).
+function __creekBucketTagsByShard(tags) {
+  const buckets = new Map();
+  for (const tag of tags) {
+    if (typeof tag !== "string") continue;
+    const shard = __creekShardForTag(tag);
+    let arr = buckets.get(shard);
+    if (!arr) {
+      arr = [];
+      buckets.set(shard, arr);
+    }
+    arr.push(tag);
+  }
+  return buckets;
+}
+
+function __creekShardStub(env, shardKey) {
+  const projectId = __creekProjectId(env);
+  const ns = env.NEXT_TAG_CACHE_DO_SHARDED;
+  if (!ns) return null;
+  return ns.get(ns.idFromName(projectId + ":tag:" + shardKey));
+}
+
+// Returns true if ANY of \`tags\` has been revalidated strictly after
+// \`since\` (a ms timestamp). Uses DO-backed tag cache when available,
+// falls back to the in-memory \`__CREEK_TAG_INVALIDATED_AT\` map (covers
+// wrangler-dev-without-bindings + single-isolate tests).
+async function __creekTagsInvalidatedSince(tags, since) {
+  if (!Array.isArray(tags) || tags.length === 0) return false;
+  const env = __creekCurrentEnv();
+  if (env && env.NEXT_TAG_CACHE_DO_SHARDED) {
+    const buckets = __creekBucketTagsByShard(tags);
+    // Parallel fan-out across shards; short-circuit on first hit.
+    const checks = [];
+    for (const [shardKey, shardTags] of buckets) {
+      const stub = __creekShardStub(env, shardKey);
+      if (!stub) continue;
+      checks.push(stub.hasBeenRevalidated(shardTags, since).catch(() => false));
+    }
+    try {
+      const results = await Promise.all(checks);
+      if (results.some(Boolean)) return true;
+    } catch {
+      // DO failure — degrade to in-memory check below.
+    }
+  }
+  const mem = globalThis.__CREEK_TAG_INVALIDATED_AT;
+  if (!mem) return false;
+  for (const tag of tags) {
+    const at = mem.get(tag);
+    if (typeof at === "number" && at > since) return true;
+  }
+  return false;
+}
+
+async function __creekWriteRevalidatedTags(tags) {
+  if (!Array.isArray(tags) || tags.length === 0) return;
+  const now = Date.now();
+  // Always update in-memory (fast, covers same-isolate subsequent reads).
+  const mem = globalThis.__CREEK_TAG_INVALIDATED_AT;
+  if (mem) {
+    for (const t of tags) if (typeof t === "string") mem.set(t, now);
+  }
+  // Also persist to DO shards so other isolates / future requests see it.
+  const env = __creekCurrentEnv();
+  if (env && env.NEXT_TAG_CACHE_DO_SHARDED) {
+    const buckets = __creekBucketTagsByShard(tags);
+    const writes = [];
+    for (const [shardKey, shardTags] of buckets) {
+      const stub = __creekShardStub(env, shardKey);
+      if (!stub) continue;
+      writes.push(stub.writeTags(shardTags, now).catch(() => {}));
+    }
+    // Fire-and-forget the DO writes if a waitUntil is available; otherwise
+    // await so the caller's lifetime covers persistence.
+    const ctx = (() => {
+      try {
+        return __INTERNAL_FETCH_CONTEXT.getStore()?.ctx ?? null;
+      } catch {
+        return null;
+      }
+    })();
+    if (ctx && typeof ctx.waitUntil === "function") {
+      try { ctx.waitUntil(Promise.all(writes).catch(() => {})); }
+      catch { await Promise.all(writes).catch(() => {}); }
+    } else {
+      await Promise.all(writes).catch(() => {});
+    }
+  }
+}
+
 class CreekCacheHandler {
-  constructor() {
+  constructor(ctx) {
     if (!globalThis.__CREEK_CACHE) globalThis.__CREEK_CACHE = new Map();
     if (!globalThis.__CREEK_TAG_TO_KEYS) globalThis.__CREEK_TAG_TO_KEYS = new Map();
     // Map<tag, ms timestamp>: when revalidateTag() was called for this tag.
@@ -896,15 +1189,9 @@ class CreekCacheHandler {
 
     const age = (Date.now() - entry.lastModified) / 1000;
 
-    // Stale by tag invalidation
-    let staleByTag = false;
-    for (const tag of entry.tags) {
-      const invalidatedAt = globalThis.__CREEK_TAG_INVALIDATED_AT.get(tag);
-      if (invalidatedAt !== undefined && invalidatedAt > entry.lastModified) {
-        staleByTag = true;
-        break;
-      }
-    }
+    // Stale by tag invalidation — checks DO shards first (cross-isolate),
+    // falls back to the in-memory map.
+    const staleByTag = await __creekTagsInvalidatedSince(entry.tags || [], entry.lastModified);
 
     // Stale by time-based revalidate
     const staleByTime =
@@ -953,15 +1240,42 @@ class CreekCacheHandler {
 
   async revalidateTag(tag) {
     const tags = Array.isArray(tag) ? tag : [tag];
-    const now = Date.now();
     // Mark stale, do not delete. Next.js will receive cacheState: "stale"
     // on the next get() and trigger SWR (serve old, revalidate in background).
-    for (const t of tags) {
-      globalThis.__CREEK_TAG_INVALIDATED_AT.set(t, now);
-    }
+    await __creekWriteRevalidatedTags(tags);
   }
 
   resetRequestCache() {}
+}
+
+// Build a Next.js IncrementalCache instance backed by CreekCacheHandler.
+// Cached per-isolate because the Next.js layer caches per-route control
+// data on the instance; rebuilding every request loses those wins and
+// also burns CPU on prerender-manifest parsing.
+// Cache our IncrementalCache on a PRIVATE global. The public
+// \`globalThis.__incrementalCache\` is stomped on per-request by Next.js's
+// app-page handler (build/templates/app-page.ts:768). We read the
+// private key from requestMeta injection so Next.js never falls back
+// to its filesystem-backed cache (which 500s under workerd's read-only
+// fs).
+function __creekGetIncrementalCache(requestHeaders) {
+  if (globalThis.__CREEK_INCREMENTAL_CACHE) return globalThis.__CREEK_INCREMENTAL_CACHE;
+  try {
+    globalThis.__CREEK_INCREMENTAL_CACHE = new IncrementalCache({
+      dev: false,
+      minimalMode: false,
+      requestHeaders: requestHeaders || {},
+      getPrerenderManifest: __getPrerenderManifest,
+      CurCacheHandler: CreekCacheHandler,
+    });
+  } catch (err) {
+    // If Next.js's constructor shape ever changes, don't take the whole
+    // request down — the old undefined-cache fallback still serves basic
+    // pages; only fetch cache / unstable_cache / revalidate will regress
+    // and that's visible in the test suite.
+    console.error("[creek-cache] failed to construct IncrementalCache:", err?.message);
+  }
+  return globalThis.__CREEK_INCREMENTAL_CACHE;
 }
 
 // =====================================================================
@@ -1544,6 +1858,12 @@ async function __withMinimalWorkStore(pagePath, ctx, fn) {
     }
   } catch {}
 
+  // Lazily construct the IncrementalCache the first time a workStore is
+  // needed. Without this, Next.js's fetch/unstable_cache/ISR codepaths
+  // see \`workStore.incrementalCache === undefined\` and silently no-op
+  // (the failure mode that put app-static 0/29 on the cache cluster).
+  const incrementalCache = __creekGetIncrementalCache();
+
   const store = {
     page: pagePath,
     route: pagePath,
@@ -1555,7 +1875,7 @@ async function __withMinimalWorkStore(pagePath, ctx, fn) {
     reactLoadableManifest: {},
     assetPrefix: ASSET_PREFIX,
     cacheComponentsEnabled: false,
-    incrementalCache: globalThis.__incrementalCache,
+    incrementalCache,
     runInCleanSnapshot: (cb, ...args) => typeof cb === "function" ? cb(...args) : cb,
     reactServerErrorsByDigest: new Map(),
     afterContext: {
@@ -3182,6 +3502,34 @@ async function __handleRequest(request, env, ctx) {
         }
       }
 
+      // Patch routeModule.getIncrementalCache for ANY handler type
+      // (APP_PAGE, APP_ROUTE, PAGES, PAGES_API). The Pages Router code
+      // path (pages-handler.ts:491) calls this directly with no
+      // requestMeta override, so we have to intercept here or fetch
+      // cache / unstable_cache / ISR fall through to a filesystem
+      // backend that immediately 500s under workerd. Returning our
+      // single CreekCacheHandler-backed instance unifies behavior
+      // across both routers.
+      {
+        const rm2 = mod && mod.routeModule;
+        if (
+          rm2 &&
+          typeof rm2.getIncrementalCache === "function" &&
+          !rm2.__creekIncCachePatched
+        ) {
+          rm2.getIncrementalCache = async function () {
+            const ic = __creekGetIncrementalCache();
+            // Mirror what the original setter at app-page.ts:768 / pages
+            // handler does so any code that reads
+            // \`globalThis.__incrementalCache\` later in the request also
+            // sees ours instead of falling back to filesystem.
+            if (ic) globalThis.__incrementalCache = ic;
+            return ic;
+          };
+          rm2.__creekIncCachePatched = true;
+        }
+      }
+
       if (handler.runtime === "edge") {
         // CF Workers IS edge — try _ENTRIES first, then fall through to Node.js.
         // (Per opennext research: edge runtime is redundant on CF Workers.)
@@ -4158,6 +4506,14 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     initURL: request.url,
     initProtocol: url.protocol.replace(/:+$/, ""),
     initQuery: {},
+    // App Router handler (build/templates/app-page.ts:758-760) reads
+    // \`getRequestMeta(req, 'incrementalCache')\` and only falls back to
+    // \`routeModule.getIncrementalCache(...)\` if unset. That fallback
+    // synthesizes a filesystem-backed cache and swallows our
+    // globalThis.__incrementalCache — which is why earlier tries to
+    // plumb the cache via workStore had zero effect. Injecting through
+    // requestMeta is the upstream-supported override point.
+    incrementalCache: __creekGetIncrementalCache(),
   };
   // Tell Next.js's server-action redirect codepath the real origin so
   // its internal fetch (action-handler.ts:417) doesn't default to

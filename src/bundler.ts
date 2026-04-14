@@ -549,22 +549,31 @@ directory = "${assetsRelPath}"
 binding = "ASSETS"
 run_worker_first = true
 
-# Durable Object classes declared by the adapter's worker-entry. Bindings
-# must exist even when unused, or workerd refuses to start. The matching
-# \`new_classes\` migration registers them on first deploy.
+# Durable Object classes declared by the adapter's worker-entry. The
+# binding \`name\` (what runtime code reads via \`env.<NAME>\`) must match
+# what Creek's control plane injects in production — see
+# \`packages/control-plane/src/modules/deployments/deploy.ts:129-140\` in
+# the Creek repo. Do NOT rename these without coordinating with Creek.
+#
+# \`class_name\` is our internal export name from worker-entry.ts.
+# \`new_sqlite_classes\` (not \`new_classes\`) selects SQLite-backed DO
+# storage — DOShardedTagCache and BucketCachePurge both use
+# \`ctx.storage.sql\`. DOQueueHandler is currently a placeholder but
+# declared under SQLite too so future queue persistence has no migration
+# cost.
 [[durable_objects.bindings]]
-name = "DOQueueHandler"
+name = "NEXT_CACHE_DO_QUEUE"
 class_name = "DOQueueHandler"
 [[durable_objects.bindings]]
-name = "DOShardedTagCache"
+name = "NEXT_TAG_CACHE_DO_SHARDED"
 class_name = "DOShardedTagCache"
 [[durable_objects.bindings]]
-name = "BucketCachePurge"
+name = "NEXT_CACHE_DO_BUCKET_PURGE"
 class_name = "BucketCachePurge"
 
 [[migrations]]
 tag = "v1"
-new_classes = ["DOQueueHandler", "DOShardedTagCache", "BucketCachePurge"]
+new_sqlite_classes = ["DOQueueHandler", "DOShardedTagCache", "BucketCachePurge"]
 ${wasmRule}
 `;
   await fs.writeFile(path.join(outputDir, "wrangler.toml"), toml);
