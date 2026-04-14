@@ -3434,6 +3434,35 @@ async function __handleRequest(request, env, ctx) {
           if (!ct.includes("text/html")) {
             const text = await cloned.text();
             if (text.trim() === "This page could not be found") {
+              // Case (a0): an app/not-found.tsx is present (\`/_not-found\`
+              // handler registered) — prefer it over Pages Router's
+              // static 404. Next.js defines app-dir's not-found as the
+              // canonical 404 when both routers coexist, even for URLs
+              // that were resolved via Pages Router. We need a fresh
+              // routeResult with status=404 so invokeNodeHandler
+              // pre-seeds res.statusCode correctly.
+              // Fixes app-dir/not-found-with-pages-i18n "should prefer
+              // the app router 404 over the pages router 404".
+              if (HANDLERS["/_not-found"]) {
+                try {
+                  const nfHandler = HANDLERS["/_not-found"];
+                  const nfMod = await nfHandler.load();
+                  const nfRouteResult = { ...(result || {}), status: 404 };
+                  const nfRes = await invokeNodeHandler(
+                    request,
+                    nfMod,
+                    ctx,
+                    nfRouteResult,
+                    "/_not-found",
+                    "APP_PAGE",
+                  );
+                  if (nfRes && nfRes.body) {
+                    const headers = new Headers(nfRes.headers);
+                    headers.set("content-type", "text/html; charset=utf-8");
+                    return new Response(nfRes.body, { status: 404, headers });
+                  }
+                } catch {}
+              }
               // Case (a): try prerendered /404/index.html from ASSETS.
               const notFoundCandidates = [];
               if (STATIC_PAGES["/404"]?.assetPath) {
