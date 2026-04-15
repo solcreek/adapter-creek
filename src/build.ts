@@ -36,15 +36,41 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   const assetCount = await collectStaticFiles(ctx.outputs, assetsDir, ctx.projectDir, ctx.distDir, ctx.buildId);
   console.log(`  [Creek Adapter] ${assetCount} static files collected`);
 
-  // Step 2: Collect WASM files from all outputs
+  // Step 2: Collect WASM files from all outputs.
+  // Middleware (both \`ctx.outputs.middleware\` and the \`edgeRuntime\` variant)
+  // ships its own wasmAssets separate from the page/route outputs — tests
+  // like \`edge-can-use-wasm-files\` import a user-provided \`.wasm\` from
+  // middleware. Skipping middleware here produced a \`.creek/\` output
+  // with zero wasm siblings and workerd threw at runtime:
+  // \`dynamically loading WebAssembly is not supported ... chunk
+  // 'chunks/src_add_0656eb_.wasm'\`.
   const wasmFiles = new Map<string, string>();
-  for (const outputs of [ctx.outputs.appPages, ctx.outputs.appRoutes, ctx.outputs.pages, ctx.outputs.pagesApi]) {
+  for (const outputs of [
+    ctx.outputs.appPages,
+    ctx.outputs.appRoutes,
+    ctx.outputs.pages,
+    ctx.outputs.pagesApi,
+  ]) {
     for (const output of outputs) {
       if (output.wasmAssets) {
         for (const [name, absPath] of Object.entries(output.wasmAssets)) {
           wasmFiles.set(name, absPath);
         }
       }
+    }
+  }
+  // Middleware ships its own wasmAssets separate from the page/route
+  // outputs. \`edge-can-use-wasm-files\` imports a user-provided \`.wasm\`
+  // from middleware. Skipping this produced zero wasm siblings in the
+  // \`.creek/\` output and workerd threw at runtime with
+  // \`dynamically loading WebAssembly is not supported ...
+  //  chunk 'chunks/src_add_0656eb_.wasm'\`.
+  const mwOutput = ctx.outputs.middleware as
+    | { wasmAssets?: Record<string, string> }
+    | undefined;
+  if (mwOutput?.wasmAssets) {
+    for (const [name, absPath] of Object.entries(mwOutput.wasmAssets)) {
+      wasmFiles.set(name, absPath);
     }
   }
 
