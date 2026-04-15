@@ -517,7 +517,22 @@ async function emitWranglerConfig(opts: {
   wasmFilenames: string[];
 }): Promise<void> {
   const { outputDir, assetsRelPath, wasmFilenames } = opts;
-  const wasmRule = wasmFilenames.length
+  // Scan the output dir for every \`.wasm\` sibling. Turbopack gives us
+  // one set (hashed \`wasm_<md5>\`); wrangler's own esbuild pass emits a
+  // second set (\`<sha1>-yoga.wasm\`, \`<sha1>-resvg.wasm\`) when the app
+  // imports next/og. Passing only the Turbopack-reported names leaves
+  // the wrangler-emitted siblings unmatched → workerd fails startup
+  // with \`No such module "<sha1>-yoga.wasm"\`. A wildcard glob covers
+  // both sources without having to track who emitted which.
+  const allWasm = new Set(wasmFilenames);
+  try {
+    const entries = await fs.readdir(outputDir);
+    for (const e of entries) {
+      if (e.endsWith(".wasm")) allWasm.add(e);
+    }
+  } catch {}
+  const wasmGlobs = [...allWasm];
+  const wasmRule = wasmGlobs.length
     ? [
         "",
         "# Declare every wasm sibling as a CompiledWasm module so \`import",
@@ -525,7 +540,7 @@ async function emitWranglerConfig(opts: {
         "# Without this, Turbopack's runtime registry returns undefined and",
         "# throws \"dynamically loading WebAssembly is not supported\".",
         "[[rules]]",
-        `globs = [${wasmFilenames.map((g) => `"${g}"`).join(", ")}]`,
+        `globs = [${wasmGlobs.map((g) => `"${g}"`).join(", ")}]`,
         `type = "CompiledWasm"`,
         `fallthrough = false`,
       ].join("\n")
