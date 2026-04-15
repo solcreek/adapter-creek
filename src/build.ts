@@ -280,6 +280,44 @@ async function copyHtmlWithDplId(src: string, dest: string, buildId: string): Pr
   await fs.writeFile(dest, patched);
 }
 
+// \`fs.mkdir(..., {recursive:true})\` throws ENOTDIR if any parent of the
+// target path exists as a file. Next.js's adapter API emits
+// interception-route prerenders that collide with regular routes: e.g.
+// \`/test-nested\` lands as an HTML file at \`assets/test-nested\`, then a
+// subsequent \`/(.)test-nested/deeper\` wants to create
+// \`assets/(.)test-nested/deeper/\` — but a prior loop iteration may have
+// created \`assets/(.)test-nested\` as a FILE. Recover: return false so
+// the caller skips this entry. Interception routes are dynamic and
+// will be served via the worker, so skipping the prerender copy is safe.
+// Fixes \`Build error: ENOTDIR: not a directory, mkdir '.../(.)foo/bar'\`
+// on interception-dynamic-segment + parallel-routes fixtures.
+async function safeMkdirForDest(destPath: string, label?: string): Promise<boolean> {
+  try {
+    await fs.mkdir(path.dirname(destPath), { recursive: true });
+    return true;
+  } catch (err: any) {
+    // ENOTDIR: a parent in the path exists as a file → cannot create dir
+    //         beneath it. (Seen when \`(.)foo/bar\` is processed after
+    //         \`(.)foo\` got written as a file — \`(.)foo\` then blocks
+    //         \`(.)foo/bar\`.)
+    // EEXIST: \`fs.mkdir({recursive:true})\` only silences EEXIST when the
+    //         target is already a directory. If \`(.)foo\` was written as
+    //         a file first and we later try to \`mkdir assets/(.)foo\` to
+    //         host a sibling, node throws EEXIST instead of ENOTDIR
+    //         depending on which parent the conflict lands on.
+    if (err && (err.code === "ENOTDIR" || err.code === "EEXIST")) {
+      if (label) {
+        console.error(
+          "[adapter-creek] skip (path conflicts with a file sibling):",
+          label,
+        );
+      }
+      return false;
+    }
+    throw err;
+  }
+}
+
 async function collectStaticFiles(
   outputs: BuildContext["outputs"],
   assetsDir: string,
@@ -299,7 +337,7 @@ async function collectStaticFiles(
       destRelative = path.join(destRelative, "index.html");
     }
     const destPath = path.join(assetsDir, destRelative);
-    await fs.mkdir(path.dirname(destPath), { recursive: true });
+    if (!(await safeMkdirForDest(destPath, destRelative))) continue;
     try {
       if (isHtml && buildId) {
         await copyHtmlWithDplId(file.filePath, destPath, buildId);
@@ -318,7 +356,7 @@ async function collectStaticFiles(
         destRelative = destRelative + "/index.html";
       }
       const destPath = path.join(assetsDir, destRelative);
-      await fs.mkdir(path.dirname(destPath), { recursive: true });
+      if (!(await safeMkdirForDest(destPath, destRelative))) continue;
       try {
         if (isHtml && buildId) {
           await copyHtmlWithDplId(prerender.fallback.filePath, destPath, buildId);
@@ -348,7 +386,7 @@ async function collectStaticFiles(
         if (!entry.isFile()) continue;
         const srcPath = path.join(edgeChunksDir, entry.name);
         const destPath = path.join(assetsDir, "_next", "edge-chunks", entry.name);
-        await fs.mkdir(path.dirname(destPath), { recursive: true });
+        if (!(await safeMkdirForDest(destPath, entry.name))) continue;
         try {
           await fs.copyFile(srcPath, destPath);
           count++;
@@ -378,7 +416,7 @@ async function collectStaticFiles(
         if (!entry.isFile()) continue;
         const srcPath = path.join(edgeAssetsDir, entry.name);
         const destPath = path.join(assetsDir, "_next", "edge-assets", entry.name);
-        await fs.mkdir(path.dirname(destPath), { recursive: true });
+        if (!(await safeMkdirForDest(destPath, entry.name))) continue;
         try {
           await fs.copyFile(srcPath, destPath);
           count++;
@@ -409,7 +447,7 @@ async function collectStaticFiles(
           if (!entry.isFile()) continue;
           const relativeFromPublic = path.relative(publicDir, srcPath);
           const destPath = path.join(assetsDir, relativeFromPublic);
-          await fs.mkdir(path.dirname(destPath), { recursive: true });
+          if (!(await safeMkdirForDest(destPath, relativeFromPublic))) continue;
           try {
             await fs.copyFile(srcPath, destPath);
             count++;
