@@ -1587,7 +1587,14 @@ function __initManifests() {
       },
       serverModuleMap: new Proxy({}, {
         get: (_, id) => {
-          const workers = serverActionsManifest.node?.[id]?.workers;
+          // Check both node AND edge action maps — edge-runtime pages
+          // register their actions under the \`edge\` key. Without this
+          // fallback, edge Server Actions throw "Failed to find Server
+          // Action" because the lookup only searched \`node\`.
+          // Fixes temporary-references edge variant + other edge SA tests.
+          const nodeWorkers = serverActionsManifest.node?.[id]?.workers;
+          const edgeWorkers = serverActionsManifest.edge?.[id]?.workers;
+          const workers = nodeWorkers || edgeWorkers;
           if (!workers) return undefined;
           const entry = Object.values(workers)[0];
           return entry ? { id: entry.moduleId, name: id, chunks: [], async: entry.async } : undefined;
