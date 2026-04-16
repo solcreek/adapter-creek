@@ -3124,6 +3124,16 @@ async function __handleRequest(request, env, ctx) {
       })();
       const isServingBracketShell =
         typeof servePath === "string" && servePath.includes("[") && !!staticEntry;
+      // ISR pages (initialRevalidate > 0) must NOT be served from static
+      // assets because the handler needs to manage the fresh → stale → SWR
+      // lifecycle via IncrementalCache. Serving from assets would freeze the
+      // build-time snapshot forever, skipping time-based revalidation.
+      // When a handler exists for an ISR page, we let it run so getStaticProps
+      // executes with the correct revalidateReason ('stale' after TTL expires,
+      // 'on-demand' after res.revalidate()). Fixes revalidate-reason "stale",
+      // trailingslash revalidation, and stale-cache-serving tests.
+      const isISRPage = staticEntry?.initialRevalidate != null && staticEntry.initialRevalidate > 0;
+      const hasHandler = resolvedPathname && HANDLERS[resolvedPathname];
       const canServeStaticPage =
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
@@ -3134,7 +3144,9 @@ async function __handleRequest(request, env, ctx) {
         !nextDataAppRouterPath &&
         !isDraftModeRequest &&
         !(isCrawlerRequest && isServingBracketShell) &&
-        (!isRewritten || !hasHandlerForTarget);
+        (!isRewritten || !hasHandlerForTarget) &&
+        // ISR pages bypass static assets when a handler exists.
+        !(isISRPage && hasHandler);
       // POST (or other non-GET/HEAD) to a prerendered static page → 405.
       // Next.js's NextNodeServer does this; without it, POST falls through
       // to routing, finds no handler, and returns 200 (via static asset
@@ -4257,6 +4269,11 @@ interface StaticPageEntry {
   // worker has to apply both when serving the static HTML.
   status?: number;
   headers?: Record<string, string | string[]>;
+  // ISR revalidation period (seconds). If > 0, this page uses Incremental
+  // Static Regeneration and must NOT be served indefinitely from static
+  // assets — the handler path with IncrementalCache manages the
+  // fresh/stale lifecycle.
+  initialRevalidate?: number;
 }
 
 function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, StaticPageEntry> {
@@ -4295,6 +4312,15 @@ function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, 
     }
     if (prerender.fallback.initialHeaders) {
       entry.headers = prerender.fallback.initialHeaders;
+    }
+    // ISR revalidation period: if > 0, the page should NOT be served
+    // indefinitely from static assets — after the revalidate window
+    // the handler must re-run getStaticProps. We store this on the
+    // entry so \`canServeStaticPage\` can skip the static shortcut for
+    // ISR pages, forcing them through the handler path where
+    // IncrementalCache manages freshness/staleness and SWR.
+    if (typeof prerender.fallback.initialRevalidate === "number" && prerender.fallback.initialRevalidate > 0) {
+      entry.initialRevalidate = prerender.fallback.initialRevalidate;
     }
 
     map[prerender.pathname] = entry;
