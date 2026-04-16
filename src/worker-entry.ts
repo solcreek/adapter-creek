@@ -3147,12 +3147,19 @@ async function __handleRequest(request, env, ctx) {
         (!isRewritten || !hasHandlerForTarget) &&
         // ISR pages bypass static assets when a handler exists.
         !(isISRPage && hasHandler);
-      // POST (or other non-GET/HEAD) to a prerendered static page → 405.
-      // Next.js's NextNodeServer does this; without it, POST falls through
-      // to routing, finds no handler, and returns 200 (via static asset
-      // fallback) or 404 — neither is correct.
-      // Fixes prerender.test.ts "should respond with 405 for POST to static page".
-      if (staticAssetPath && !canServeStaticPage && request.method !== "GET" && request.method !== "HEAD") {
+      // POST (or other non-GET/HEAD) to a purely prerendered static page → 405.
+      // Only applies when the page has no handler AND the request isn't a
+      // Server Action / RSC / data-URL request, which legitimately POST to
+      // prerendered paths.
+      if (
+        staticAssetPath &&
+        !hasHandler &&
+        request.method !== "GET" &&
+        request.method !== "HEAD" &&
+        !request.headers.has("next-action") &&
+        !isAppRouterRSCRequest &&
+        !nextDataAppRouterPath
+      ) {
         return new Response("Method Not Allowed", { status: 405 });
       }
 
