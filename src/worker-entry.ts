@@ -4812,6 +4812,30 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
           existing.set(key, String(value));
         }
       }
+      // Middleware rewrites are dynamic and not reproducible by Next.js's
+      // internal handleRewrites, so user-added search params from
+      // \`NextResponse.rewrite(new URL('/target?first=value', req.url))\`
+      // have to be carried into req.url manually. Config rewrites, by
+      // contrast, get re-run internally and produce searchParams from
+      // the rewrite destination naturally — we skip this merge for them
+      // to avoid double-adding params.
+      // Fixes app/index "should have the correct search params on
+      // middleware rewrite" (client + server variants).
+      if (isMiddlewareRewrite) {
+        for (const [key, value] of Object.entries(rawQueryForUrl)) {
+          if (key === "nextLocale") continue;
+          if (/^[0-9]+$/.test(key)) continue;
+          if (key.startsWith("nxtP")) continue;
+          if (existing.has(key)) continue;
+          if (Array.isArray(value)) {
+            for (const v of value) existing.append(key, String(v));
+          } else if (value !== undefined && value !== null) {
+            existing.set(key, String(value));
+          } else {
+            existing.set(key, "");
+          }
+        }
+      }
       const mergedSearch = existing.toString();
       req.url = url.pathname + (mergedSearch ? "?" + mergedSearch : "");
     } else if (isRewrite && !isAppRouterHandler && !isMiddlewareRewrite) {
