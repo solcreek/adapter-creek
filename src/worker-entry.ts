@@ -4612,6 +4612,34 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     // plumb the cache via workStore had zero effect. Injecting through
     // requestMeta is the upstream-supported override point.
     incrementalCache: __creekGetIncrementalCache(),
+    // \`res.revalidate(path)\` in Pages Router API routes reads
+    // \`routerServerContext.revalidate\` which comes from
+    // \`getRequestMeta(req, 'revalidate')\`. Without this, the call
+    // throws "Invariant: missing internal router-server-methods".
+    // We provide a function that makes a self-fetch (HEAD) to our own
+    // worker with the \`x-prerender-revalidate\` header so Next.js's
+    // ISR layer triggers on-demand regeneration. The HEAD request
+    // routes back through our worker → handler → getStaticProps runs
+    // with \`revalidateReason: 'on-demand'\`.
+    revalidate: async ({ urlPath, headers }) => {
+      try {
+        const revalUrl = new URL(urlPath, url.origin);
+        const res = await fetch(revalUrl, {
+          method: "HEAD",
+          headers: new Headers(headers),
+        });
+        const cacheHeader = res.headers.get("x-nextjs-cache");
+        if (
+          cacheHeader?.toUpperCase() !== "REVALIDATED" &&
+          res.status !== 200 &&
+          !(res.status === 404)
+        ) {
+          throw new Error("Invalid response " + res.status);
+        }
+      } catch (err) {
+        throw new Error("Failed to revalidate " + urlPath + ": " + (err instanceof Error ? err.message : String(err)));
+      }
+    },
   };
   // Tell Next.js's server-action redirect codepath the real origin so
   // its internal fetch (action-handler.ts:417) doesn't default to
@@ -5274,6 +5302,11 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
         ...requestMeta,
         relativeProjectDir: ".",
         hostname: request.headers.get("host") || "localhost",
+        // Pages-api template calls \`setRequestMeta(req, ctx.requestMeta)\`
+        // which REPLACES our \`req[NEXT_REQUEST_META]\` wholesale. Include
+        // incrementalCache + revalidate here so they survive the overwrite.
+        incrementalCache: __creekGetIncrementalCache(),
+        revalidate: req[Symbol.for("NextInternalRequestMeta")]?.revalidate,
       },
     });
 
