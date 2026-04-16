@@ -1173,18 +1173,55 @@ async function __creekWriteRevalidatedTags(tags) {
   }
 }
 
+// ---------------------------------------------------------------
+// CreekCacheHandler — tiered cache backend
+//
+// L1: in-memory Map (per-isolate, per-request dedup)
+// L2: env.KV (Creek auto-provisions per-project KV namespace)
+// Tag: DOShardedTagCache (already wired via __creekTagsInvalidatedSince)
+//
+// Reads: L1 hit → return. L1 miss → KV.get → promote to L1 → return.
+// Writes: L1.set + KV.put (fire-and-forget via waitUntil if available).
+//
+// When KV binding is absent (local dev without bindings), falls back
+// to pure in-memory — matches pre-KV behavior.
+// ---------------------------------------------------------------
+const __CREEK_KV_PREFIX = "__next_cache:";
+
+function __creekKV() {
+  try {
+    return __INTERNAL_FETCH_CONTEXT.getStore()?.env?.KV ?? null;
+  } catch {
+    return null;
+  }
+}
+
 class CreekCacheHandler {
   constructor(ctx) {
     if (!globalThis.__CREEK_CACHE) globalThis.__CREEK_CACHE = new Map();
     if (!globalThis.__CREEK_TAG_TO_KEYS) globalThis.__CREEK_TAG_TO_KEYS = new Map();
-    // Map<tag, ms timestamp>: when revalidateTag() was called for this tag.
-    // get() compares against entry.lastModified to mark stale instead of
-    // delete — see opennextjs-cloudflare#1168 for the SWR rationale.
     if (!globalThis.__CREEK_TAG_INVALIDATED_AT) globalThis.__CREEK_TAG_INVALIDATED_AT = new Map();
   }
 
   async get(key) {
-    const entry = globalThis.__CREEK_CACHE.get(key);
+    // L1: in-memory
+    let entry = globalThis.__CREEK_CACHE.get(key);
+
+    // L2: KV (if available and L1 miss)
+    if (!entry) {
+      const kv = __creekKV();
+      if (kv) {
+        try {
+          const raw = await kv.get(__CREEK_KV_PREFIX + key, "json");
+          if (raw && typeof raw === "object") {
+            entry = raw;
+            // Promote to L1 for subsequent reads in this isolate
+            globalThis.__CREEK_CACHE.set(key, entry);
+          }
+        } catch {}
+      }
+    }
+
     if (!entry) return null;
 
     const age = (Date.now() - entry.lastModified) / 1000;
@@ -1218,16 +1255,59 @@ class CreekCacheHandler {
   async set(key, data, ctx) {
     if (data === null) {
       globalThis.__CREEK_CACHE.delete(key);
+      // Also delete from KV
+      const kv = __creekKV();
+      if (kv) {
+        try {
+          const kvCtx = (() => { try { return __INTERNAL_FETCH_CONTEXT.getStore()?.ctx; } catch { return null; } })();
+          const p = kv.delete(__CREEK_KV_PREFIX + key);
+          if (kvCtx && typeof kvCtx.waitUntil === "function") {
+            try { kvCtx.waitUntil(p.catch(() => {})); } catch { await p.catch(() => {}); }
+          } else {
+            await p.catch(() => {});
+          }
+        } catch {}
+      }
       return;
     }
     const tags = ctx?.tags ?? [];
     const revalidate = typeof ctx?.revalidate === "number" ? ctx.revalidate : undefined;
-    globalThis.__CREEK_CACHE.set(key, {
+    const entry = {
       value: data,
       lastModified: Date.now(),
       tags,
       revalidate,
-    });
+    };
+
+    // L1: always update in-memory
+    globalThis.__CREEK_CACHE.set(key, entry);
+
+    // L2: persist to KV (fire-and-forget)
+    const kv = __creekKV();
+    if (kv) {
+      try {
+        // KV TTL: use revalidate seconds if set, otherwise 1 year.
+        // This provides automatic expiration without needing manual cleanup.
+        const expirationTtl = typeof revalidate === "number" && revalidate > 0
+          ? Math.max(60, revalidate * 2)  // 2x revalidate, min 60s
+          : 31536000; // 1 year
+        const kvCtx = (() => { try { return __INTERNAL_FETCH_CONTEXT.getStore()?.ctx; } catch { return null; } })();
+        // JSON.stringify may fail for IncrementalCacheValues containing
+        // Buffers, TypedArrays, or circular refs. Skip KV persist silently
+        // — the in-memory cache still holds the entry for this isolate.
+        let serialized;
+        try { serialized = JSON.stringify(entry); } catch { return; }
+        if (!serialized || serialized.length > 24_000_000) return; // KV 25MB limit
+        const p = kv.put(__CREEK_KV_PREFIX + key, serialized, { expirationTtl });
+        if (kvCtx && typeof kvCtx.waitUntil === "function") {
+          try { kvCtx.waitUntil(p.catch(() => {})); } catch { await p.catch(() => {}); }
+        } else {
+          await p.catch(() => {});
+        }
+      } catch {}
+    }
+
+    // Track tags → keys mapping (in-memory only, for same-isolate invalidation)
     for (const tag of tags) {
       let keys = globalThis.__CREEK_TAG_TO_KEYS.get(tag);
       if (!keys) {
@@ -1240,8 +1320,6 @@ class CreekCacheHandler {
 
   async revalidateTag(tag) {
     const tags = Array.isArray(tag) ? tag : [tag];
-    // Mark stale, do not delete. Next.js will receive cacheState: "stale"
-    // on the next get() and trigger SWR (serve old, revalidate in background).
     await __creekWriteRevalidatedTags(tags);
   }
 

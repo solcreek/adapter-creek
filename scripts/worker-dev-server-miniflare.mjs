@@ -117,6 +117,11 @@ const mf = new Miniflare({
   compatibilityDate: "2026-03-23",
   compatibilityFlags: ["nodejs_compat"],
 
+  // KV namespace for Next.js IncrementalCache (CreekCacheHandler).
+  // In production, Creek auto-provisions env.KV per-project. For local
+  // dev, Miniflare provides a local KV backed by filesystem persistence.
+  kvNamespaces: { KV: "creek-dev-kv" },
+
   // Assets binding (equivalent to wrangler.toml [assets] with run_worker_first)
   assets: {
     directory: assetsAbs,
