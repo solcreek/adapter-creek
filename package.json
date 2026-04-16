@@ -45,6 +45,7 @@
   },
   "dependencies": {
     "@next/routing": "16.2.3",
+    "miniflare": "^4.20260410.0",
     "wrangler": "^4.82.2"
   },
   "peerDependencies": {

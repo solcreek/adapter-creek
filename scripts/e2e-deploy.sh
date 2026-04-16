@@ -159,7 +159,7 @@ HEALTHCHECK_PATH="${BASE_PATH}/_next/static/${BUILD_ID}/_buildManifest.js"
 # speed, but that hid streaming/HTTP-edge-case bugs that surface under
 # workerd — swapping here keeps dev/prod behavior consistent.
 ADAPTER_OUTPUT=".creek/adapter-output"
-WORKER_SERVER="${ADAPTER_DIR}/scripts/worker-dev-server-sub.mjs"
+WORKER_SERVER="${ADAPTER_DIR}/scripts/worker-dev-server-miniflare.mjs"
 
 # PORT was pre-allocated before build (see top of script).
 log "Starting local server on port ${PORT}..."
