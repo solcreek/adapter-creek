@@ -3135,6 +3135,15 @@ async function __handleRequest(request, env, ctx) {
         !isDraftModeRequest &&
         !(isCrawlerRequest && isServingBracketShell) &&
         (!isRewritten || !hasHandlerForTarget);
+      // POST (or other non-GET/HEAD) to a prerendered static page → 405.
+      // Next.js's NextNodeServer does this; without it, POST falls through
+      // to routing, finds no handler, and returns 200 (via static asset
+      // fallback) or 404 — neither is correct.
+      // Fixes prerender.test.ts "should respond with 405 for POST to static page".
+      if (staticAssetPath && !canServeStaticPage && request.method !== "GET" && request.method !== "HEAD") {
+        return new Response("Method Not Allowed", { status: 405 });
+      }
+
       if (staticAssetPath && canServeStaticPage) {
         try {
           const assetRes = await env.ASSETS.fetch(
