@@ -4403,7 +4403,8 @@ function fillRouteParamsFromPath(routePattern, pathname, params) {
   for (const segment of patternSegments) {
     if (segment.startsWith("[[...") && segment.endsWith("]]")) {
       const key = segment.slice(5, -2);
-      const rest = pathSegments.slice(pathIndex).map(decodeRouteParam);
+      const rest = pathSegments.slice(pathIndex).map(decodeRouteParam)
+        .filter((v) => typeof v !== "string" || (!v.startsWith("$nxtP") && !v.startsWith("%24nxtP")));
       if (rest.length > 0) params[key] = rest;
       else delete params[key];
       pathIndex = pathSegments.length;
@@ -4412,7 +4413,8 @@ function fillRouteParamsFromPath(routePattern, pathname, params) {
 
     if (segment.startsWith("[...") && segment.endsWith("]")) {
       const key = segment.slice(4, -1);
-      params[key] = pathSegments.slice(pathIndex).map(decodeRouteParam);
+      params[key] = pathSegments.slice(pathIndex).map(decodeRouteParam)
+        .filter((v) => typeof v !== "string" || (!v.startsWith("$nxtP") && !v.startsWith("%24nxtP")));
       pathIndex = pathSegments.length;
       continue;
     }
@@ -4420,7 +4422,18 @@ function fillRouteParamsFromPath(routePattern, pathname, params) {
     if (segment.startsWith("[") && segment.endsWith("]")) {
       const key = segment.slice(1, -1);
       if (pathIndex < pathSegments.length) {
-        params[key] = decodeRouteParam(pathSegments[pathIndex]);
+        const val = decodeRouteParam(pathSegments[pathIndex]);
+        // \`fillRouteParamsFromPath\` runs AFTER the \`$nxtP\` sentinel
+        // stripping in \`getNormalizedRouteParams\`. If
+        // \`invocationTarget.pathname\` contains sentinel segments
+        // (e.g. \`/$nxtPlocale/not-found\` for a parallel-route
+        // not-found boundary), we'd re-introduce the stripped value.
+        // Skip sentinels here too.
+        if (typeof val === "string" && (val.startsWith("$nxtP") || val.startsWith("%24nxtP"))) {
+          // Don't set — leave whatever was already there (or nothing).
+        } else {
+          params[key] = val;
+        }
       }
     }
 
