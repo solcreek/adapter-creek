@@ -168,6 +168,7 @@ if (typeof process !== "undefined") {
 
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import { IncrementalCache } from "next/dist/server/lib/incremental-cache/index.js";
+import { tagsManifest as __nextTagsManifest } from "next/dist/server/lib/incremental-cache/tags-manifest.external.js";
 import { workAsyncStorage as __nextWorkAsyncStorage } from "next/dist/server/app-render/work-async-storage.external.js";
 import { DurableObject } from "cloudflare:workers";
 
@@ -1109,6 +1110,31 @@ function __creekShardStub(env, shardKey) {
 // \`since\` (a ms timestamp). Uses DO-backed tag cache when available,
 // falls back to the in-memory \`__CREEK_TAG_INVALIDATED_AT\` map (covers
 // wrangler-dev-without-bindings + single-isolate tests).
+// Derive the implicit tags Next.js would attach to a path-based cache entry
+// from its cache key. Mirrors \`getDerivedTags\` + \`getImplicitTags\` in
+// nextjs/packages/next/src/server/lib/implicit-tags.ts — every URL segment
+// becomes a \`_N_T_<seg>/layout\` tag, and the full pathname becomes
+// \`_N_T_<pathname>\`. revalidatePath('/foo') invalidates \`_N_T_/foo\`, so
+// when we read a cache entry for key "/foo" we have to check those tags
+// even though Next.js never stored them on the entry itself.
+const __CREEK_IMPLICIT_TAG_PREFIX = "_N_T_";
+function __creekImplicitTagsForKey(key) {
+  if (typeof key !== "string" || !key.startsWith("/")) return [];
+  const tags = [__CREEK_IMPLICIT_TAG_PREFIX + "/layout"];
+  const parts = key.split("/");
+  for (let i = 1; i < parts.length + 1; i++) {
+    let cur = parts.slice(0, i).join("/");
+    if (!cur) continue;
+    if (!cur.endsWith("/page") && !cur.endsWith("/route")) {
+      cur = cur + (cur.endsWith("/") ? "" : "/") + "layout";
+    }
+    tags.push(__CREEK_IMPLICIT_TAG_PREFIX + cur);
+  }
+  tags.push(__CREEK_IMPLICIT_TAG_PREFIX + key);
+  if (key === "/") tags.push(__CREEK_IMPLICIT_TAG_PREFIX + "/index");
+  return tags;
+}
+
 async function __creekTagsInvalidatedSince(tags, since) {
   if (!Array.isArray(tags) || tags.length === 0) return false;
   const env = __creekCurrentEnv();
@@ -1145,6 +1171,21 @@ async function __creekWriteRevalidatedTags(tags) {
   if (mem) {
     for (const t of tags) if (typeof t === "string") mem.set(t, now);
   }
+  // Also update Next.js's internal tagsManifest — \`areTagsExpired\` /
+  // \`areTagsStale\` (server/lib/incremental-cache/tags-manifest.external.ts)
+  // read this map when deciding whether an APP_PAGE / APP_ROUTE cache
+  // entry is stale based on its x-next-cache-tags header. Without this
+  // write, on-demand revalidation (revalidateTag / revalidatePath / after
+  // + revalidatePath) has no effect because Next.js never sees the tag
+  // flip. Fixes next-after-app-deploy, trailingslash revalidate, and
+  // use-cache-route-handler-only revalidate.
+  try {
+    for (const t of tags) {
+      if (typeof t !== "string") continue;
+      const existing = __nextTagsManifest.get(t) || {};
+      __nextTagsManifest.set(t, Object.assign({}, existing, { stale: now, expired: now }));
+    }
+  } catch {}
   // Also persist to DO shards so other isolates / future requests see it.
   const env = __creekCurrentEnv();
   if (env && env.NEXT_TAG_CACHE_DO_SHARDED) {
@@ -1228,7 +1269,17 @@ class CreekCacheHandler {
 
     // Stale by tag invalidation — checks DO shards first (cross-isolate),
     // falls back to the in-memory map.
-    const staleByTag = await __creekTagsInvalidatedSince(entry.tags || [], entry.lastModified);
+    //
+    // Implicit path tags (_N_T_<pathname>) are NOT stored on the entry by
+    // Next.js's ResponseCache (it only passes cacheControl/isRoutePPREnabled/
+    // isFallback to set()). revalidatePath('/foo') invalidates _N_T_/foo,
+    // so we have to derive the implicit tags from the cache key at read
+    // time and include them in the invalidation check. Without this,
+    // revalidatePath and after() + revalidatePath have no effect on ISR
+    // page caches. Fixes next-after-app-deploy, trailingslash revalidate.
+    const checkTags = Array.isArray(entry.tags) ? entry.tags.slice() : [];
+    checkTags.push(...__creekImplicitTagsForKey(key));
+    const staleByTag = await __creekTagsInvalidatedSince(checkTags, entry.lastModified);
 
     // Stale by time-based revalidate
     const staleByTime =
