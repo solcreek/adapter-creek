@@ -1519,15 +1519,31 @@ class CreekComposableCacheHandler {
   /**
    * Next 16+ entry point. Marks tags stale immediately. If \`durations.expire\`
    * is provided (seconds), schedules hard expiry; otherwise expires now.
+   *
+   * Edge-runtime revalidatePath/revalidateTag flows through getCacheHandlers()
+   * → this method, never through the legacy CreekCacheHandler.revalidateTag.
+   * So we ALSO mirror the tag flip into the shared tagsManifest + our own
+   * __CREEK_TAG_INVALIDATED_AT (the map consulted by App Router ISR cache
+   * reads via __creekTagsInvalidatedSince). Without this mirror, edge-runtime
+   * after() + revalidatePath had no effect on node-side cache entries.
    */
   async updateTags(tags, durations) {
     const now = Date.now();
+    const expire = durations && durations.expire !== undefined ? now + durations.expire * 1000 : now;
     for (const tag of tags) {
-      globalThis.__CREEK_CC_TAG_STATE.set(tag, {
-        stale: now,
-        expire: durations && durations.expire !== undefined ? now + durations.expire * 1000 : now,
-      });
+      globalThis.__CREEK_CC_TAG_STATE.set(tag, { stale: now, expire });
     }
+    try {
+      const mem = globalThis.__CREEK_TAG_INVALIDATED_AT;
+      if (mem) {
+        for (const t of tags) if (typeof t === "string") mem.set(t, now);
+      }
+      for (const t of tags) {
+        if (typeof t !== "string") continue;
+        const existing = __nextTagsManifest.get(t) || {};
+        __nextTagsManifest.set(t, Object.assign({}, existing, { stale: now, expired: now }));
+      }
+    } catch {}
   }
 }
 
