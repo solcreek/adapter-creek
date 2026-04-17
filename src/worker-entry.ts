@@ -3535,9 +3535,52 @@ async function __handleRequest(request, env, ctx) {
         !(isISRPage && hasHandler)
       ) {
         try {
-          const rscAssetPath = staticAssetPath.endsWith("/index.html")
-            ? staticAssetPath.replace(/\\/index\\.html$/, ".rsc")
-            : staticAssetPath.replace(/\\.html$/, ".rsc");
+          const baseAssetPath = staticAssetPath.endsWith("/index.html")
+            ? staticAssetPath.replace(/\\/index\\.html$/, "")
+            : staticAssetPath.replace(/\\.html$/, "");
+          // Segment prefetch — Next.js client sends
+          // \`next-router-segment-prefetch: /blog/[author]/__PAGE__\` during
+          // Link-driven partial prefetches and expects just THAT segment,
+          // not the full route's RSC. Serve from
+          // \`<pathname>.segments/<segment>.segment.rsc\`. The segment header
+          // encodes dynamic segments in bracket form at request time but
+          // the on-disk sibling uses \`$d$name\` (the Next.js conventional
+          // segment encoding for \`[name]\`). Normalize before the lookup.
+          // Pattern from nextjs/adapter-bun \`segmentData\` handling:
+          // src/runtime/incremental-cache-handler.ts:247-276.
+          const segmentHeader = request.headers.get("next-router-segment-prefetch");
+          if (segmentHeader && typeof segmentHeader === "string") {
+            const decoded = (() => {
+              try { return decodeURIComponent(segmentHeader); } catch { return segmentHeader; }
+            })();
+            const normalizedSegment = decoded
+              .replace(/\\[\\.\\.\\.([^\\]]+)\\]/g, "$c$$$1") // [...slug] → $c$slug
+              .replace(/\\[([^\\]]+)\\]/g, "$d$$$1");         // [slug] → $d$slug
+            // \`segmentHeader\` starts with "/", strip leading slash for path join.
+            const segmentTail = normalizedSegment.replace(/^\\//, "");
+            const segmentAssetPath = baseAssetPath + ".segments/" + segmentTail + ".segment.rsc";
+            const segmentRes = await env.ASSETS.fetch(
+              new Request(new URL(segmentAssetPath, url.origin), { headers: request.headers })
+            );
+            if (segmentRes.status === 304) return segmentRes;
+            if (segmentRes.ok) {
+              const headers = new Headers(segmentRes.headers);
+              headers.set("content-type", "text/x-component");
+              headers.set("Vary", "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch");
+              headers.set("x-nextjs-prerender", "1");
+              if (staticEntry?.cacheTags) {
+                headers.set("x-next-cache-tags", String(staticEntry.cacheTags));
+              }
+              return new Response(segmentRes.body, {
+                status: segmentRes.status,
+                statusText: segmentRes.statusText,
+                headers,
+              });
+            }
+            // Fall through to full RSC if the segment file isn't there.
+          }
+
+          const rscAssetPath = baseAssetPath + ".rsc";
           if (rscAssetPath !== staticAssetPath) {
             const rscRes = await env.ASSETS.fetch(
               new Request(new URL(rscAssetPath, url.origin), { headers: request.headers })
