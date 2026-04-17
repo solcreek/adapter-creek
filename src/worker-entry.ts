@@ -2326,12 +2326,27 @@ async function __handleRequest(request, env, ctx) {
       // the early asset serve so middleware can intercept the request.
       // Tests like middleware-static-files depend on middleware being able
       // to rewrite /file.svg → a JSON API response.
+      // Route handlers with file extensions (e.g. \`/foo/[slug]/data.json\`,
+      // \`/feed.xml\`) must NOT take the asset fast-path when a HANDLERS entry
+      // matches them — otherwise prerendered output is served directly from
+      // the assets binding and the handler is never invoked, so ISR
+      // (\`export const revalidate = N\`) is frozen at build-time output.
+      // Fixes app-custom-routes "revalidates correctly on /revalidate-1/*"
+      // for concrete generateStaticParams entries.
+      const maybeRouteHandler = (() => {
+        if (HANDLERS[assetPath]) return true;
+        // Dynamic route match: \`/revalidate-1/first/data.json\` →
+        // \`/revalidate-1/[slug]/data.json\`.
+        try { if (__matchDynamicRoute(assetPath)) return true; } catch {}
+        return false;
+      })();
       if (
         request.method === "GET" &&
         !assetPath.startsWith("/_next/") &&
         !assetPath.startsWith("/api/") &&
         /\\.[a-zA-Z0-9]+$/.test(assetPath) &&
-        !(HAS_MIDDLEWARE && __shouldRunMiddleware(url, request.headers))
+        !(HAS_MIDDLEWARE && __shouldRunMiddleware(url, request.headers)) &&
+        !maybeRouteHandler
       ) {
         try {
           const assetRes = await env.ASSETS.fetch(request);
