@@ -3911,6 +3911,31 @@ async function __handleRequest(request, env, ctx) {
         }
       }
 
+      // Eagerly seed \`globalThis.__incrementalCache\` for every request.
+      // Next.js's \`unstable_cache\` (spec-extension/unstable-cache.js:60)
+      // throws \`Invariant: incrementalCache missing\` when neither
+      // workStore.incrementalCache nor globalThis.__incrementalCache is set.
+      // For Pages Router handlers (\`getServerSideProps\`, API routes) Next.js
+      // never calls \`routeModule.getIncrementalCache\` until after the
+      // user callback runs, so our patched getter above fires too late.
+      // Setting the global here — before we invoke any handler — makes
+      // unstable_cache work uniformly across APP/PAGES + route/api.
+      //
+      // \`__incrementalCacheShared\` must be set so Next.js's Pages Router
+      // edge template doesn't stomp over our seeded instance with a new
+      // IncrementalCache that has no CurCacheHandler (minified ref at
+      // worker.js:70448 — \`!globalThis.__incrementalCacheShared &&
+      // t2.IncrementalCache && (globalThis.__incrementalCache = new ...)\`).
+      // Without this flag, edge unstable_cache constructs a handler-less
+      // IncrementalCache each request → every call is a cache miss.
+      try {
+        const __seedIC = __creekGetIncrementalCache();
+        if (__seedIC) {
+          globalThis.__incrementalCache = __seedIC;
+          globalThis.__incrementalCacheShared = true;
+        }
+      } catch {}
+
       if (handler.runtime === "edge") {
         // CF Workers IS edge — try _ENTRIES first, then fall through to Node.js.
         // (Per opennext research: edge runtime is redundant on CF Workers.)
