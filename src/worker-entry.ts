@@ -3451,6 +3451,55 @@ async function __handleRequest(request, env, ctx) {
         return new Response("Method Not Allowed", { status: 405 });
       }
 
+      // App Router RSC GET of a statically prerendered page: serve the
+      // adjacent \`.rsc\` file directly. The App Router client dispatches
+      // \`fetch(pathname, { headers: { RSC: '1' } })\` during soft navigation
+      // and expects a flight payload. Without this branch, the request
+      // falls through to \`invokeNodeHandler\`, which re-renders the page
+      // and returns HTML — the client interprets the non-RSC response as
+      // a signal to hard-navigate, defeating Link / useRouter.push().
+      // Fixes app-static "should navigate to static path correctly" and
+      // similar client-nav tests whose prerendered target has an RSC
+      // sibling on disk.
+      if (
+        staticAssetPath &&
+        isAppRouterRSCRequest &&
+        (request.method === "GET" || request.method === "HEAD") &&
+        !request.headers.has("next-action") &&
+        !nextDataAppRouterPath &&
+        !(isISRPage && hasHandler)
+      ) {
+        try {
+          const rscAssetPath = staticAssetPath.endsWith("/index.html")
+            ? staticAssetPath.replace(/\\/index\\.html$/, ".rsc")
+            : staticAssetPath.replace(/\\.html$/, ".rsc");
+          if (rscAssetPath !== staticAssetPath) {
+            const rscRes = await env.ASSETS.fetch(
+              new Request(new URL(rscAssetPath, url.origin), { headers: request.headers })
+            );
+            if (rscRes.status === 304) return rscRes;
+            if (rscRes.ok) {
+              const headers = new Headers(rscRes.headers);
+              headers.set("content-type", "text/x-component");
+              headers.set("Vary", "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch");
+              const staleTime = staticEntry?.initialRevalidate;
+              if (typeof staleTime === "number") {
+                headers.set("x-nextjs-stale-time", String(staleTime));
+              }
+              headers.set("x-nextjs-prerender", "1");
+              if (staticEntry?.cacheTags) {
+                headers.set("x-next-cache-tags", String(staticEntry.cacheTags));
+              }
+              return new Response(rscRes.body, {
+                status: rscRes.status,
+                statusText: rscRes.statusText,
+                headers,
+              });
+            }
+          }
+        } catch {}
+      }
+
       if (staticAssetPath && canServeStaticPage) {
         try {
           const assetRes = await env.ASSETS.fetch(
