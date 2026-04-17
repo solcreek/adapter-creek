@@ -4906,7 +4906,19 @@ function getNormalizedRouteParams(routeResult, handlerPathname, fallbackUrl) {
     // (observed on middleware-rewrites "should handle static dynamic
     // rewrite from middleware correctly").
     if (key === "nextLocale") continue;
-    const normalizedKey = key.startsWith("nxtP") ? key.slice(4) : key;
+    // @next/routing encodes dynamic segments in routeMatches with two
+    // prefixes: \`nxtP\` for regular params (\`nxtPid\` → \`id\`) and
+    // \`nxtI\` for interception-route params (\`nxtIusername\` → \`username\`
+    // from a \`/(.)[username]/[id]\` pattern). Next.js's
+    // \`interpolateParallelRouteParams\` looks up params by the bare name
+    // (\`username\`) and throws
+    //   Invariant: Could not resolve param value for segment: username
+    // when the map only has \`nxtIusername\`.
+    // Fixes interception-dynamic-segment tests (6 tests).
+    let normalizedKey = key;
+    if (normalizedKey.startsWith("nxtP") || normalizedKey.startsWith("nxtI")) {
+      normalizedKey = normalizedKey.slice(4);
+    }
     if (/^[0-9]+$/.test(normalizedKey)) continue;
     normalizedRouteParams[normalizedKey] = value;
   }
@@ -4926,7 +4938,13 @@ function getNormalizedResolvedQuery(routeResult) {
     if (typeof value === "string" && (value.startsWith("$nxtP") || value.startsWith("%24nxtP"))) continue;
     // Same i18n marker — never surfaces as a user-facing query param.
     if (key === "nextLocale") continue;
-    const normalizedKey = key.startsWith("nxtP") ? key.slice(4) : key;
+    // Strip both \`nxtP\` (regular) and \`nxtI\` (interception) prefixes.
+    // See getNormalizedRouteParams for the invariant error that
+    // motivated the \`nxtI\` handling.
+    let normalizedKey = key;
+    if (normalizedKey.startsWith("nxtP") || normalizedKey.startsWith("nxtI")) {
+      normalizedKey = normalizedKey.slice(4);
+    }
     if (/^[0-9]+$/.test(normalizedKey)) continue;
     normalizedResolvedQuery[normalizedKey] = value;
   }
