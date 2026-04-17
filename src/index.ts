@@ -58,6 +58,15 @@ const adapter: NextAdapter = {
       // Disable memory cache — CF Workers doesn't have persistent fs.
       // The runtime cache handler is inlined in the worker entry (CreekCacheHandler).
       cacheMaxMemorySize: 0,
+      // Cap maxPostponedStateSize so Next.js's zlib inflate (5x this) stays
+      // under workerd's 128MB max output length. Default is 100MB → 500MB
+      // decompressed → workerd RangeError. 20MB compressed → 100MB decompressed
+      // → safely under limit. Real PPR fallback shells are typically ≤ a few
+      // KB anyway, so this cap is purely defensive.
+      experimental: {
+        ...(config.experimental ?? {}),
+        maxPostponedStateSize: "20mb",
+      },
       // Skip TypeScript type checking during build — CF Workers adapter
       // builds run `next build` where TS errors block the build. Type
       // checking should happen before deployment, not during bundling.
