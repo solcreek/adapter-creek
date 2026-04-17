@@ -39,6 +39,23 @@ export interface WorkerEntryOptions {
     initialHeaders?: Record<string, string | string[]>;
     pprHeaders?: Record<string, string>;
   }>;
+  /**
+   * Composable cache (`'use cache'`) entries extracted from build-time
+   * prerenders, keyed by bracket-form shell pathname. Applied request-scoped
+   * at runtime so only requests matching a shell see its seeds.
+   */
+  composableCacheSeedsByShell?: Array<[
+    string,
+    Array<{
+      key: string;
+      value: string;
+      tags: string[];
+      stale: number;
+      timestamp: number;
+      expire: number;
+      revalidate: number;
+    }>,
+  ]>;
   /** Path to edge registration chunk (contains _ENTRIES setup) */
   edgeRegistrationChunkPath?: string;
   /** Turbopack runtime module IDs for edge middleware evaluation */
@@ -69,6 +86,7 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
   const pathnames = collectPathnames(opts.outputs, opts.manifests);
   const staticPageMap = collectStaticPageMap(opts.outputs);
   const revalidatePaths = collectRevalidatePaths(opts.outputs);
+  const composableCacheSeedsByShell = opts.composableCacheSeedsByShell ?? [];
 
   // Lazy imports — used at request time, not module evaluation.
   // wrangler bundles the entry + all reachable imports.
@@ -1448,6 +1466,42 @@ class CreekComposableCacheHandler {
   }
 
   async get(cacheKey) {
+    // Check the request-scoped shell seeds first. These are build-time
+    // \`'use cache'\` values extracted from the matching fallback shell's
+    // postponedState — they take precedence over any runtime-populated
+    // module-level entry because they represent the authoritative
+    // build-time cache for a PPR fallback render.
+    try {
+      const reqUrl = __INTERNAL_FETCH_CONTEXT.getStore()?.request?.url;
+      if (reqUrl) {
+        const pathname = new URL(reqUrl).pathname;
+        const seeds = __creekSeedsForPathname(pathname);
+        if (seeds) {
+          const seed = seeds.get(cacheKey);
+          if (seed) {
+            for (const tag of seed.tags) {
+              const state = globalThis.__CREEK_CC_TAG_STATE.get(tag);
+              if (state && state.expire !== undefined && state.expire > seed.timestamp) {
+                // Seed invalidated by a runtime tag flip — fall through to
+                // normal handler path so a fresh render happens.
+                break;
+              }
+            }
+            return {
+              value: new ReadableStream({
+                start(c) { c.enqueue(seed.value); c.close(); },
+              }),
+              tags: seed.tags,
+              stale: seed.stale,
+              timestamp: seed.timestamp,
+              expire: seed.expire,
+              revalidate: seed.revalidate,
+            };
+          }
+        }
+      }
+    } catch {}
+
     const entry = globalThis.__CREEK_CC_STORE.get(cacheKey);
     if (!entry) return undefined;
 
@@ -1580,6 +1634,73 @@ class CreekComposableCacheHandler {
     globalThis[handlersMapSymbol] = map;
     globalThis[handlersSetSymbol] = new Set(map.values());
   }
+}
+
+// Composable cache build-time seeds. Extracted from each prerender's
+// postponedState (embedded renderResumeDataCache) during \`next build\`.
+// Keyed by bracket-form shell pathname so we apply only the seeds matching
+// the current request's shell — mirrors Next.js's per-request RDC and
+// prevents e.g. \`/with-suspense/*\`'s build-time "buildtime" sentinel from
+// leaking into \`/without-suspense/*\` requests that expect a fresh runtime
+// render.
+//
+// We precompile each pathname into a RegExp + turn \`value\` (base64) into
+// Uint8Array up-front so handler.get() is a hot-path lookup.
+const __CREEK_CC_SEEDS_BY_SHELL = (() => {
+  const out = [];
+  for (const [pathname, seeds] of ${JSON.stringify(composableCacheSeedsByShell)}) {
+    // Pathname may be bracket form like /foo/[slug]/bar or /foo/[...rest].
+    // Build a matcher that mirrors our bracket semantics elsewhere in this
+    // file (same as collectRevalidatePaths / static page map).
+    let re = "";
+    let i = 0;
+    while (i < pathname.length) {
+      const ch = pathname[i];
+      if (ch === "[") {
+        const end = pathname.indexOf("]", i);
+        if (end === -1) { re += "\\\\["; i++; continue; }
+        const inner = pathname.slice(i + 1, end);
+        if (inner.startsWith("[...") && inner.endsWith("]")) { re += "(.*)"; i = end + 1; continue; }
+        if (inner.startsWith("...")) { re += "(.+)"; i = end + 1; continue; }
+        re += "([^/]+)"; i = end + 1; continue;
+      }
+      if (/[.*+?^\${}()|\\\\]/.test(ch)) re += "\\\\" + ch;
+      else re += ch;
+      i++;
+    }
+    const entries = new Map();
+    for (const seed of seeds) {
+      try {
+        const bin = atob(seed.value);
+        const bytes = new Uint8Array(bin.length);
+        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+        entries.set(seed.key, {
+          value: bytes,
+          tags: seed.tags || [],
+          stale: seed.stale,
+          timestamp: seed.timestamp,
+          expire: seed.expire,
+          revalidate: seed.revalidate,
+        });
+      } catch {}
+    }
+    out.push({ regex: new RegExp("^" + re + "$"), entries });
+  }
+  return out;
+})();
+
+// Resolve the seed entries applicable to the current request. Returns a Map
+// (cacheKey → entry) merged across all matching shells — usually at most
+// one shell matches a given pathname.
+function __creekSeedsForPathname(pathname) {
+  if (!pathname || __CREEK_CC_SEEDS_BY_SHELL.length === 0) return null;
+  let merged = null;
+  for (const shell of __CREEK_CC_SEEDS_BY_SHELL) {
+    if (!shell.regex.test(pathname)) continue;
+    if (!merged) merged = new Map();
+    for (const [k, v] of shell.entries) if (!merged.has(k)) merged.set(k, v);
+  }
+  return merged;
 }
 
 // Initialize manifests singleton — called lazily on first SSR request.
@@ -2191,7 +2312,7 @@ async function __handleRequest(request, env, ctx) {
   // Reset patch state so Next.js will re-wrap fetch for this request.
   globalThis.fetch = __ourFetchWrapper;
   globalThis[__NEXT_PATCH_SYMBOL] = false;
-  const response = await __INTERNAL_FETCH_CONTEXT.run({ origin: new URL(request.url).origin, env, ctx }, async () => {
+  const response = await __INTERNAL_FETCH_CONTEXT.run({ origin: new URL(request.url).origin, env, ctx, request }, async () => {
     try {
       __initManifests();
       const url = new URL(request.url);

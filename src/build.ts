@@ -87,6 +87,23 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     console.log(`  [Creek Adapter] ${prerenderEntries.length} prerender entries for cache seeding`);
   }
 
+  // Step 3c: Extract \`'use cache'\` entries from every prerender's postponedState.
+  // Keyed by bracket-form shell pathname so the worker can apply them ONLY to
+  // requests matching that shell — mirrors Next.js's request-scoped RDC and
+  // keeps e.g. /with-suspense/* build-time values out of /without-suspense/*
+  // requests that expect fresh runtime renders.
+  const composableCacheSeedsByShell = await collectComposableCacheSeeds(ctx.outputs);
+  const composableCacheSeedEntries = Array.from(composableCacheSeedsByShell.entries());
+  const composableCacheSeedCount = composableCacheSeedEntries.reduce(
+    (n, [, seeds]) => n + seeds.length,
+    0
+  );
+  if (composableCacheSeedCount > 0) {
+    console.log(
+      `  [Creek Adapter] ${composableCacheSeedCount} composable cache seeds across ${composableCacheSeedEntries.length} shells`
+    );
+  }
+
   // Find Turbopack runtime for static import (triggers chunk bundling)
   let turbopackRuntimePath: string | undefined;
   try {
@@ -236,6 +253,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     manifests,
     userFiles,
     prerenderEntries,
+    composableCacheSeedsByShell: composableCacheSeedEntries,
     turbopackRuntimePath,
     edgeRegistrationChunkPath,
     edgeRuntimeModuleIds,
@@ -729,6 +747,82 @@ async function collectPrerenderEntries(outputs: BuildContext["outputs"]): Promis
   }
 
   return entries;
+}
+
+/**
+ * A single \`'use cache'\` entry extracted at build time from a prerender's
+ * embedded renderResumeDataCache. Mirrors Next.js's UseCacheCacheStoreSerialized
+ * shape (see packages/next/src/server/resume-data-cache/cache-store.ts) so the
+ * worker can restore these straight into CreekComposableCacheHandler without
+ * running Next.js's parse path (which allocates streams tied to a request's
+ * IoContext).
+ */
+export interface ComposableCacheSeed {
+  key: string;
+  value: string;
+  tags: string[];
+  stale: number;
+  timestamp: number;
+  expire: number;
+  revalidate: number;
+}
+
+/**
+ * Extract \`'use cache'\` entries from every prerender's postponedState.
+ *
+ * Next.js serializes postponedState as \`<len>:<postponedString><base64ZlibBlob>\`
+ * where the tail is a zlib-compressed JSON containing the cache, fetch, and
+ * encryptedBoundArgs stores. We decompress and pull out the cache entries so
+ * the worker can hand them to CreekComposableCacheHandler at init — meaning
+ * root-layout \`'use cache'\` values computed at build time ("buildtime"
+ * sentinel) survive into runtime GETs without a full PPR resume.
+ *
+ * Duplicate cache keys (e.g. root layout shared across many shells) dedupe
+ * naturally by Map key — the last seen wins, which is fine since they're
+ * semantically identical.
+ */
+async function collectComposableCacheSeeds(
+  outputs: BuildContext["outputs"]
+): Promise<Map<string, ComposableCacheSeed[]>> {
+  const zlib = await import("node:zlib");
+  // Map bracket-form pathname → its cache entries. Gating by shell prevents
+  // seeds from one prerender's request-scoped RDC from bleeding into
+  // unrelated requests (e.g. \`/with-suspense/*\`'s build-time "buildtime"
+  // leaking into \`/without-suspense/*\` where the test expects "runtime").
+  const byShell = new Map<string, ComposableCacheSeed[]>();
+  for (const prerender of outputs.prerenders) {
+    const postponed = prerender.fallback?.postponedState;
+    if (typeof postponed !== "string" || postponed.length === 0) continue;
+    const m = postponed.match(/^(\d+):/);
+    if (!m) continue;
+    const prefixLen = m[0].length;
+    const postponedLen = parseInt(m[1], 10);
+    const cacheBlob = postponed.slice(prefixLen + postponedLen);
+    if (!cacheBlob || cacheBlob === "null") continue;
+    try {
+      const buf = Buffer.from(cacheBlob, "base64");
+      const inflated = zlib.inflateSync(buf, { maxOutputLength: 200 * 1024 * 1024 });
+      const json = JSON.parse(inflated.toString("utf-8"));
+      const cacheStore = json?.store?.cache;
+      if (!cacheStore || typeof cacheStore !== "object") continue;
+      const shellSeeds: ComposableCacheSeed[] = [];
+      for (const [key, serialized] of Object.entries<any>(cacheStore)) {
+        if (!serialized?.entry) continue;
+        const e = serialized.entry;
+        shellSeeds.push({
+          key,
+          value: e.value ?? "",
+          tags: Array.isArray(e.tags) ? e.tags : [],
+          stale: typeof e.stale === "number" ? e.stale : 0,
+          timestamp: typeof e.timestamp === "number" ? e.timestamp : Date.now(),
+          expire: typeof e.expire === "number" ? e.expire : Number.MAX_SAFE_INTEGER,
+          revalidate: typeof e.revalidate === "number" ? e.revalidate : Number.MAX_SAFE_INTEGER,
+        });
+      }
+      if (shellSeeds.length > 0) byShell.set(prerender.pathname, shellSeeds);
+    } catch {}
+  }
+  return byShell;
 }
 
 function formatSize(bytes: number): string {
