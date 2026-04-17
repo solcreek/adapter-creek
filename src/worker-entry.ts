@@ -68,6 +68,7 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
   const handlers = collectHandlers(opts.outputs, opts.manifests);
   const pathnames = collectPathnames(opts.outputs, opts.manifests);
   const staticPageMap = collectStaticPageMap(opts.outputs);
+  const revalidatePaths = collectRevalidatePaths(opts.outputs);
 
   // Lazy imports — used at request time, not module evaluation.
   // wrangler bundles the entry + all reachable imports.
@@ -518,6 +519,12 @@ const HAS_MIDDLEWARE = ${JSON.stringify(!!opts.outputs.middleware)};
 // Pages Router static pages and auto-statically-optimized pages don't work
 // through handler invocation in CF Workers (no filesystem access).
 const STATIC_PAGES = ${JSON.stringify(staticPageMap)};
+
+// Set of concrete prerender pathnames whose route handler must run through
+// the handler pipeline (not the asset fast-path) so its ISR revalidate
+// lifecycle actually fires. Metadata routes are deliberately excluded
+// above — see collectRevalidatePaths().
+const REVALIDATE_PATHS = new Set(${JSON.stringify(revalidatePaths)});
 
 // Embedded manifests — Next.js route modules call loadManifest() which
 // normally uses fs.readFileSync(). Expose on globalThis so the shim can access it.
@@ -2326,12 +2333,24 @@ async function __handleRequest(request, env, ctx) {
       // the early asset serve so middleware can intercept the request.
       // Tests like middleware-static-files depend on middleware being able
       // to rewrite /file.svg → a JSON API response.
+      // Skip fast-path for paths whose build-time prerender has
+      // revalidate > 0 (traditional ISR route handlers like
+      // \`export const revalidate = N\` in /foo/[slug]/data.json).
+      // The prerendered file is a frozen snapshot — serving it
+      // directly bypasses IncrementalCache's fresh/stale/SWR loop.
+      // Metadata routes (\`'use cache'\`-based sitemaps etc.) are
+      // excluded from REVALIDATE_PATHS at build time so they keep
+      // serving their build-time output via the fast-path — running
+      // them through the handler would hang without composable-cache
+      // build-time seeding.
+      const isRevalidatingPrerender = REVALIDATE_PATHS.has(assetPath);
       if (
         request.method === "GET" &&
         !assetPath.startsWith("/_next/") &&
         !assetPath.startsWith("/api/") &&
         /\\.[a-zA-Z0-9]+$/.test(assetPath) &&
-        !(HAS_MIDDLEWARE && __shouldRunMiddleware(url, request.headers))
+        !(HAS_MIDDLEWARE && __shouldRunMiddleware(url, request.headers)) &&
+        !isRevalidatingPrerender
       ) {
         try {
           const assetRes = await env.ASSETS.fetch(request);
@@ -4360,6 +4379,44 @@ interface StaticPageEntry {
   // assets — the handler path with IncrementalCache manages the
   // fresh/stale lifecycle.
   initialRevalidate?: number;
+}
+
+// Collect paths whose build-time prerender has an ISR revalidate > 0 AND
+// is NOT a metadata route. Intent: allow \`export const revalidate = N\`
+// route handlers (e.g. /revalidate-1/[slug]/data.json) to bypass the
+// static-asset fast-path so the handler runs and IncrementalCache governs
+// the fresh/stale lifecycle. Metadata routes (sitemap, robots, manifest,
+// opengraph-image, etc.) often also carry revalidate via \`'use cache'\`
+// defaults, but running them through the handler at runtime hangs —
+// \`'use cache'\` relies on build-time-seeded cache entries that we don't
+// populate yet. So metadata routes keep serving their build-time output
+// via the fast-path until composable-cache seeding is implemented.
+const __METADATA_ROUTE_NAMES = new Set([
+  "sitemap", "robots", "manifest",
+  "opengraph-image", "twitter-image",
+  "icon", "apple-icon", "favicon",
+]);
+function __isMetadataRoutePath(p: string): boolean {
+  const segments = p.split("/").filter(Boolean);
+  if (segments.length === 0) return false;
+  const last = segments[segments.length - 1] || "";
+  const lastNoExt = last.replace(/\.[a-z0-9]+$/i, "");
+  if (__METADATA_ROUTE_NAMES.has(lastNoExt)) return true;
+  const second = segments[segments.length - 2] || "";
+  if (__METADATA_ROUTE_NAMES.has(second)) return true;
+  return false;
+}
+function collectRevalidatePaths(outputs: BuildContext["outputs"]): string[] {
+  const paths = new Set<string>();
+  for (const prerender of outputs.prerenders) {
+    if (!prerender.fallback?.filePath) continue;
+    if (prerender.pathname.startsWith("/_next/")) continue;
+    const rev = prerender.fallback.initialRevalidate;
+    if (typeof rev !== "number" || rev <= 0) continue;
+    if (__isMetadataRoutePath(prerender.pathname)) continue;
+    paths.add(prerender.pathname);
+  }
+  return Array.from(paths);
 }
 
 function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, StaticPageEntry> {
