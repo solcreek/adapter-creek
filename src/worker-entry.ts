@@ -1322,7 +1322,19 @@ class CreekCacheHandler {
       return;
     }
     const tags = ctx?.tags ?? [];
-    const revalidate = typeof ctx?.revalidate === "number" ? ctx.revalidate : undefined;
+    // Next.js 16's ResponseCache passes { cacheControl, isRoutePPREnabled,
+    // isFallback } to cacheHandler.set — revalidate lives under cacheControl,
+    // not on ctx directly. Read from both so time-based ISR expiry works.
+    // Without this, \`age > entry.revalidate\` comparison at get() time
+    // always takes the \`undefined\` path, so entries stay fresh forever and
+    // \`export const revalidate = N\` routes never re-execute.
+    // Fixes app-custom-routes "revalidates correctly on /revalidate-1/*".
+    const revalidate =
+      typeof ctx?.revalidate === "number"
+        ? ctx.revalidate
+        : typeof ctx?.cacheControl?.revalidate === "number"
+          ? ctx.cacheControl.revalidate
+          : undefined;
     const entry = {
       value: data,
       lastModified: Date.now(),
