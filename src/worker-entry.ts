@@ -170,6 +170,17 @@ if (typeof globalThis.Request === "function") {
       if (init && init.body != null && init.duplex === undefined) {
         init = Object.assign({}, init, { duplex: "half" });
       }
+      // workerd's Request constructor rejects the standard
+      // \`cache: 'force-cache' | 'no-cache' | 'only-if-cached' | 'reload'\`
+      // modes with \`TypeError: Unsupported cache mode\`. Next.js's
+      // \`patch-fetch.js\` already handles these semantics at a higher
+      // layer (via IncrementalCache), so the underlying Request doesn't
+      // actually need the field. Drop it before hitting super. Preserve
+      // \`no-store\` and \`default\` which workerd does accept.
+      if (init && init.cache !== undefined && init.cache !== "no-store" && init.cache !== "default") {
+        init = Object.assign({}, init);
+        delete init.cache;
+      }
       super(input, init);
     }
   }
@@ -2234,6 +2245,15 @@ async function __withMinimalWorkStore(pagePath, ctx, fn) {
 
 const __INTERNAL_FETCH_CONTEXT = new AsyncLocalStorage();
 globalThis.fetch = function(input, init) {
+  // workerd rejects \`cache: 'force-cache' | 'no-cache' | 'only-if-cached' |
+  // 'reload'\` — standard Fetch API fields that Next.js's user code freely
+  // passes through. patch-fetch handles the cache semantics at a higher
+  // layer via IncrementalCache, so dropping the field before the native
+  // call is safe. Preserve \`no-store\` and \`default\`.
+  if (init && init.cache !== undefined && init.cache !== "no-store" && init.cache !== "default") {
+    init = Object.assign({}, init);
+    delete init.cache;
+  }
   // Edge asset bindings: Next.js's middleware-asset-loader rewrites
   // \`fetch(new URL('../assets/foo.ttf', import.meta.url))\` into
   // \`fetch('blob:<name>')\` and emits the file bytes to either
