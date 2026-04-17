@@ -2882,8 +2882,10 @@ async function __handleRequest(request, env, ctx) {
         const fixedQuery = { ...result.resolvedQuery };
         let changed = false;
         // Sort keys by length desc so longer named groups don't shadow.
+        // Include both nxtP (regular) and nxtI (interception) prefixes —
+        // see getNormalizedRouteParams for the nxtI rationale.
         const sortedKeys = Object.keys(result.routeMatches)
-          .filter((k) => k.startsWith("nxtP") && !/^[0-9]+$/.test(k.slice(4)))
+          .filter((k) => (k.startsWith("nxtP") || k.startsWith("nxtI")) && !/^[0-9]+$/.test(k.slice(4)))
           .sort((a, b) => b.length - a.length);
         for (const key of sortedKeys) {
           const authoritative = result.routeMatches[key];
