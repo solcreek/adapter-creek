@@ -325,6 +325,16 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     await fs.writeFile(path.join(opts.outputDir, "__entry_debug.mjs"), opts.workerSource);
   }
 
+  // Copy WASM files alongside the bundle BEFORE wrangler runs. wrangler's
+  // bundler needs the files resolvable from the entry `import __wasm_0 from
+  // "./wasm_<hex>.wasm"` to apply the CompiledWasm rule — copying later
+  // (after the bundle step) is too late.
+  for (const [name, absPath] of opts.wasmFiles) {
+    const destName = name.endsWith(".wasm") ? name : name + ".wasm";
+    const destPath = path.join(opts.outputDir, destName);
+    await fs.copyFile(absPath, destPath);
+  }
+
   // Resolve adapter paths
   const adapterDir = path.dirname(path.dirname(new URL(import.meta.url).pathname));
 
@@ -467,11 +477,6 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     await fs.writeFile(workerPath, workerCode);
   } catch {}
 
-  // Copy WASM files alongside the bundle
-  for (const [name, absPath] of opts.wasmFiles) {
-    await fs.copyFile(absPath, path.join(opts.outputDir, name));
-  }
-
   // Emit wrangler.toml that covers both local dev (workerd via wrangler dev)
   // and \`wrangler deploy\`. Dev and prod MUST share the same config so
   // deployment behavior stays predictable — that's what the adapter is
@@ -484,7 +489,12 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   await emitWranglerConfig({
     outputDir: opts.outputDir,
     assetsRelPath: "../assets", // server/ → assets/
-    wasmFilenames: [...opts.wasmFiles.keys()],
+    // Same normalization as the copy loop above — ensure every wasm
+    // filename declared in the rules ends with \`.wasm\` so wrangler's
+    // CompiledWasm rule discovers the file we actually wrote to disk.
+    wasmFilenames: [...opts.wasmFiles.keys()].map((n) =>
+      n.endsWith(".wasm") ? n : n + ".wasm"
+    ),
   });
 
   // Clean up temp files

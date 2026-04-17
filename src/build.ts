@@ -80,6 +80,28 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   const manifests = await collectManifests(ctx.distDir);
   console.log(`  [Creek Adapter] ${Object.keys(manifests).length} manifests embedded`);
 
+  // Step 3a-bis: Compute xxh3-128 hex for every wasm file. Turbopack's
+  // edge bundles access each wasm via \`globalThis.wasm_<hex>\` where
+  // \`<hex>\` is xxh3_128(wasm_content). At worker init we need to import
+  // the wasm (as CompiledWasm via wrangler rules) and mirror it onto
+  // globalThis under the expected name.
+  const wasmHashToFilename = new Map<string, string>();
+  try {
+    const { xxh3 } = await import("@node-rs/xxhash");
+    for (const [name, absPath] of wasmFiles) {
+      try {
+        const bytes = await fs.readFile(absPath);
+        const hex = xxh3.xxh128(bytes).toString(16).padStart(32, "0");
+        const destName = name.endsWith(".wasm") ? name : name + ".wasm";
+        console.log(`    wasm: name=${name} dest=${destName} xxh3=${hex}`);
+        wasmHashToFilename.set(hex, destName);
+      } catch {}
+    }
+    if (wasmHashToFilename.size > 0) {
+      console.log(`  [Creek Adapter] ${wasmHashToFilename.size} wasm edge var mappings computed`);
+    }
+  } catch {}
+
   // Step 3b: Collect prerender entries for ISR cache seeding.
   // Each prerender with a fallback file gets seeded into the cache at startup.
   const prerenderEntries = await collectPrerenderEntries(ctx.outputs);
@@ -254,6 +276,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     userFiles,
     prerenderEntries,
     composableCacheSeedsByShell: composableCacheSeedEntries,
+    wasmHashToFilename: Array.from(wasmHashToFilename.entries()),
     turbopackRuntimePath,
     edgeRegistrationChunkPath,
     edgeRuntimeModuleIds,

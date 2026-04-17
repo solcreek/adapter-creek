@@ -62,6 +62,13 @@ export interface WorkerEntryOptions {
   edgeRuntimeModuleIds?: number[];
   /** Paths to edge otherChunks that need explicit import */
   edgeOtherChunkPaths?: string[];
+  /**
+   * [xxh3_128_hex, wasm_filename_with_ext] pairs. Turbopack edge bundles
+   * access the compiled WebAssembly.Module via \`globalThis.wasm_<hex>\`.
+   * Import each wasm (wrangler declares \`.wasm\` as CompiledWasm) and
+   * assign onto globalThis before edge modules evaluate.
+   */
+  wasmHashToFilename?: Array<[string, string]>;
 }
 
 interface HandlerEntry {
@@ -120,6 +127,15 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
 
   const edgeOtherChunkImports = (opts.edgeOtherChunkPaths || [])
     .map((p: string, i: number) => `import * as __edgeChunk${i} from ${JSON.stringify(p)};\nvoid __edgeChunk${i};`)
+    .join("\n");
+
+  // Mirror each \`.wasm\` CompiledWasm export onto globalThis under the
+  // \`wasm_<xxh3_128_hex>\` name Turbopack's loadEdgeWasm expects.
+  const wasmImports = (opts.wasmHashToFilename ?? [])
+    .map(([hex, filename], i) =>
+      `import __wasm_${i} from ${JSON.stringify("./" + filename)};\n` +
+      `globalThis[${JSON.stringify("wasm_" + hex)}] = __wasm_${i};`
+    )
     .join("\n");
 
   // Path to ALS polyfill — must be the FIRST import so it runs
@@ -193,6 +209,10 @@ import { DurableObject } from "cloudflare:workers";
 
 // Boot manifest globals before importing edge runtime chunks.
 ${manifestImports}
+
+// Register each WebAssembly.Module under \`wasm_<xxh3_128_hex>\` globals
+// Turbopack's edge wasm loader expects. Must precede edge chunk imports.
+${wasmImports}
 
 // Edge runtime chunks must be imported so their module factories are present
 // before runtimeModuleIds are evaluated for middleware or edge pages/routes.
