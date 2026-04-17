@@ -1733,6 +1733,52 @@ function __creekSeedsForPathname(pathname) {
   return merged;
 }
 
+// PPR fallback-shell resume: map bracket-form shell pathname → postponedState
+// string. At request time, any path whose concrete pathname matches a shell's
+// bracket pattern gets the shell's postponedState injected into its
+// requestMeta as \`postponed\`. Next.js's app-page template reads that and
+// resumes the render from the pre-captured prelude + RDC instead of running
+// cached functions from scratch (see
+// \`packages/next/dist/build/templates/app-page.js:333\` —
+// \`getRequestMeta(req, 'postponed')\`). Without this plumbing, every
+// fallback shell resume re-renders every \`'use cache'\` function at runtime,
+// producing hydration mismatches between the shell HTML (buildtime values)
+// and the RSC stream (fresh runtime values).
+// Fixes fallback-shells hydration-errors test and unblocks future PPR work.
+const __CREEK_POSTPONED_BY_SHELL = (() => {
+  const out = [];
+  for (const entry of __PRERENDER_ENTRIES) {
+    if (typeof entry.postponedState !== "string" || entry.postponedState.length === 0) continue;
+    if (!entry.pathname.includes("[")) continue; // concrete prerenders use their own URL directly
+    let re = "";
+    let i = 0;
+    while (i < entry.pathname.length) {
+      const ch = entry.pathname[i];
+      if (ch === "[") {
+        const end = entry.pathname.indexOf("]", i);
+        if (end === -1) { re += "\\\\["; i++; continue; }
+        const inner = entry.pathname.slice(i + 1, end);
+        if (inner.startsWith("[...") && inner.endsWith("]")) { re += "(.*)"; i = end + 1; continue; }
+        if (inner.startsWith("...")) { re += "(.+)"; i = end + 1; continue; }
+        re += "([^/]+)"; i = end + 1; continue;
+      }
+      if (/[.*+?^\${}()|\\\\]/.test(ch)) re += "\\\\" + ch;
+      else re += ch;
+      i++;
+    }
+    out.push({ regex: new RegExp("^" + re + "$"), postponedState: entry.postponedState });
+  }
+  return out;
+})();
+
+function __creekPostponedForPathname(pathname) {
+  if (!pathname || __CREEK_POSTPONED_BY_SHELL.length === 0) return null;
+  for (const shell of __CREEK_POSTPONED_BY_SHELL) {
+    if (shell.regex.test(pathname)) return shell.postponedState;
+  }
+  return null;
+}
+
 // Initialize manifests singleton — called lazily on first SSR request.
 function __initManifests() {
   const MANIFESTS_SINGLETON = Symbol.for('next.server.manifests');
@@ -5099,6 +5145,15 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   //     preview-mode and header forwarding.
   // Symbol.for(...) matches Next.js's own \`NEXT_REQUEST_META\` export.
   const NEXT_REQUEST_META = Symbol.for("NextInternalRequestMeta");
+  // PPR fallback-shell resume: if this path matches a bracket-form
+  // prerender whose build-time output carried a postponedState (i.e. the
+  // shell was prerendered with opaque params), inject it into requestMeta
+  // so the app-page template reads it via \`getRequestMeta(req, 'postponed')\`
+  // at \`packages/next/dist/build/templates/app-page.js:333\`. That makes
+  // Next.js resume the render from the captured prelude + RDC instead of
+  // re-running every \`'use cache'\` function — which is what was leaking
+  // runtime timestamps into layouts and producing hydration mismatches.
+  const __postponedForThisPath = __creekPostponedForPathname(url.pathname);
   req[NEXT_REQUEST_META] = {
     initURL: request.url,
     initProtocol: url.protocol.replace(/:+$/, ""),
@@ -5111,6 +5166,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     // plumb the cache via workStore had zero effect. Injecting through
     // requestMeta is the upstream-supported override point.
     incrementalCache: __creekGetIncrementalCache(),
+    ...(__postponedForThisPath ? { postponed: __postponedForThisPath } : {}),
     // \`res.revalidate(path)\` in Pages Router API routes reads
     // \`routerServerContext.revalidate\` which comes from
     // \`getRequestMeta(req, 'revalidate')\`. Without this, the call
