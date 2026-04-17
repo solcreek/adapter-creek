@@ -4073,7 +4073,7 @@ async function __handleRequest(request, env, ctx) {
       if (handler.runtime === "edge") {
         // CF Workers IS edge — try _ENTRIES first, then fall through to Node.js.
         // (Per opennext research: edge runtime is redundant on CF Workers.)
-        const edgeRouteParams = getNormalizedRouteParams(result, handler.pathname, url);
+        const edgeRouteParams = getNormalizedRouteParams(result, handler.pathname, url, request.headers);
         const edgeRequestQuery =
           handler.type === "APP_PAGE"
             ? { ...(result.resolvedQuery || {}), ...edgeRouteParams }
@@ -4970,7 +4970,7 @@ function fillRouteParamsFromPath(routePattern, pathname, params) {
   return params;
 }
 
-function getNormalizedRouteParams(routeResult, handlerPathname, fallbackUrl) {
+function getNormalizedRouteParams(routeResult, handlerPathname, fallbackUrl, requestHeaders) {
   const normalizedRouteParams = {};
   for (const [key, value] of Object.entries(routeResult?.routeMatches || {})) {
     // Any \`$nxtP{paramName}\` sentinel represents a MISSING optional
@@ -5012,6 +5012,53 @@ function getNormalizedRouteParams(routeResult, handlerPathname, fallbackUrl) {
     routeResult?.invocationTarget?.pathname || fallbackUrl?.pathname,
     normalizedRouteParams,
   );
+  // Interception + locale middleware fallback: @next/routing doesn't
+  // extract named captures from a beforeFiles rewrite's \`has\` header
+  // regex (e.g. the interception rewrite source
+  // \`{type:"header", key:"next-url", value:"/(?<nxtPlocale>[^/]+?)..."}\` —
+  // the nxtPlocale capture is meant to seed the rewrite destination's
+  // virtual params). Result: an interception route match like
+  // \`/[locale]/(.)foo/p/1\` arrives with locale="", and Next.js's
+  // \`interpolateParallelRouteParams\` throws
+  //   Invariant: Could not resolve param value for segment: locale.
+  // When the handler looks like an interception route and any params
+  // are still empty/sentinel-holed after the path fill, take them from
+  // the \`next-url\` header's path — that's the URL the client was on
+  // before the navigation, which is what \`has.next-url\` targets.
+  // Fixes interception-dynamic-segment-middleware cluster (3 tests).
+  if (
+    handlerPathname &&
+    handlerPathname.includes("(.)") &&
+    requestHeaders &&
+    typeof requestHeaders.get === "function"
+  ) {
+    const nextUrl = requestHeaders.get("next-url");
+    if (nextUrl && typeof nextUrl === "string") {
+      try {
+        // \`next-url\` may be an absolute URL or a bare path — handle both.
+        const nextUrlPath = nextUrl.startsWith("http")
+          ? new URL(nextUrl).pathname
+          : nextUrl.split("?")[0];
+        const nextUrlSegments = nextUrlPath.split("/").filter(Boolean);
+        const patternSegments = handlerPathname.split("/").filter(Boolean);
+        let idx = 0;
+        for (const seg of patternSegments) {
+          if (idx >= nextUrlSegments.length) break;
+          if (seg.startsWith("[") && seg.endsWith("]") && !seg.startsWith("[...") && !seg.startsWith("[[...")) {
+            const key = seg.slice(1, -1);
+            const existing = normalizedRouteParams[key];
+            if (existing === undefined || existing === "" || (typeof existing === "string" && existing.startsWith("$nxtP"))) {
+              normalizedRouteParams[key] = decodeRouteParam(nextUrlSegments[idx]);
+            }
+          }
+          // Stop at the interception marker — segments beyond it are
+          // in the intercepted tree, not the parent tree next-url points to.
+          if (seg.startsWith("(.)") || seg.startsWith("(..)")) break;
+          idx += 1;
+        }
+      } catch {}
+    }
+  }
   return normalizedRouteParams;
 }
 
@@ -5103,7 +5150,7 @@ function applyStaticAssetHeaders(headers, pathname) {
  */
 async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname, handlerType) {
   const url = new URL(request.url);
-  const normalizedRouteParams = getNormalizedRouteParams(routeResult, handlerPathname, url);
+  const normalizedRouteParams = getNormalizedRouteParams(routeResult, handlerPathname, url, request.headers);
   const isRSCRequest = request.headers.has("rsc");
   const isPrefetchRSCRequest = request.headers.get("next-router-prefetch") === "1";
   const segmentPrefetchRSCRequest = request.headers.get("next-router-segment-prefetch");
