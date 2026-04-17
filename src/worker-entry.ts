@@ -3424,6 +3424,20 @@ async function __handleRequest(request, env, ctx) {
       // trailingslash revalidation, and stale-cache-serving tests.
       const isISRPage = staticEntry?.initialRevalidate != null && staticEntry.initialRevalidate > 0;
       const hasHandler = resolvedPathname && HANDLERS[resolvedPathname];
+      // Any tag on this prerender invalidated since build? If yes the static
+      // HTML is stale — skip the fast-path and let the handler rebuild so the
+      // server-action-side updateTag/revalidateTag actually takes effect.
+      // Uses \`__CREEK_TAG_INVALIDATED_AT\` which server actions write via
+      // \`CreekCacheHandler.revalidateTag\` / \`CreekComposableCacheHandler.updateTags\`.
+      let staleByTag = false;
+      if (staticEntry?.cacheTags && hasHandler) {
+        const mem = globalThis.__CREEK_TAG_INVALIDATED_AT;
+        if (mem) {
+          for (const tag of staticEntry.cacheTags) {
+            if (mem.has(tag)) { staleByTag = true; break; }
+          }
+        }
+      }
       const canServeStaticPage =
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
@@ -3436,7 +3450,10 @@ async function __handleRequest(request, env, ctx) {
         !(isCrawlerRequest && isServingBracketShell) &&
         (!isRewritten || !hasHandlerForTarget) &&
         // ISR pages bypass static assets when a handler exists.
-        !(isISRPage && hasHandler);
+        !(isISRPage && hasHandler) &&
+        // A previous revalidateTag/updateTag marked one of this page's
+        // tags stale — fall through to handler so the fresh render runs.
+        !staleByTag;
       // POST (or other non-GET/HEAD) to a purely prerendered static page → 405.
       // Only applies when the page has no handler AND the request isn't a
       // Server Action / RSC / data-URL request, which legitimately POST to
@@ -4645,6 +4662,11 @@ interface StaticPageEntry {
   // assets — the handler path with IncrementalCache manages the
   // fresh/stale lifecycle.
   initialRevalidate?: number;
+  // Cache tags the prerender was built with (parsed from its
+  // \`x-next-cache-tags\` header). Consulted at request time so that when
+  // a server action calls updateTag/revalidateTag on one of these tags,
+  // the stale static asset is bypassed and the handler runs fresh.
+  cacheTags?: string[];
 }
 
 // Collect paths whose build-time prerender has an ISR revalidate > 0 AND
@@ -4721,6 +4743,21 @@ function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, 
     }
     if (prerender.fallback.initialHeaders) {
       entry.headers = prerender.fallback.initialHeaders;
+    }
+    // Extract cache tags for runtime invalidation checking. When a
+    // server action calls \`updateTag/revalidateTag\`, we flip the
+    // matching tag in \`__CREEK_TAG_INVALIDATED_AT\` — but the prerendered
+    // HTML still sits on disk. Without a runtime tag check here, the
+    // static asset fast-path keeps serving the stale HTML and the
+    // client never sees the invalidation. Store the tag list on the
+    // entry so \`canServeStaticPage\` can intersect it with the
+    // invalidated-tag set and skip the fast-path when any tag has been
+    // revalidated since build.
+    // Fixes app-static "updateTag/revalidateTag should successfully
+    // update tag when called from server action".
+    const cacheTagsHeader = prerender.fallback.initialHeaders?.["x-next-cache-tags"];
+    if (typeof cacheTagsHeader === "string" && cacheTagsHeader.length > 0) {
+      entry.cacheTags = cacheTagsHeader.split(",").map((t) => t.trim()).filter(Boolean);
     }
     // ISR revalidation period: if > 0, the page should NOT be served
     // indefinitely from static assets — after the revalidate window
