@@ -1988,9 +1988,28 @@ const middlewareHandler = async (mwCtx) => {
     });
     let response;
     try {
+      // Pass waitUntil into middleware so \`after()\` callbacks can extend
+      // the request lifetime past the middleware's return. Without this
+      // Next.js's after-context sees no waitUntil, throws the callback
+      // into the synchronous fire-and-forget bucket, and the callback
+      // typically gets cut off before it completes its self-fetch —
+      // which is how \`after() triggers revalidate from middleware\` loses
+      // its revalidation call.
+      // MiddlewareContext from @next/routing only carries url/headers/body
+      // — not the worker's ExecutionContext. Pull our own ctx off the
+      // __INTERNAL_FETCH_CONTEXT store so after() callbacks inside
+      // middleware can extend the worker lifetime via ctx.waitUntil.
+      const mwInvokeCtx = {
+        waitUntil: (p) => {
+          try {
+            const outer = __INTERNAL_FETCH_CONTEXT.getStore()?.ctx;
+            outer?.waitUntil?.(Promise.resolve(p).catch(() => {}));
+          } catch {}
+        },
+      };
       response = await __withEdgeRouteEnv(
         ${JSON.stringify(opts.outputs.middleware.edgeRuntime.entryKey)},
-        () => handler(mwReq, {})
+        () => handler(mwReq, mwInvokeCtx)
       );
     } catch (handlerErr) {
       // Middleware threw. Return a \`bodySent\` result with a synthetic
@@ -2099,7 +2118,17 @@ const middlewareHandler = async (mwCtx) => {
       headers: mwHeaders,
       body: mwBodyBuffer,
     });
-    const response = await handler(mwReq, {});
+    // Same rationale as edge middleware branch: forward waitUntil so
+    // after() callbacks can extend the worker lifetime.
+    const mwInvokeCtx = {
+      waitUntil: (p) => {
+        try {
+          const outer = __INTERNAL_FETCH_CONTEXT.getStore()?.ctx;
+          outer?.waitUntil?.(Promise.resolve(p).catch(() => {}));
+        } catch {}
+      },
+    };
+    const response = await handler(mwReq, mwInvokeCtx);
     const mwResult = responseToMiddlewareResult(response, mwHeaders, mwCtx.url);
     mwResult.__mwResponse = response;
     // See edge variant for rationale: restore flight headers so the page
