@@ -2114,7 +2114,23 @@ function __initManifests() {
           const edgeWorkers = serverActionsManifest.edge?.[id]?.workers;
           const workers = nodeWorkers || edgeWorkers;
           if (!workers) return undefined;
-          const entry = Object.values(workers)[0];
+          // Mirror Next.js manifests-singleton.createServerModuleMap:
+          // in a combined worker, an action's moduleId differs per page
+          // (e.g. getHeader has moduleId 98913 on /header but 47627 on
+          // /header/node/form). Always pick the worker for the CURRENT
+          // page so the module factory that was preloaded by that page's
+          // route entry is the one we dispatch to.
+          const workStore = typeof __nextWorkAsyncStorage?.getStore === "function"
+            ? __nextWorkAsyncStorage.getStore()
+            : undefined;
+          let entry;
+          if (workStore?.page) {
+            const pageKey = workStore.page.startsWith("app")
+              ? workStore.page
+              : "app" + workStore.page;
+            entry = workers[pageKey];
+          }
+          if (!entry) entry = Object.values(workers)[0];
           return entry ? { id: entry.moduleId, name: id, chunks: [], async: entry.async } : undefined;
         }
       }),
