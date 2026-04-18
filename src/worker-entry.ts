@@ -19,6 +19,14 @@ export interface WorkerEntryOptions {
   basePath: string;
   assetPrefix: string;
   i18n: unknown;
+  /**
+   * Subset of \`next.config\` that the worker runtime needs — \`ROUTING\`
+   * doesn't expose these fields directly (trailingSlash is implemented
+   * as regex rules in \`beforeMiddleware\`). Carry them separately so
+   * code that needs the boolean flag can consult it without reverse-
+   * engineering the routing table.
+   */
+  config: { trailingSlash?: boolean };
   /** Embedded manifests: absolute path → file content */
   manifests: Record<string, string>;
   /**
@@ -597,6 +605,10 @@ const ASSET_PREFIX_PATH = (() => {
   return ASSET_PREFIX.startsWith("/") ? ASSET_PREFIX.replace(/\\/$/, "") : "";
 })();
 const ROUTING = ${JSON.stringify(opts.routing)};
+// Subset of next.config that's not encoded into ROUTING. trailingSlash
+// is the only one we currently rely on — needed for data-URL
+// normalization before middleware sees them.
+const CONFIG = ${JSON.stringify(opts.config || {})};
 // Normalize ROUTING: when Next.js emits a redirect rule via \`beforeMiddleware\`
 // it sets \`headers.Location\` + \`status\` in the 3xx range but sometimes
 // omits the \`destination\` field. @next/routing's \`processRoutes\` loop
@@ -2828,6 +2840,47 @@ async function __handleRequest(request, env, ctx) {
         if (!__shouldRunMiddleware(mwCtx.url, mwCtx.headers)) {
           return {};
         }
+        // \`trailingSlash: true\` fixture quirk: @next/routing's
+        // \`normalizeNextDataUrl\` strips \`.json\` from \`/_next/data/<id>/x.json\`
+        // before middleware sees it, producing \`/x\`. But middleware
+        // expects \`/x/\` (tests compare \`url.pathname === '/ssr-page/'\`).
+        // Real Next.js normalizes both at the same point — \`@next/routing\`
+        // doesn't. Post-normalize here only when the URL came from a data
+        // URL to avoid double-slashing static asset / api paths.
+        // Pages Router data-URL normalization for middleware.
+        // Real Next.js server strips \`/_next/data/<buildId>/\` +
+        // \`.json\` from the URL BEFORE middleware sees it, then
+        // appends \`trailingSlash\` suffix when configured. @next/routing
+        // re-denormalizes the URL to its data-URL form before the
+        // \`invokeMiddleware\` call (see \`denormalizeNextDataUrl\`), so
+        // user middleware receives the raw \`/_next/data/...json\`
+        // path — their own \`url.pathname === '/ssr-page/'\` checks then
+        // silently fail. Recompute the normalized pathname here to
+        // match the upstream behavior.
+        // Fixes middleware-trailing-slash \`should trigger middleware
+        // for data requests\`, \`should add a rewrite header on data
+        // requests for rewrites\`, \`should normalize data requests
+        // into page requests\`, \`should have correct query values
+        // for rewrite to ssg page\`.
+        const __mwDataPrefix = (BASE_PATH || "") + "/_next/data/" + BUILD_ID + "/";
+        if (mwCtx.url.pathname.startsWith(__mwDataPrefix)) {
+          let pagePath = mwCtx.url.pathname.slice(__mwDataPrefix.length);
+          if (pagePath.endsWith(".json")) pagePath = pagePath.slice(0, -5);
+          let normPathname =
+            (BASE_PATH || "") + (pagePath.startsWith("/") ? pagePath : "/" + pagePath);
+          if (normPathname === "") normPathname = "/";
+          if (
+            CONFIG.trailingSlash &&
+            normPathname.length > 1 &&
+            !normPathname.endsWith("/") &&
+            !normPathname.includes(".")
+          ) {
+            normPathname += "/";
+          }
+          const fixed = new URL(mwCtx.url.toString());
+          fixed.pathname = normPathname;
+          mwCtx = { ...mwCtx, url: fixed };
+        }
         const mwRes = await middlewareHandler(mwCtx);
         if (mwRes && mwRes.requestHeaders) {
           mwModifiedRequestHeaders = mwRes.requestHeaders;
@@ -2919,9 +2972,18 @@ async function __handleRequest(request, env, ctx) {
       // \`url\`/\`assetPath\` untouched so the later data-response branch
       // still formats as JSON + adds \`x-nextjs-data\`.
       let __routingUrl;
-      if (staticPagesDataRoutePath) {
+      if (staticPagesDataRoutePath && !ROUTING.shouldNormalizeNextData) {
+        // No middleware → \`@next/routing\` skips its own data-URL
+        // normalization, so we pre-rewrite to the page URL ourselves.
         __routingUrl = new URL((BASE_PATH || "") + staticPagesDataRoutePath + (url.search || ""), url.origin);
       } else {
+        // Middleware is present → \`@next/routing\` normalizes the data
+        // URL via \`normalizeNextDataUrl\`, runs \`beforeMiddleware\` +
+        // middleware, then denormalizes so the middleware sees the
+        // correct \`/ssr-page\` (or \`/ssr-page/\` with \`trailingSlash\`)
+        // form. Pass the original data URL through so that pipeline
+        // works — my earlier \`staticPagesDataRoutePath\` pre-rewrite
+        // fought the same machinery.
         __routingUrl = new URL(request.url);
         const dataPrefix = (BASE_PATH || "") + "/_next/data/" + BUILD_ID + "/";
         if (
@@ -2930,8 +2992,25 @@ async function __handleRequest(request, env, ctx) {
         ) {
           let pagePath = assetPath.slice(dataPrefix.length);
           if (pagePath.endsWith(".json")) pagePath = pagePath.slice(0, -5);
-          const newPathname =
+          let newPathname =
             (BASE_PATH || "") + (pagePath.startsWith("/") ? pagePath : "/" + pagePath);
+          // \`trailingSlash: true\` projects expect the normalized URL to
+          // carry the trailing slash so middleware can match on
+          // \`url.pathname === '/ssr-page/'\`. Without this, middleware
+          // rewrites for data-URL requests silently no-op and the
+          // client gets the non-rewritten page payload. Fixes
+          // middleware-trailing-slash "should trigger middleware for
+          // data requests" + "normalize data requests into page
+          // requests" + "add a rewrite header on data requests for
+          // rewrites".
+          if (
+            ROUTING.trailingSlash &&
+            newPathname.length > 1 &&
+            !newPathname.endsWith("/") &&
+            !newPathname.includes(".")
+          ) {
+            newPathname += "/";
+          }
           __routingUrl = new URL(
             newPathname + (url.search || ""),
             url.origin,

@@ -340,6 +340,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     basePath: ctx.config.basePath || "",
     assetPrefix: ctx.config.assetPrefix || "",
     i18n: ctx.config.i18n || null,
+    config: { trailingSlash: !!ctx.config.trailingSlash },
     manifests,
     userFiles,
     prerenderEntries,
