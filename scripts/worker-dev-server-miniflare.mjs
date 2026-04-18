@@ -106,6 +106,39 @@ try {
   }
 } catch {}
 
+// Forward user-facing env vars from the host process into the worker.
+// Tests like middleware-general "allows to access env variables" set
+// arbitrary vars (`MIDDLEWARE_TEST=asdf`, etc.) via the deploy script's
+// environment and expect `process.env.MIDDLEWARE_TEST` to be readable
+// from middleware at request time. workerd's `process.env` is populated
+// from the `bindings` option (plain string-to-string map) when
+// `nodejs_compat` is enabled. Filter out vars that would break the worker
+// or leak host internals — we only pass through what looks like user
+// application env, plus a few Next.js-specific test vars.
+const FORWARD_PREFIXES = ["NEXT_", "NEXT_PUBLIC_", "VERCEL_"];
+const FORWARD_EXACT = new Set([
+  "NODE_ENV",
+]);
+const SKIP_PATTERNS = [
+  /^_/,                      // underscore-prefixed internal
+  /^(PATH|HOME|USER|SHELL|TERM|LANG|LC_|TMPDIR|DYLD_|LD_LIBRARY_)/,
+  /^(NPM_|PNPM_|YARN_|VOLTA_|NVM_)/,
+  /^(GIT_|SSH_|GPG_)/,
+];
+const forwardedBindings = {};
+for (const [k, v] of Object.entries(process.env)) {
+  if (typeof v !== "string") continue;
+  if (SKIP_PATTERNS.some((re) => re.test(k))) continue;
+  // Pass through if it looks like a Next.js / Vercel / app env var, or
+  // if it's a short all-caps identifier that looks like user-set config.
+  const looksLikeUserVar =
+    FORWARD_EXACT.has(k) ||
+    FORWARD_PREFIXES.some((p) => k.startsWith(p)) ||
+    /^[A-Z][A-Z0-9_]{1,40}$/.test(k);
+  if (!looksLikeUserVar) continue;
+  forwardedBindings[k] = v;
+}
+
 const mf = new Miniflare({
   // Worker script — use explicit modules array instead of scriptPath
   // because the bundle contains dynamic import() expressions that
@@ -116,6 +149,11 @@ const mf = new Miniflare({
   // Runtime
   compatibilityDate: "2026-03-23",
   compatibilityFlags: ["nodejs_compat"],
+
+  // Forward host env vars so middleware / route handlers can read
+  // `process.env.MIDDLEWARE_TEST` etc. (nodejs_compat populates
+  // `process.env` from bindings automatically).
+  bindings: forwardedBindings,
 
   // KV namespace for Next.js IncrementalCache (CreekCacheHandler).
   // In production, Creek auto-provisions env.KV per-project. For local
