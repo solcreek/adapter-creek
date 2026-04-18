@@ -2905,9 +2905,39 @@ async function __handleRequest(request, env, ctx) {
       // the original \`url\` reference unchanged; \`invokeNodeHandler\`
       // reconstructs req.url from the original request to preserve
       // the data-URL prefix that Pages Router's render layer looks for.
-      const __routingUrl = staticPagesDataRoutePath
-        ? new URL((BASE_PATH || "") + staticPagesDataRoutePath + (url.search || ""), url.origin)
-        : new URL(request.url);
+      // \`@next/routing\` only strips the \`/_next/data/<buildId>/...json\`
+      // prefix before matching when \`routes.shouldNormalizeNextData\` is
+      // true — upstream only turns that flag on when middleware is present
+      // (build-complete.ts:2184 sets it to \`!!needsMiddlewareResolveRoutes\`).
+      // For apps without middleware, data URLs that hit dynamic pages
+      // (\`/_next/data/BID/blog/post-3.json\` → \`/blog/[post]\`) fall through
+      // routing with no match and we 404 with the HTML not-found page,
+      // which breaks every \`renderViaHTTP\` test in prerender.test.ts that
+      // does \`JSON.parse(await renderViaHTTP(\`/_next/data/...json\`))\`.
+      // Normalize here so \`resolveRoutes\` sees the underlying page URL
+      // and can match against \`ROUTING.dynamicRoutes\`. Keeps the original
+      // \`url\`/\`assetPath\` untouched so the later data-response branch
+      // still formats as JSON + adds \`x-nextjs-data\`.
+      let __routingUrl;
+      if (staticPagesDataRoutePath) {
+        __routingUrl = new URL((BASE_PATH || "") + staticPagesDataRoutePath + (url.search || ""), url.origin);
+      } else {
+        __routingUrl = new URL(request.url);
+        const dataPrefix = (BASE_PATH || "") + "/_next/data/" + BUILD_ID + "/";
+        if (
+          !ROUTING.shouldNormalizeNextData &&
+          assetPath.startsWith(dataPrefix)
+        ) {
+          let pagePath = assetPath.slice(dataPrefix.length);
+          if (pagePath.endsWith(".json")) pagePath = pagePath.slice(0, -5);
+          const newPathname =
+            (BASE_PATH || "") + (pagePath.startsWith("/") ? pagePath : "/" + pagePath);
+          __routingUrl = new URL(
+            newPathname + (url.search || ""),
+            url.origin,
+          );
+        }
+      }
       // @next/routing workaround: its \`replaceDestination\` never exposes
       // NAMED host-regex captures to the destination. A rule like
       //   source: '/:path*',
@@ -3506,6 +3536,18 @@ async function __handleRequest(request, env, ctx) {
             }
           }
         }
+        // Pages Router root-index alias: resolveRoutes turns \`/\` into
+        // \`/index\` (HANDLERS key is \`/index\`) but the prerender entry is
+        // under the literal \`/\`. Without this, POST \`/\` (and any other
+        // non-GET) finds no \`staticAssetPath\` and the 405 check above
+        // can't fire — the handler runs instead and returns 200 HTML.
+        // Fixes prerender.test.ts "should respond with 405 for POST to
+        // static page" and keeps deploy-mode cache-control overrides
+        // reachable for the root route.
+        if (!staticEntry && servePath === "/index" && STATIC_PAGES["/"]) {
+          servePath = "/";
+          staticEntry = STATIC_PAGES["/"];
+        }
       }
       const staticAssetPath = staticEntry?.assetPath;
       // \`_rsc\` query param alone does NOT indicate an RSC request — Next.js
@@ -3643,13 +3685,23 @@ async function __handleRequest(request, env, ctx) {
         // A previous revalidateTag/updateTag marked one of this page's
         // tags stale — fall through to handler so the fresh render runs.
         !staleByTag;
-      // POST (or other non-GET/HEAD) to a purely prerendered static page → 405.
-      // Only applies when the page has no handler AND the request isn't a
-      // Server Action / RSC / data-URL request, which legitimately POST to
-      // prerendered paths.
+      // POST (or other non-GET/HEAD) to a prerendered page → 405.
+      // Covers two cases: (a) no handler at all (pure static page), and
+      // (b) handler is a Pages Router page whose only request-time entry
+      // point is \`getStaticProps\`/\`getServerSideProps\` — neither is
+      // reachable via POST, so the Vercel edge answers 405 without
+      // invoking the handler. API routes (\`PAGES_API\`) and App Router
+      // endpoints (\`APP_PAGE\`, \`APP_ROUTE\`) legitimately accept POST;
+      // Server Action / RSC / Pages-data-URL POSTs also target
+      // prerendered paths and must pass through. Without this check,
+      // POST \`/\` served the prerendered HTML with 200 and failed the
+      // prerender.test.ts "should respond with 405 for POST to static
+      // page" assertion.
+      const handlerIsPagesPage =
+        hasHandler && HANDLERS[resolvedPathname]?.type === "PAGES";
       if (
         staticAssetPath &&
-        !hasHandler &&
+        (!hasHandler || handlerIsPagesPage) &&
         request.method !== "GET" &&
         request.method !== "HEAD" &&
         !request.headers.has("next-action") &&
@@ -3784,6 +3836,17 @@ async function __handleRequest(request, env, ctx) {
                 }
               }
             }
+            // Deploy-mode cache-control: Vercel's edge strips the
+            // \`s-maxage=N, stale-while-revalidate=...\` that Next.js's
+            // prerender entry carries and replaces it with
+            // \`public, max-age=0, must-revalidate\` on the client response
+            // (the CDN absorbs the server-side caching hint internally).
+            // Tests like \`should use correct caching headers for a
+            // revalidate page\` / \`fallback-true (prerendered)\` /
+            // \`fallback-true (lazy)\` branch on \`isDeploy\` and expect this
+            // exact deploy-mode string. Without this override, the raw
+            // Next.js value leaks through and fails the assertion.
+            headers.set("cache-control", "public, max-age=0, must-revalidate");
             if (!headers.has("x-nextjs-cache") && finalStatus === 200) {
               headers.set("x-nextjs-cache", "HIT");
             }
@@ -4050,6 +4113,12 @@ async function __handleRequest(request, env, ctx) {
               if (!headers.has("x-nextjs-deployment-id")) {
                 headers.set("x-nextjs-deployment-id", DEPLOYMENT_ID);
               }
+              // Deploy-mode cache-control for Pages Router \`__N_SSG\` data
+              // URLs — match Vercel's edge behavior (public, max-age=0,
+              // must-revalidate) that the prerender.test.ts fallback-true
+              // cache-header assertions expect. Without this, the ASSETS
+              // binding's default cache-control leaks through.
+              headers.set("cache-control", "public, max-age=0, must-revalidate");
               return new Response(dataAssetRes.body, {
                 status: 200,
                 headers,
@@ -4619,6 +4688,52 @@ async function __handleRequest(request, env, ctx) {
           }
         } catch {}
       }
+      // Deploy-mode cache-control on handler responses. Next.js internally
+      // sets \`s-maxage=<revalidate>, stale-while-revalidate=...\` on ISR
+      // page responses — that's the value a self-hosted \`next start\`
+      // would emit. Vercel's edge strips that server-side hint before
+      // the client sees it and replaces it with
+      // \`public, max-age=0, must-revalidate\`. Match the deploy-mode
+      // behavior for HTML responses from Pages Router pages that carry
+      // a prerender entry with a positive revalidate — tests like
+      // \`should use correct caching headers for a revalidate page\` /
+      // \`fallback-true (prerendered)\` assert the exact deploy string
+      // and would otherwise see the raw \`s-maxage=...\` value leak
+      // through our handler path. The static-asset serve branch above
+      // does the same thing for the prerendered HTML fast-path.
+      try {
+        if (
+          __invokedResponse &&
+          __invokedResponse.status === 200 &&
+          handler?.type === "PAGES"
+        ) {
+          const ct = __invokedResponse.headers.get("content-type") || "";
+          // HTML responses of ISR pages AND every Pages Router data URL
+          // need the deploy-mode cache-control override. Next.js emits
+          // \`s-maxage=<revalidate>, stale-while-revalidate=...\` for
+          // both; Vercel's edge strips that before the client sees it
+          // and replaces with \`public, max-age=0, must-revalidate\`.
+          // Tests like \`should use correct caching headers for ...\`
+          // (HTML and data-URL variants) assert the exact deploy-mode
+          // string on \`isDeploy\` branch.
+          const isIsrHtml =
+            ct.includes("text/html") &&
+            staticEntry?.initialRevalidate != null &&
+            staticEntry.initialRevalidate !== false;
+          const isDataUrlJson =
+            ct.includes("application/json") &&
+            url.pathname.startsWith("/_next/data/");
+          if (isIsrHtml || isDataUrlJson) {
+            const patched = new Headers(__invokedResponse.headers);
+            patched.set("cache-control", "public, max-age=0, must-revalidate");
+            __invokedResponse = new Response(__invokedResponse.body, {
+              status: __invokedResponse.status,
+              statusText: __invokedResponse.statusText,
+              headers: patched,
+            });
+          }
+        }
+      } catch {}
       return __invokedResponse;
     } catch (err) {
       const msg = err instanceof Error ? (err.stack || err.message) : String(err);
