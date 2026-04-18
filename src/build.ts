@@ -489,8 +489,16 @@ async function collectStaticFiles(
 
   for (const prerender of outputs.prerenders) {
     if (prerender.fallback?.filePath) {
+      // Prerender source files: \`.html\` for APP_PAGE / Pages Router,
+      // \`.body\` for APP_ROUTE (opengraph-image, icon, sitemap, etc. — often
+      // binary). Misclassifying a binary \`.body\` as HTML routes it through
+      // \`copyHtmlWithDplId\` which reads as UTF-8 and corrupts PNG/JPEG
+      // bytes into \`0xef 0xbf 0xbd\` replacement chars. Trust the source
+      // extension over the pathname — \`/opengraph-image\` has no dot but
+      // maps to \`opengraph-image.body\`.
+      const isBinary = prerender.fallback.filePath.endsWith(".body");
+      const isHtml = !isBinary && isStaticHtmlPage(prerender.pathname);
       let destRelative = prerender.pathname;
-      const isHtml = isStaticHtmlPage(destRelative);
       if (isHtml) {
         destRelative = destRelative + "/index.html";
       }

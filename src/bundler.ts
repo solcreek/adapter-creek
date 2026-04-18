@@ -559,6 +559,29 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       (_match, filename) => filename.replace(/^"\.\//, '"'),
     );
 
+    // Turbopack's node.js runtime implements top-level-await by assigning
+    // \`module.exports = <Promise>\`. esbuild's \`__toESM\` wraps imports with
+    // \`__create(__getProtoOf(mod))\`, and for a Promise that yields a plain
+    // object whose \`__proto__\` is \`Promise.prototype\`. Awaiting that object
+    // invokes \`Promise.prototype.then\` with a non-Promise receiver — workerd
+    // rejects it as "incompatible receiver" and the route 500s. Detect a
+    // Promise input and return it unchanged so await resolves the real
+    // async-module promise instead. Fixes \`metadata-edge\` and
+    // \`metadata-dynamic-routes-async-deps\` \`opengraph-image\` routes.
+    workerCode = workerCode.replace(
+      /var __toESM = \(mod, isNodeMode, target\) => \(target = mod != null \? __create\(__getProtoOf\(mod\)\) : \{\}, __copyProps\(\s*(?:\/\/[^\n]*\n\s*)*isNodeMode \|\| !mod \|\| !mod\.__esModule \? __defProp\(target, "default", \{ value: mod, enumerable: true \}\) : target,\s*mod\s*\)\);/,
+      `var __toESM = (mod, isNodeMode, target) => {
+  if (mod != null && typeof mod === "object" && typeof mod.then === "function" && __getProtoOf(mod) === Promise.prototype) {
+    return mod;
+  }
+  target = mod != null ? __create(__getProtoOf(mod)) : {};
+  return __copyProps(
+    isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
+    mod
+  );
+};`,
+    );
+
     await fs.writeFile(workerPath, workerCode);
   } catch {}
 
@@ -612,22 +635,22 @@ async function emitWranglerConfig(opts: {
   wasmFilenames: string[];
 }): Promise<void> {
   const { outputDir, assetsRelPath, wasmFilenames } = opts;
-  // Scan the output dir for every \`.wasm\` sibling. Turbopack gives us
-  // one set (hashed \`wasm_<md5>\`); wrangler's own esbuild pass emits a
-  // second set (\`<sha1>-yoga.wasm\`, \`<sha1>-resvg.wasm\`) when the app
-  // imports next/og. Passing only the Turbopack-reported names leaves
-  // the wrangler-emitted siblings unmatched → workerd fails startup
-  // with \`No such module "<sha1>-yoga.wasm"\`. A wildcard glob covers
-  // both sources without having to track who emitted which.
-  const allWasm = new Set(wasmFilenames);
-  try {
-    const entries = await fs.readdir(outputDir);
-    for (const e of entries) {
-      if (e.endsWith(".wasm")) allWasm.add(e);
-    }
-  } catch {}
-  const wasmGlobs = [...allWasm];
-  const wasmRule = wasmGlobs.length
+  // Turbopack + wrangler both emit wasm siblings (hashed \`wasm_<xxh3>\`
+  // from us, \`<sha1>-yoga.wasm\` / \`<sha1>-resvg.wasm\` from wrangler's
+  // own esbuild pass when the app imports next/og). A wildcard glob
+  // covers every sibling regardless of who emitted it. Listing specific
+  // filenames fails because wrangler normalises import paths with a
+  // leading \`./\` that literal-name globs don't match — the built-in
+  // \`**/*.wasm\` rule then fires and aborts the build with
+  // "ignored because a previous rule ... was not marked as fallthrough".
+  let hasWasm = wasmFilenames.length > 0;
+  if (!hasWasm) {
+    try {
+      const entries = await fs.readdir(outputDir);
+      hasWasm = entries.some((e) => e.endsWith(".wasm"));
+    } catch {}
+  }
+  const wasmRule = hasWasm
     ? [
         "",
         "# Declare every wasm sibling as a CompiledWasm module so \`import",
@@ -635,7 +658,7 @@ async function emitWranglerConfig(opts: {
         "# Without this, Turbopack's runtime registry returns undefined and",
         "# throws \"dynamically loading WebAssembly is not supported\".",
         "[[rules]]",
-        `globs = [${wasmGlobs.map((g) => `"${g}"`).join(", ")}]`,
+        `globs = ["**/*.wasm"]`,
         `type = "CompiledWasm"`,
         `fallthrough = false`,
       ].join("\n")
