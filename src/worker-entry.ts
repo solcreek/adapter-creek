@@ -331,63 +331,6 @@ if (typeof WebAssembly !== "undefined" && typeof WebAssembly.instantiate === "fu
   }
 }
 
-// Emulate fast-immediate semantics BEFORE any Next.js code loads. Next.js's
-// \`runInSequentialTasks\` (used by cacheComponents + cachedNavigations to
-// split render into static/dynamic stages) relies on \`setImmediate\`
-// callbacks firing BETWEEN sequential \`setTimeout(0)\` tasks. Next ships
-// \`fast-set-immediate.external\` to enforce this in Node, but it captures
-// the pre-patch global as \`originalSetImmediate\` at module load and falls
-// back to it the moment its own queue drains. In workerd, the native
-// \`setImmediate\` fires AFTER subsequent \`setTimeout(0)\` tasks, so any
-// setImmediate scheduled after React's queue-drain happens too late —
-// cache-component chunks (e.g. \`14:[cached-content]\`) emit in the Dynamic
-// stage instead of Static, pushing the \`l\` byte-length marker smaller
-// and breaking the client's segment-cache. By replacing
-// \`globalThis.setImmediate\` before fast-set-immediate's module body runs,
-// its captured \`originalSetImmediate\` IS our emulation — fall-through
-// callbacks route through \`queueMicrotask → process.nextTick → cb\`,
-// which matches Node's "fires before next setTimeout" ordering.
-if (typeof globalThis.setImmediate === "function" && typeof process !== "undefined" && typeof process.nextTick === "function") {
-  const __nativeSetImmediate = globalThis.setImmediate.bind(globalThis);
-  const __nativeClearImmediate = typeof globalThis.clearImmediate === "function" ? globalThis.clearImmediate.bind(globalThis) : null;
-  const __nativeNextTick = process.nextTick.bind(process);
-  const __emulatedSetImmediate = function(cb, ...args) {
-    let fired = false;
-    // Also schedule on the native queue — we must return a real workerd
-    // Immediate object so any downstream \`clearImmediate(obj)\` call (e.g.
-    // Next.js's cacheSignal cleanup) succeeds. The fast path usually races
-    // the native path and wins; if it doesn't, the native callback runs
-    // the same work.
-    const nativeHandle = __nativeSetImmediate(function () {
-      if (fired) return;
-      fired = true;
-      try {
-        args.length > 0 ? cb.apply(null, args) : cb();
-      } catch (err) {
-        queueMicrotask(() => { throw err; });
-      }
-    });
-    // Fast path: queueMicrotask → nextTick runs the callback BEFORE the
-    // next setTimeout(0) macrotask. This matches Node's fast-set-immediate
-    // "fires before next setTimeout" semantics that
-    // \`runInSequentialTasks\` depends on.
-    queueMicrotask(() => {
-      __nativeNextTick(() => {
-        if (fired) return;
-        fired = true;
-        if (__nativeClearImmediate) __nativeClearImmediate(nativeHandle);
-        try {
-          args.length > 0 ? cb.apply(null, args) : cb();
-        } catch (err) {
-          queueMicrotask(() => { throw err; });
-        }
-      });
-    });
-    return nativeHandle;
-  };
-  globalThis.setImmediate = __emulatedSetImmediate;
-}
-
 // Polyfill process methods and env that Next.js uses.
 if (typeof process !== "undefined") {
   if (!process.env) process.env = {};
