@@ -3844,6 +3844,7 @@ async function __handleRequest(request, env, ctx) {
               headers.set("content-type", "text/x-component");
               headers.set("Vary", "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch");
               headers.set("x-nextjs-prerender", "1");
+              headers.set("x-nextjs-deployment-id", DEPLOYMENT_ID);
               if (staticEntry?.cacheTags) {
                 headers.set("x-next-cache-tags", String(staticEntry.cacheTags));
               }
@@ -3871,6 +3872,7 @@ async function __handleRequest(request, env, ctx) {
                 headers.set("x-nextjs-stale-time", String(staleTime));
               }
               headers.set("x-nextjs-prerender", "1");
+              headers.set("x-nextjs-deployment-id", DEPLOYMENT_ID);
               if (staticEntry?.cacheTags) {
                 headers.set("x-next-cache-tags", String(staticEntry.cacheTags));
               }
@@ -4797,6 +4799,16 @@ async function __handleRequest(request, env, ctx) {
           // Tests like \`should use correct caching headers for ...\`
           // (HTML and data-URL variants) assert the exact deploy-mode
           // string on \`isDeploy\` branch.
+          // Only override cache-control when Next.js emitted an
+          // \`s-maxage=\`-style header (SSG / ISR pattern). getServerSideProps
+          // responses natively come back as
+          // \`private, no-cache, no-store, max-age=0, must-revalidate\` —
+          // Vercel's edge leaves those untouched, so rewriting them to
+          // \`public, ...\` leaks uncacheable SSR data through shared caches
+          // and breaks the \`should set default caching header\` assertion
+          // in \`test/e2e/getserversideprops\`.
+          const origCacheControl = __invokedResponse.headers.get("cache-control") || "";
+          const hasSMaxAge = /\\bs-maxage=/i.test(origCacheControl);
           const isIsrHtml =
             ct.includes("text/html") &&
             staticEntry?.initialRevalidate != null &&
@@ -4804,7 +4816,7 @@ async function __handleRequest(request, env, ctx) {
           const isDataUrlJson =
             ct.includes("application/json") &&
             url.pathname.startsWith("/_next/data/");
-          if (isIsrHtml || isDataUrlJson) {
+          if (hasSMaxAge && (isIsrHtml || isDataUrlJson)) {
             const patched = new Headers(__invokedResponse.headers);
             patched.set("cache-control", "public, max-age=0, must-revalidate");
             __invokedResponse = new Response(__invokedResponse.body, {
@@ -4840,11 +4852,21 @@ async function __handleRequest(request, env, ctx) {
   // happy (its \`isNextDeploy\` branch asserts the header is truthy).
   try {
     const url = new URL(request.url);
+    const isDataUrl =
+      url.pathname.startsWith("/_next/data/") ||
+      (BASE_PATH && url.pathname.startsWith(BASE_PATH + "/_next/data/"));
+    // App Router RSC responses also need x-nextjs-deployment-id for the
+    // deployment-skew header assertion (segment-cache/deployment-skew) —
+    // the client's skew check hits every \`text/x-component\` payload, not
+    // just Pages Router data URLs.
+    const isRscResponse =
+      response &&
+      typeof response.headers?.get === "function" &&
+      (response.headers.get("content-type") || "").includes("text/x-component");
     if (
       response &&
       typeof response.headers?.has === "function" &&
-      (url.pathname.startsWith("/_next/data/") ||
-        (BASE_PATH && url.pathname.startsWith(BASE_PATH + "/_next/data/"))) &&
+      (isDataUrl || isRscResponse) &&
       !response.headers.has("x-nextjs-deployment-id")
     ) {
       const headers = new Headers(response.headers);
