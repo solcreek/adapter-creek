@@ -2685,7 +2685,20 @@ async function __handleRequest(request, env, ctx) {
       if (assetPath.startsWith("/_next/data/")) {
         const dataMatch = assetPath.match(/^\\/_next\\/data\\/([^/]+)\\/(.+)\\.json$/);
         if (dataMatch && dataMatch[1] === BUILD_ID) {
-          const candidate = "/" + dataMatch[2].replace(/\\/index$/, "");
+          // Root-index collapses: dataMatch[2] === "index" is the data URL for
+          // \`pages/index.js\` (\`/_next/data/<buildId>/index.json\`), which maps
+          // to "/". Subpath "/index" stripping still applies for entries like
+          // \`/foo/index.json\` → "/foo". Without collapsing exact "index", we
+          // returned \`/index\` and routed to \`pages/[id].js\` with id="index"
+          // instead of \`pages/index.js\`, producing \`params: {id: "index"}\`
+          // where the spec (and Vercel) return \`params: null\` — fails
+          // edge-pages-support "should respond to _next/data for index
+          // correctly".
+          const rawSegment = dataMatch[2];
+          const candidate =
+            rawSegment === "index"
+              ? "/"
+              : "/" + rawSegment.replace(/\\/index$/, "");
           const lookup = candidate === "/" ? "/index" : candidate;
           const handler = HANDLERS[lookup] || HANDLERS[candidate];
           if (handler && handler.type === "APP_PAGE") {
