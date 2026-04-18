@@ -87,6 +87,17 @@ export interface WorkerEntryOptions {
    * going through workerd's broken external loader.
    */
   externalModules?: string[];
+  /**
+   * Absolute path to the user's \`.next/server/instrumentation.js\` when the
+   * project actually provides one (not our \`module.exports = {}\` placeholder).
+   * We static-import it from the worker entry so wrangler bundles the full
+   * module graph, then hand it to Next.js's \`getInstrumentationModule\`
+   * lookup — otherwise the dynamic \`__require\` falls back to undefined on
+   * workerd and \`instrumentation.register()\` is never called.
+   * Fixes e2e/opentelemetry/client-trace-metadata (5 tests) and any other
+   * test that depends on user instrumentation side effects.
+   */
+  userInstrumentationPath?: string;
 }
 
 interface HandlerEntry {
@@ -207,6 +218,14 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
           `globalThis.__CREEK_EXT_LOADERS[${JSON.stringify(spec)}] = () => import(${JSON.stringify(spec)});`
         )
         .join("\n");
+
+  // User-provided \`instrumentation.ts\`. Static-import so wrangler bundles
+  // the whole OTel graph, then publish on \`globalThis.__CREEK_INSTRUMENTATION\`
+  // so our patched \`getInstrumentationModule\` lookup picks it up at runtime.
+  const userInstrumentationImport = opts.userInstrumentationPath
+    ? `import * as __userInstrumentation from ${JSON.stringify(opts.userInstrumentationPath)};\n` +
+      `globalThis.__CREEK_INSTRUMENTATION = __userInstrumentation && (__userInstrumentation.default && (__userInstrumentation.default.register || __userInstrumentation.default.onRequestError) ? __userInstrumentation.default : __userInstrumentation);`
+    : "";
 
   // Path to ALS polyfill — must be the FIRST import so it runs
   // before any Turbopack edge module evaluates.
@@ -342,6 +361,11 @@ ${wasmImports}
 // pointing at these paths) so our patched externalImport can serve them
 // without going through workerd's external loader.
 ${externalModuleImports}
+
+// Statically bundle the user's \`instrumentation.ts\` (when present) and
+// expose it on globalThis so our patched \`getInstrumentationModule\` can
+// return it without hitting workerd's dynamic-require restriction.
+${userInstrumentationImport}
 
 // Edge runtime chunks must be imported so their module factories are present
 // before runtimeModuleIds are evaluated for middleware or edge pages/routes.

@@ -458,6 +458,20 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       'err.code !== "ENOENT" && err.code !== "MODULE_NOT_FOUND" && err.code !== "ERR_MODULE_NOT_FOUND" && !err.message?.includes("is not supported")',
     );
 
+    // Next.js's \`getInstrumentationModule\` does
+    // \`await __require(path.join(projectDir, distDir, "server",
+    // \`\${INSTRUMENTATION_HOOK_FILENAME}.js\`))\`. workerd can't resolve
+    // dynamic-require paths — the call rejects, the catch above swallows it,
+    // and \`instrumentation.register()\` is never invoked. Worker-entry
+    // static-imports the user file onto \`globalThis.__CREEK_INSTRUMENTATION\`
+    // when present, so prefer that over \`__require\` here. Falls through
+    // to the original call when no user instrumentation is registered so
+    // the \`module.exports = {}\` placeholder path still works.
+    workerCode = workerCode.replace(
+      /(cachedInstrumentationModule\s*=\s*\(0,\s*_interopdefault\.interopDefault\)\s*\()\s*await __require\(/g,
+      "$1globalThis.__CREEK_INSTRUMENTATION || await __require(",
+    );
+
     workerCode = patchBundledManifestSingleton(workerCode);
 
     // depd (via raw-body) uses `eval("(function ("+args+") {...})")` to build a

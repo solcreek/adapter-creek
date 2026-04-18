@@ -178,9 +178,23 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // this at runtime, and CF Workers throws a generic error for dynamic require
   // of missing modules. The error code doesn't match ENOENT/MODULE_NOT_FOUND
   // that Next.js expects, causing an unhandled rejection.
+  //
+  // We also track whether the file represents a REAL user instrumentation
+  // (not our no-op) so the worker entry can statically import it and invoke
+  // \`register()\` at startup. Next.js's \`getInstrumentationModule\` uses
+  // \`__require\` with a dynamic path — workerd rejects that with
+  // "Dynamic require ... is not supported", the registration promise resolves
+  // undefined, and no user instrumentation ever runs. Side effects like
+  // \`experimental.clientTraceMetadata\` meta-tag injection silently disappear.
+  // Static-importing here gets the user module into the bundle and gives us
+  // a concrete handle to hand back to Next.js at runtime.
   const instrumentationPath = path.join(ctx.distDir, "server", "instrumentation.js");
+  let userInstrumentationPath: string | undefined;
   try {
-    await fs.access(instrumentationPath);
+    const existing = await fs.readFile(instrumentationPath, "utf-8");
+    if (existing.trim().length > 0 && !/^\s*module\.exports\s*=\s*\{\s*\}\s*;?\s*$/.test(existing)) {
+      userInstrumentationPath = instrumentationPath;
+    }
   } catch {
     await fs.writeFile(instrumentationPath, "module.exports = {};");
   }
@@ -337,6 +351,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     edgeRegistrationChunkPath,
     edgeRuntimeModuleIds,
     edgeOtherChunkPaths,
+    userInstrumentationPath,
   });
 
   // Step 4: Bundle with esbuild
