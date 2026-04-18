@@ -18,6 +18,15 @@
         "app-dir action handling should not error when a forwarded action triggers a redirect (edge)"
       ],
       "_note": "Multi-worker forwarding — relies on deploying the same app to two different workers (one with the action handler, one without) so the request-receiving worker can forward a serialized Next-Action to the handler worker over a separate fetch. Creek deploys each app as a single worker; the fixture's two /delayed-action/(node|edge) routes collapse into the same isolate and the 'forwarded' request never carries a valid Next-Action body. Skipping rather than red-herring debugging a model we don't support."
+    },
+    "test/e2e/app-dir/actions/app-action-node-middleware.test.ts": {
+      "failed": [
+        "app-dir action handling should forward action request to a worker that contains the action handler (node)",
+        "app-dir action handling should forward action request to a worker that contains the action handler (edge)",
+        "app-dir action handling should not error when a forwarded action triggers a redirect (node)",
+        "app-dir action handling should not error when a forwarded action triggers a redirect (edge)"
+      ],
+      "_note": "This file is just `require('./app-action.test')` with TEST_NODE_MIDDLEWARE=true — it re-runs the entire app-action suite under a different file path, so the same multi-worker tests re-fail here. Mirror the exclusions."
     }
   },
   "rules": {
