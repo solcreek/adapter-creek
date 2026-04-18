@@ -3668,26 +3668,7 @@ async function __handleRequest(request, env, ctx) {
           // Pattern from nextjs/adapter-bun \`segmentData\` handling:
           // src/runtime/incremental-cache-handler.ts:247-276.
           const segmentHeader = request.headers.get("next-router-segment-prefetch");
-          // Skip segment shortcut when the request may be an interception
-          // candidate. Next.js emits two parallel segment trees for the same
-          // pathname when an intercepted sibling exists:
-          //
-          //   <path>.segments/...          — non-intercepted (catch-all etc.)
-          //   (.)<path>.segments/...       — intercepted layout
-          //
-          // The segment-prefetch header carries the target URL's segment, not
-          // the intercepted variant, so serving \`<path>.segments/\` here
-          // returns the NON-intercepted flight payload (e.g. "catch-all"
-          // instead of "Intercepted test-nested sidebar"). Client router
-          // caches that payload and the actual navigation renders the wrong
-          // modal. Fall through to full RSC — the router resolves
-          // interception using \`next-url\` and generates the correct tree.
-          // Fixes interception-dynamic-segment > Default.tsx injection
-          // validation (6 tests) + related parallel-route-interception
-          // suites that regressed on 221c0b5.
-          const nextUrlHeader = request.headers.get("next-url");
-          const mayIntercept = !!(nextUrlHeader && nextUrlHeader !== url.pathname);
-          if (segmentHeader && typeof segmentHeader === "string" && !mayIntercept) {
+          if (segmentHeader && typeof segmentHeader === "string") {
             const decoded = (() => {
               try { return decodeURIComponent(segmentHeader); } catch { return segmentHeader; }
             })();
