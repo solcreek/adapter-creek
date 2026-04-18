@@ -4804,32 +4804,45 @@ async function __handleRequest(request, env, ctx) {
           handler?.type === "PAGES"
         ) {
           const ct = __invokedResponse.headers.get("content-type") || "";
-          // HTML responses of ISR pages AND every Pages Router data URL
-          // need the deploy-mode cache-control override. Next.js emits
-          // \`s-maxage=<revalidate>, stale-while-revalidate=...\` for
-          // both; Vercel's edge strips that before the client sees it
-          // and replaces with \`public, max-age=0, must-revalidate\`.
-          // Tests like \`should use correct caching headers for ...\`
-          // (HTML and data-URL variants) assert the exact deploy-mode
-          // string on \`isDeploy\` branch.
-          // Only override cache-control when Next.js emitted an
-          // \`s-maxage=\`-style header (SSG / ISR pattern). getServerSideProps
-          // responses natively come back as
-          // \`private, no-cache, no-store, max-age=0, must-revalidate\` —
-          // Vercel's edge leaves those untouched, so rewriting them to
-          // \`public, ...\` leaks uncacheable SSR data through shared caches
-          // and breaks the \`should set default caching header\` assertion
-          // in \`test/e2e/getserversideprops\`.
-          const origCacheControl = __invokedResponse.headers.get("cache-control") || "";
-          const hasSMaxAge = /\\bs-maxage=/i.test(origCacheControl);
+          // Deploy-mode cache-control for ISR / SSG outputs: Vercel's edge
+          // strips Next.js's server-side \`s-maxage=<N>, stale-while-
+          // revalidate=...\` and also the stock \`private, no-cache, no-store\`
+          // that falls out of a fresh fallback-true render, and replaces
+          // both with \`public, max-age=0, must-revalidate\` for any page
+          // that the framework considers cacheable. Tests like \`should use
+          // correct caching headers for a revalidate page\`,
+          // \`fallback-true (prerendered)\`, and \`fallback-true (lazy)\`
+          // branch on \`isDeploy\` and assert that exact string, so the raw
+          // Next.js header must not leak through.
+          //
+          // The discriminator is the PAGE shape, not the emitted header:
+          //   - \`isIsrHtml\`: Pages Router HTML whose STATIC_PAGES entry
+          //     declares \`initialRevalidate\` (covers revalidate pages and
+          //     both fallback-true branches — the lazy branch returns the
+          //     default \`private, no-cache\` and still needs overriding).
+          //   - \`isDataUrlJson\`: \`/_next/data/<buildId>/...\` response for a
+          //     pathname that has a STATIC_PAGES entry (SSG/ISR), so we
+          //     rewrite to the deploy-mode string. \`getServerSideProps\`
+          //     data URLs DON'T have a STATIC_PAGES entry and must keep
+          //     their native \`private, no-cache, no-store, ...\` — the
+          //     \`test/e2e/getserversideprops\` "should set default caching
+          //     header" / "should respect custom caching header" tests
+          //     regress if we rewrite those.
           const isIsrHtml =
             ct.includes("text/html") &&
             staticEntry?.initialRevalidate != null &&
             staticEntry.initialRevalidate !== false;
+          const hasStaticEntryForPath = (() => {
+            if (!url.pathname.startsWith("/_next/data/")) return false;
+            // \`staticEntry\` for the request itself is set above based on the
+            // resolved pathname. If it exists, this is an SSG/ISR data URL.
+            return !!staticEntry;
+          })();
           const isDataUrlJson =
             ct.includes("application/json") &&
-            url.pathname.startsWith("/_next/data/");
-          if (hasSMaxAge && (isIsrHtml || isDataUrlJson)) {
+            url.pathname.startsWith("/_next/data/") &&
+            hasStaticEntryForPath;
+          if (isIsrHtml || isDataUrlJson) {
             const patched = new Headers(__invokedResponse.headers);
             patched.set("cache-control", "public, max-age=0, must-revalidate");
             __invokedResponse = new Response(__invokedResponse.body, {
