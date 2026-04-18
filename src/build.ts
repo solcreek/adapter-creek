@@ -74,6 +74,37 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     }
   }
 
+  // Scan \`output.assets\` for \`.wasm\` files too. Next.js's adapter API
+  // puts Turbopack-known wasm in \`wasmAssets\` (above), but libraries
+  // like \`@vercel/og\`'s node-runtime variant load \`resvg.wasm\` /
+  // \`yoga.wasm\` via \`fs.readFileSync\` — those files show up in
+  // \`output.assets\` only (file-tracing result). workerd rejects
+  // \`WebAssembly.instantiate(bytes)\` — we need the bytes precompiled
+  // into a \`WebAssembly.Module\` at bundle time. Feed these wasms
+  // through the same CompiledWasm pipeline so the runtime instantiate
+  // override can swap bytes → pre-compiled Module by length.
+  // Fixes next/og node-runtime path (og-api \`/og-node\`,
+  // use-cache-metadata-route-handler opengraph/icon tests).
+  for (const outputs of [
+    ctx.outputs.appPages,
+    ctx.outputs.appRoutes,
+    ctx.outputs.pages,
+    ctx.outputs.pagesApi,
+  ]) {
+    for (const output of outputs) {
+      const assets = (output as { assets?: Record<string, string> }).assets;
+      if (!assets) continue;
+      for (const [outPath, srcPath] of Object.entries(assets)) {
+        if (!outPath.endsWith(".wasm")) continue;
+        // Use basename as the wasm \`name\` so collisions across sources
+        // don't produce colliding destination files. The
+        // xxh3-content-hashing step below key by content anyway.
+        const name = path.basename(outPath);
+        if (!wasmFiles.has(name)) wasmFiles.set(name, srcPath);
+      }
+    }
+  }
+
   // Step 3: Collect manifests from .next/ for embedding in the worker.
   // Next.js route modules call loadManifest() which uses fs.readFileSync().
   // CF Workers doesn't have fs, so we embed all manifests and shim the loader.
@@ -86,6 +117,11 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // the wasm (as CompiledWasm via wrangler rules) and mirror it onto
   // globalThis under the expected name.
   const wasmHashToFilename = new Map<string, string>();
+  // Byte length → bundled wasm filename. Used at runtime by the
+  // \`WebAssembly.instantiate\` patch to swap byte-based calls
+  // (which workerd rejects as "Wasm code generation disallowed")
+  // for the pre-compiled CompiledWasm module wrangler bundled.
+  const wasmLengthToFilename = new Map<number, string>();
   try {
     const { xxh3 } = await import("@node-rs/xxhash");
     for (const [name, absPath] of wasmFiles) {
@@ -93,8 +129,9 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
         const bytes = await fs.readFile(absPath);
         const hex = xxh3.xxh128(bytes).toString(16).padStart(32, "0");
         const destName = name.endsWith(".wasm") ? name : name + ".wasm";
-        console.log(`    wasm: name=${name} dest=${destName} xxh3=${hex}`);
+        console.log(`    wasm: name=${name} dest=${destName} xxh3=${hex} bytes=${bytes.byteLength}`);
         wasmHashToFilename.set(hex, destName);
+        wasmLengthToFilename.set(bytes.byteLength, destName);
       } catch {}
     }
     if (wasmHashToFilename.size > 0) {
@@ -277,6 +314,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     prerenderEntries,
     composableCacheSeedsByShell: composableCacheSeedEntries,
     wasmHashToFilename: Array.from(wasmHashToFilename.entries()),
+    wasmLengthToFilename: Array.from(wasmLengthToFilename.entries()),
     externalModules: await collectExternalizedModules(ctx.distDir),
     turbopackRuntimePath,
     edgeRegistrationChunkPath,

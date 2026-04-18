@@ -70,6 +70,13 @@ export interface WorkerEntryOptions {
    */
   wasmHashToFilename?: Array<[string, string]>;
   /**
+   * [byteLength, wasm_filename] pairs. Registered in
+   * \`globalThis.__CREEK_WASM_BY_LENGTH\` so the runtime
+   * \`WebAssembly.instantiate\` patch can swap byte-based calls for the
+   * pre-compiled Module workerd already has in memory.
+   */
+  wasmLengthToFilename?: Array<[number, string]>;
+  /**
    * Module specifiers that Turbopack marked as externals but that the
    * user's code references at runtime via dynamic import. Wrangler's
    * \`externalImport(id)\` runtime helper calls \`await import(id)\` which
@@ -142,11 +149,26 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
 
   // Mirror each \`.wasm\` CompiledWasm export onto globalThis under the
   // \`wasm_<xxh3_128_hex>\` name Turbopack's loadEdgeWasm expects.
+  // Also register by byte length so the runtime \`WebAssembly.instantiate\`
+  // patch can swap byte-based instantiation (forbidden on workerd) for
+  // the pre-compiled Module.
+  const hashToLength = new Map<string, number>();
+  for (const [len, fn] of opts.wasmLengthToFilename ?? []) {
+    for (const [hex, fn2] of opts.wasmHashToFilename ?? []) {
+      if (fn === fn2) hashToLength.set(hex, len);
+    }
+  }
   const wasmImports = (opts.wasmHashToFilename ?? [])
-    .map(([hex, filename], i) =>
-      `import __wasm_${i} from ${JSON.stringify("./" + filename)};\n` +
-      `globalThis[${JSON.stringify("wasm_" + hex)}] = __wasm_${i};`
-    )
+    .map(([hex, filename], i) => {
+      const len = hashToLength.get(hex);
+      return (
+        `import __wasm_${i} from ${JSON.stringify("./" + filename)};\n` +
+        `globalThis[${JSON.stringify("wasm_" + hex)}] = __wasm_${i};\n` +
+        (len !== undefined
+          ? `(globalThis.__CREEK_WASM_BY_LENGTH ||= {})[${JSON.stringify(String(len))}] = __wasm_${i};\n`
+          : "")
+      );
+    })
     .join("\n");
 
   // Register lazy loaders for Turbopack-externalized modules. Static
@@ -218,6 +240,50 @@ if (typeof globalThis.Request === "function") {
   Object.setPrototypeOf(__PatchedRequest, __OrigRequest);
   Object.defineProperty(__PatchedRequest, "name", { value: "Request" });
   globalThis.Request = __PatchedRequest;
+}
+
+// Patch \`WebAssembly.instantiate\` so libraries that do
+// \`WebAssembly.instantiate(fs.readFileSync("X.wasm"))\` at module load
+// (e.g. \`@vercel/og\` node-runtime loading resvg/yoga wasm) can run on
+// workerd, which otherwise rejects byte-based instantiation with
+// "Wasm code generation disallowed by embedder". At build time we
+// bundle each \`.wasm\` as a CompiledWasm module and register by byte
+// length in \`__CREEK_WASM_BY_LENGTH\`. When \`instantiate(bytes)\` runs,
+// we substitute the pre-compiled Module.
+if (typeof WebAssembly !== "undefined" && typeof WebAssembly.instantiate === "function") {
+  const __origInstantiate = WebAssembly.instantiate.bind(WebAssembly);
+  const __origCompile = typeof WebAssembly.compile === "function" ? WebAssembly.compile.bind(WebAssembly) : null;
+  const __findPrecompiled = (input) => {
+    if (!input) return null;
+    const reg = globalThis.__CREEK_WASM_BY_LENGTH;
+    if (!reg) return null;
+    let len = 0;
+    if (input instanceof ArrayBuffer) len = input.byteLength;
+    else if (ArrayBuffer.isView(input)) len = input.byteLength;
+    else return null;
+    return reg[String(len)] || null;
+  };
+  WebAssembly.instantiate = async function(modOrBytes, imports) {
+    if (!(modOrBytes instanceof WebAssembly.Module)) {
+      const precompiled = __findPrecompiled(modOrBytes);
+      if (globalThis.__CREEK_WASM_DEBUG) {
+        const inLen = modOrBytes instanceof ArrayBuffer ? modOrBytes.byteLength : (ArrayBuffer.isView(modOrBytes) ? modOrBytes.byteLength : -1);
+        console.log("[creek-wasm] instantiate called bytes=" + inLen + " precompiled=" + !!precompiled + " registryKeys=" + JSON.stringify(Object.keys(globalThis.__CREEK_WASM_BY_LENGTH || {})));
+      }
+      if (precompiled) {
+        const instance = await __origInstantiate(precompiled, imports);
+        return { module: precompiled, instance };
+      }
+    }
+    return __origInstantiate(modOrBytes, imports);
+  };
+  if (__origCompile) {
+    WebAssembly.compile = async function(bytes) {
+      const precompiled = __findPrecompiled(bytes);
+      if (precompiled) return precompiled;
+      return __origCompile(bytes);
+    };
+  }
 }
 
 // Polyfill process methods and env that Next.js uses.

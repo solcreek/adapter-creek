@@ -363,6 +363,12 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       "node:vm": path.join(adapterDir, "src", "shims", "vm.js"),
       // critters is bundled by Next.js for CSS inlining — not needed on Workers.
       "critters": path.join(adapterDir, "src", "shims", "critters.js"),
+      // sharp has native .node bindings that workerd can't load. Without this
+      // alias, wrangler pulls in ~1MB of sharp's JS wrapper and the module
+      // ends up non-callable at runtime — \`@vercel/og\`'s node path then
+      // throws \`sharp is not a function\`. Aliasing to a shim whose default
+      // is undefined makes \`@vercel/og\` fall back to its resvg.wasm path.
+      "sharp": path.join(adapterDir, "src", "shims", "sharp.js"),
       // NOTE: load-manifest and fast-set-immediate shims exist in src/shims/
       // but are handled by the fs shim (manifest loading) and nodejs_compat
       // (setImmediate) respectively, so no alias needed.
