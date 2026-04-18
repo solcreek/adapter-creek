@@ -2557,6 +2557,25 @@ function __filterInternalRequestHeaders(req) {
 }
 
 async function __handleRequest(request, env, ctx) {
+  // Wrap every fetch in a per-request module-loading signal context.
+  // The track-module-loading shim's \`__CREEK_WITH_MODULE_LOADING_CONTEXT\`
+  // runs \`fn\` under an AsyncLocalStorage scope where \`getModuleLoadingSignal\`
+  // returns a fresh \`CacheSignal\` bound to this request's IoContext — so
+  // the \`setImmediate\` closure CacheSignal keeps on
+  // \`pendingTimeoutCleanup\` never leaks to a later request. Without this,
+  // second-and-later requests to routes that dynamic-import at render time
+  // (e.g. \`ImageResponse\`) 500 with "Cannot perform I/O on behalf of a
+  // different request" when clearImmediate hits the prior Immediate. The
+  // shim-global fallback guards module-init or any path that beats the
+  // alias target into the bundle.
+  const __withLoadCtx = globalThis.__CREEK_WITH_MODULE_LOADING_CONTEXT;
+  if (typeof __withLoadCtx === "function") {
+    return __withLoadCtx(() => __handleRequestInner(request, env, ctx));
+  }
+  return __handleRequestInner(request, env, ctx);
+}
+
+async function __handleRequestInner(request, env, ctx) {
   // Strip Next.js internal headers (e.g. \`x-middleware-set-cookie\`)
   // from the incoming external request — see __INTERNAL_NEXT_HEADERS
   // comment for why.

@@ -369,6 +369,28 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       // throws \`sharp is not a function\`. Aliasing to a shim whose default
       // is undefined makes \`@vercel/og\` fall back to its resvg.wasm path.
       "sharp": path.join(adapterDir, "src", "shims", "sharp.js"),
+      // Replace Next's track-module-loading.{instance,external} with a
+      // per-request AsyncLocalStorage version. The original keeps a
+      // module-level CacheSignal whose internal setImmediate closure
+      // leaks IoContext across requests on workerd — second-and-later
+      // requests throw "Cannot perform I/O on behalf of a different
+      // request" when CacheSignal.pendingTimeoutCleanup fires
+      // clearImmediate on an Immediate from the first request. Repros
+      // on any route that does dynamic imports during render (notably
+      // \`new ImageResponse(...)\` — every \`@vercel/og\` call triggers
+      // trackPendingImport). We alias \`.external\` as well because
+      // call sites import from that module (the internal relative
+      // \`./track-module-loading.instance\` import never passes through
+      // esbuild's bare-specifier alias map). See
+      // src/shims/track-module-loading.js.
+      "next/dist/server/app-render/module-loading/track-module-loading.external":
+        path.join(adapterDir, "src", "shims", "track-module-loading.js"),
+      "next/dist/server/app-render/module-loading/track-module-loading.external.js":
+        path.join(adapterDir, "src", "shims", "track-module-loading.js"),
+      "next/dist/server/app-render/module-loading/track-module-loading.instance":
+        path.join(adapterDir, "src", "shims", "track-module-loading.js"),
+      "next/dist/server/app-render/module-loading/track-module-loading.instance.js":
+        path.join(adapterDir, "src", "shims", "track-module-loading.js"),
       // NOTE: load-manifest and fast-set-immediate shims exist in src/shims/
       // but are handled by the fs shim (manifest loading) and nodejs_compat
       // (setImmediate) respectively, so no alias needed.
