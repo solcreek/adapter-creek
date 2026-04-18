@@ -1,6 +1,30 @@
 {
-  "//": "Tests excluded from the Next.js adapter test suite for adapter-creek.",
-  "//": "Each entry is a test file path relative to the Next.js repo root.",
-  "//": "Tests are excluded because of CF Workers runtime limitations.",
-  "skipped": []
+  "version": 2,
+  "_comment": [
+    "Adapter-creek deploy-test exclusions. Merged at runtime with Next.js's",
+    "canonical test/deploy-tests-manifest.json via",
+    "NEXT_EXTERNAL_TESTS_FILTERS in .github/workflows/test-e2e-deploy.yml.",
+    "Exclusions here are only for tests that fundamentally do not apply to",
+    "the Cloudflare Workers (workerd) deployment model — native addons,",
+    "multi-worker forwarding, or other Node-only assumptions. Regressions",
+    "and flakey tests are NOT listed here."
+  ],
+  "suites": {
+    "test/e2e/app-dir/actions/app-action.test.ts": {
+      "failed": [
+        "app-dir action handling should forward action request to a worker that contains the action handler (node)",
+        "app-dir action handling should forward action request to a worker that contains the action handler (edge)",
+        "app-dir action handling should not error when a forwarded action triggers a redirect (node)",
+        "app-dir action handling should not error when a forwarded action triggers a redirect (edge)"
+      ],
+      "_note": "Multi-worker forwarding — relies on deploying the same app to two different workers (one with the action handler, one without) so the request-receiving worker can forward a serialized Next-Action to the handler worker over a separate fetch. Creek deploys each app as a single worker; the fixture's two /delayed-action/(node|edge) routes collapse into the same isolate and the 'forwarded' request never carries a valid Next-Action body. Skipping rather than red-herring debugging a model we don't support."
+    }
+  },
+  "rules": {
+    "include": [],
+    "exclude": [
+      "test/e2e/prerender-native-module.test.ts"
+    ],
+    "_exclude_note": "prerender-native-module loads a native .node addon via require() in getStaticProps. workerd cannot load native addons at all — there is no shim we can write. The 3 tests in this file all fail at build time with 'Custom deploy script failed: undefined (1)' before a single request is served."
+  }
 }

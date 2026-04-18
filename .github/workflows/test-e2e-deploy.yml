@@ -107,7 +107,13 @@ jobs:
         env:
           NEXT_TEST_MODE: deploy
           NEXT_E2E_TEST_TIMEOUT: 240000
-          NEXT_EXTERNAL_TESTS_FILTERS: test/deploy-tests-manifest.json
+          # Comma-separated — first entry is Next.js's canonical baseline of
+          # failing/flakey tests across all adapters; second is our
+          # adapter-specific exclusions (inapplicable tests only — native
+          # addons, multi-worker forwarding, etc.). \`get-test-filter.js\`
+          # merges \`suites.*.failed\`, \`rules.include\`, and \`rules.exclude\`
+          # across all manifests.
+          NEXT_EXTERNAL_TESTS_FILTERS: test/deploy-tests-manifest.json,${{ github.workspace }}/adapter/test/deploy-tests-manifest.adapter-creek.json
           ADAPTER_DIR: ${{ github.workspace }}/adapter
           ADAPTER_TARBALL: ${{ github.workspace }}/solcreek-adapter-creek-0.1.0.tgz
           IS_TURBOPACK_TEST: 1
