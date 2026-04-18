@@ -717,8 +717,16 @@ async function collectManifests(distDir: string): Promise<Record<string, string>
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
-        // Skip large directories that don't contain manifests
-        if (entry.name === "static" || entry.name === "cache" || entry.name === "chunks") continue;
+        // Skip large top-level directories that don't contain manifests.
+        // Match on full relative path, not just name: a user route like
+        // \`app/static/[slug]\` is a legitimate app directory whose
+        // \`page_client-reference-manifest.js\` must be collected so the
+        // Flight renderer can resolve its client components at request time
+        // — skipping by basename alone drops those manifests and surfaces
+        // as "Could not find the module ... in the React Client Manifest"
+        // on middleware rewrites into that route.
+        const rel = path.relative(distDir, fullPath);
+        if (rel === "static" || rel === "cache" || rel === "server/chunks" || rel === "server/edge-chunks") continue;
         await walk(fullPath);
       } else if (entry.name === "BUILD_ID" || entry.name === "package.json") {
         manifests[fullPath] = await fs.readFile(fullPath, "utf-8").catch(() => "");
