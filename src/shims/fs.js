@@ -53,6 +53,19 @@ function findInUserFiles(filePath) {
     //   req  = "/app/data.json"  (page used a project-relative path)
     if (key.endsWith("/" + requestedTail) || key === requestedTail) return files[key];
   }
+  // Last-resort: match on basename for bundled sibling assets whose
+  // request path is derived from `fileURLToPath(new URL('./X', import.meta.url))`
+  // and ends up with a chunk-relative path that shares nothing with the
+  // embedded `node_modules/...` key except the filename. Only applies to
+  // binary assets (wasm / fonts / images) so text data files with common
+  // names like `config.json` don't collide across unrelated directories.
+  // Fixes next/og node-runtime `fs.readFileSync` of bundled wasm/ttf.
+  const reqBase = filePath.split("/").pop() || "";
+  if (/\.(wasm|ttf|otf|woff2?)$/i.test(reqBase)) {
+    for (const key in files) {
+      if (key.split("/").pop() === reqBase) return files[key];
+    }
+  }
   return undefined;
 }
 

@@ -474,6 +474,49 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       "return function(){log.call(deprecate,message,site);return fn.apply(this,arguments)}}",
     );
 
+    // Route \`externalImport(id)\` through \`globalThis.__CREEK_EXT_MODS\` so
+    // we can serve bundled-but-externalized-by-Turbopack modules from
+    // our worker-entry static imports. Turbopack emits chunks like
+    // \`[externals]_next_dist_compiled_@vercel_og_index_node_...\` that do
+    // \`await e.y("next/dist/compiled/@vercel/og/index.node.js")\`; on
+    // workerd that \`await import(id)\` path throws "No such module" and
+    // the handler 500s. When our entry registers the module in
+    // \`__CREEK_EXT_MODS\`, the patched \`externalImport\` returns it
+    // directly without going through workerd's external loader.
+    // Fixes og-api \`/og-node\` (node runtime) +
+    // use-cache-metadata-route-handler opengraph/icon tests.
+    workerCode = workerCode.replace(
+      /async function externalImport\((\w+)\)\s*\{\s*let\s+raw;\s*try\s*\{\s*raw\s*=\s*await import\(\1\);/g,
+      (match, idVar) =>
+        `async function externalImport(${idVar}) {\n` +
+        `      let raw;\n` +
+        `      { const __loaders = globalThis.__CREEK_EXT_LOADERS; if (__loaders && __loaders[${idVar}]) {\n` +
+        `        const __cached = globalThis.__CREEK_EXT_MODS = globalThis.__CREEK_EXT_MODS || {};\n` +
+        `        if (${idVar} in __cached) { raw = __cached[${idVar}]; }\n` +
+        `        else { try { raw = await __loaders[${idVar}](); __cached[${idVar}] = raw; } catch (err) { throw new Error(\`Failed to load external module \${${idVar}}: \${err}\`); } }\n` +
+        `        if (raw && raw.__esModule && raw.default && "default" in raw.default) { return interopEsm(raw.default, createNS(raw), true); }\n` +
+        `        return raw;\n` +
+        `      } }\n` +
+        `      try {\n` +
+        `        raw = await import(${idVar});`,
+    );
+
+    // \`@vercel/og/index.node.js\` evaluates at module load:
+    //
+    //   var fontData = fs.readFileSync(fileURLToPath(new URL("./Geist-Regular.ttf", import.meta.url)));
+    //   var resvg_wasm = fs.readFileSync(fileURLToPath(new URL("./resvg.wasm", import.meta.url)));
+    //
+    // workerd rejects \`new URL("./X", import.meta.url)\` with
+    // "Invalid URL string" in the bundled-worker context, so evaluation
+    // aborts before any request hits the route. Rewrite these two calls
+    // to pass literal paths into fs.readFileSync directly — our fs shim
+    // has a basename fallback for .wasm/.ttf, so the embedded bundled
+    // bytes resolve regardless of path.
+    workerCode = workerCode.replace(
+      /fileURLToPath\(new URL\(("\.\/[^"]+\.(?:wasm|ttf|otf|woff2?|png|jpg|jpeg|gif|webp|svg|ico)")\s*,\s*import\.meta\.url\)\)/g,
+      (_match, filename) => filename.replace(/^"\.\//, '"'),
+    );
+
     await fs.writeFile(workerPath, workerCode);
   } catch {}
 

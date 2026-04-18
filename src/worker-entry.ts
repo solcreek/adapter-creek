@@ -69,6 +69,17 @@ export interface WorkerEntryOptions {
    * assign onto globalThis before edge modules evaluate.
    */
   wasmHashToFilename?: Array<[string, string]>;
+  /**
+   * Module specifiers that Turbopack marked as externals but that the
+   * user's code references at runtime via dynamic import. Wrangler's
+   * \`externalImport(id)\` runtime helper calls \`await import(id)\` which
+   * workerd refuses — the worker would 500 with "No such module".
+   * Eagerly \`import\` each specifier from the worker entry so wrangler
+   * bundles them, and register them in \`globalThis.__CREEK_EXT_MODS\` so
+   * our patched \`externalImport\` returns the cached module without
+   * going through workerd's broken external loader.
+   */
+  externalModules?: string[];
 }
 
 interface HandlerEntry {
@@ -137,6 +148,26 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
       `globalThis[${JSON.stringify("wasm_" + hex)}] = __wasm_${i};`
     )
     .join("\n");
+
+  // Register lazy loaders for Turbopack-externalized modules. Static
+  // \`import * as X from "..."\` wouldn't work: the imports hoist to the
+  // top of the module and run BEFORE \`globalThis.__USER_FILES\` is set
+  // — but \`@vercel/og/index.node.js\` reads \`Geist-Regular.ttf\` and
+  // \`resvg.wasm\` via \`fs.readFileSync\` at module evaluation. With
+  // __USER_FILES still undefined, our fs shim throws ENOENT and worker
+  // init aborts. Emit loader functions (arrow functions containing a
+  // dynamic \`import(...)\` with a literal string — wrangler statically
+  // follows these and bundles the target) and register them in
+  // \`__CREEK_EXT_LOADERS\`. Our patched externalImport awaits the loader
+  // on first call, at which point all runtime globals are ready.
+  const externalModuleImports = (opts.externalModules ?? []).length === 0
+    ? ""
+    : "globalThis.__CREEK_EXT_LOADERS = globalThis.__CREEK_EXT_LOADERS || {};\n" +
+      (opts.externalModules ?? [])
+        .map((spec: string) =>
+          `globalThis.__CREEK_EXT_LOADERS[${JSON.stringify(spec)}] = () => import(${JSON.stringify(spec)});`
+        )
+        .join("\n");
 
   // Path to ALS polyfill — must be the FIRST import so it runs
   // before any Turbopack edge module evaluates.
@@ -223,6 +254,11 @@ ${manifestImports}
 // Register each WebAssembly.Module under \`wasm_<xxh3_128_hex>\` globals
 // Turbopack's edge wasm loader expects. Must precede edge chunk imports.
 ${wasmImports}
+
+// Bundle externalized modules (Turbopack emitted externalImport chunks
+// pointing at these paths) so our patched externalImport can serve them
+// without going through workerd's external loader.
+${externalModuleImports}
 
 // Edge runtime chunks must be imported so their module factories are present
 // before runtimeModuleIds are evaluated for middleware or edge pages/routes.

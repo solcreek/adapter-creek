@@ -277,6 +277,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     prerenderEntries,
     composableCacheSeedsByShell: composableCacheSeedEntries,
     wasmHashToFilename: Array.from(wasmHashToFilename.entries()),
+    externalModules: await collectExternalizedModules(ctx.distDir),
     turbopackRuntimePath,
     edgeRegistrationChunkPath,
     edgeRuntimeModuleIds,
@@ -678,19 +679,25 @@ async function collectUserFiles(
   for (const output of allOutputs) {
     const assets = (output as { assets?: Record<string, string> }).assets;
     if (!assets) continue;
-
     for (const [fileOutputPath, sourceFile] of Object.entries(assets)) {
       // Skip already-collected (different outputs may share the same asset)
       if (files[fileOutputPath]) continue;
-
-      // Skip dependencies — esbuild already bundles JS deps; we only need
-      // user-side data files that get read at runtime via fs.
-      if (fileOutputPath.includes("node_modules/")) continue;
 
       const ext = path.extname(fileOutputPath).toLowerCase();
       const isText = TEXT_EXTENSIONS.has(ext);
       const isBinary = BINARY_EXTENSIONS.has(ext);
       if (!isText && !isBinary) continue;
+
+      // Skip JS/TS dependencies from node_modules — esbuild already bundles
+      // those. But keep BINARY assets even when they live in node_modules:
+      // \`next/og\` (node runtime) reads \`@vercel/og/resvg.wasm\` +
+      // \`Geist-Regular.ttf\` via \`fs.readFileSync(fileURLToPath(...))\` at
+      // request time — those bytes have to be available through our fs
+      // shim or the route handler 500s. Same for other libs that ship
+      // fonts/wasm as sibling assets.
+      // Fixes og-api node-runtime (\`/og-node\`) and
+      // use-cache-metadata-route-handler opengraph/icon image tests.
+      if (fileOutputPath.includes("node_modules/") && !isBinary) continue;
 
       try {
         if (isText) {
@@ -846,6 +853,38 @@ async function collectComposableCacheSeeds(
     } catch {}
   }
   return byShell;
+}
+
+/**
+ * Scan built Turbopack chunks for the \`await e.y("<specifier>")\`
+ * externalImport calls Turbopack emits for modules it can't bundle
+ * (Node-specific libs like \`@vercel/og/index.node.js\`). workerd refuses
+ * to resolve those at runtime, so we collect the specifiers and
+ * statically \`import\` them from our worker entry instead — wrangler
+ * then bundles them, and our patched externalImport returns the cached
+ * module from \`globalThis.__CREEK_EXT_MODS\`.
+ */
+async function collectExternalizedModules(distDir: string): Promise<string[]> {
+  const found = new Set<string>();
+  const scanDir = async (dir: string) => {
+    try {
+      const entries = await fs.readdir(dir, { withFileTypes: true });
+      for (const e of entries) {
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) await scanDir(full);
+        else if (e.name.startsWith("[externals]") && e.name.endsWith(".js")) {
+          try {
+            const content = await fs.readFile(full, "utf-8");
+            const m = content.match(/e\.y\("([^"]+)"\)/);
+            if (m) found.add(m[1]);
+          } catch {}
+        }
+      }
+    } catch {}
+  };
+  await scanDir(path.join(distDir, "server", "chunks"));
+  await scanDir(path.join(distDir, "server", "edge", "chunks"));
+  return Array.from(found);
 }
 
 function formatSize(bytes: number): string {
