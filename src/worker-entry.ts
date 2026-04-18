@@ -154,6 +154,7 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
       },
     )
     .join("\n");
+  const handlerStaticImports = "";
 
   // Boot manifests must run before edge runtime modules evaluate.
   // Edge app wrappers read globals like __RSC_MANIFEST and
@@ -378,6 +379,7 @@ ${userInstrumentationImport}
 // Edge runtime chunks must be imported so their module factories are present
 // before runtimeModuleIds are evaluated for middleware or edge pages/routes.
 ${edgeOtherChunkImports}
+${handlerStaticImports}
 
 ${opts.outputs.middleware?.edgeRuntime ? `
 // Import edge middleware runtime.

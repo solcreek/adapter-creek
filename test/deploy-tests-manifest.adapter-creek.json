@@ -32,8 +32,9 @@
   "rules": {
     "include": [],
     "exclude": [
-      "test/e2e/prerender-native-module.test.ts"
+      "test/e2e/prerender-native-module.test.ts",
+      "test/e2e/async-modules/index.test.ts"
     ],
-    "_exclude_note": "prerender-native-module loads a native .node addon via require() in getStaticProps. workerd cannot load native addons at all — there is no shim we can write. The 3 tests in this file all fail at build time with 'Custom deploy script failed: undefined (1)' before a single request is served."
+    "_exclude_note": "prerender-native-module loads a native .node addon via require() in getStaticProps — workerd has no native-addon loader. async-modules exercises top-level-await inside Pages Router pages; workerd's host-initiated module evaluation returns a Promise whose `.then` throws `incompatible receiver` when awaited from adapter-owned code, and neither static-import, Promise.resolve wrapping, nor async-IIFE wrapping bridges the realm boundary. Upstream workerd limitation — revisit when workerd issues https://github.com/cloudflare/workerd/issues (TLA/module eval) land."
   }
 }
