@@ -3763,10 +3763,38 @@ async function __handleRequest(request, env, ctx) {
           }
         }
       }
+      // \`res.revalidate(path)\` in a Pages Router API route sends a HEAD
+      // to the target path with \`x-prerender-revalidate: <previewModeId>\`.
+      // For that path to run \`getStaticProps\` with
+      // \`revalidateReason: 'on-demand'\` (what
+      // \`test/e2e/revalidate-reason\` asserts), the HEAD must reach the
+      // handler — serving the static prerender would skip
+      // getStaticProps entirely and the subsequent GET would still see
+      // the build-time snapshot.
+      const isPrerenderRevalidate = request.headers.has("x-prerender-revalidate");
+      // After a successful on-demand revalidation, subsequent GETs need
+      // to pick up the fresh getStaticProps output (stored in
+      // IncrementalCache) instead of the build-time static HTML. We track
+      // revalidated paths in \`__CREEK_PATH_REVALIDATED_AT\` and bypass
+      // the static-serve fast-path while the flag is set.
+      const staleByOnDemand = (() => {
+        const mem = globalThis.__CREEK_PATH_REVALIDATED_AT;
+        if (!mem || !hasHandler) return false;
+        const candidateKeys = [
+          resolvedPathname,
+          url.pathname,
+          servePath,
+        ];
+        for (const k of candidateKeys) {
+          if (k && mem.has(k)) return true;
+        }
+        return false;
+      })();
       const canServeStaticPage =
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
         !isAppRouterRSCRequest &&
+        !isPrerenderRevalidate &&
         // Data URL requests must return JSON, not the prerendered HTML.
         // Pages Router's fetchNextData calls .json() on the body —
         // serving HTML breaks soft navigation and skew detection.
@@ -3778,7 +3806,8 @@ async function __handleRequest(request, env, ctx) {
         !(isISRPage && hasHandler) &&
         // A previous revalidateTag/updateTag marked one of this page's
         // tags stale — fall through to handler so the fresh render runs.
-        !staleByTag;
+        !staleByTag &&
+        !staleByOnDemand;
       // POST (or other non-GET/HEAD) to a prerendered page → 405.
       // Covers two cases: (a) no handler at all (pure static page), and
       // (b) handler is a Pages Router page whose only request-time entry
@@ -4850,6 +4879,30 @@ async function __handleRequest(request, env, ctx) {
               statusText: __invokedResponse.statusText,
               headers: patched,
             });
+          }
+        }
+      } catch {}
+      // When a HEAD with \`x-prerender-revalidate\` succeeds, mark the path
+      // so subsequent GETs bypass the static fast-path and re-run the
+      // handler (which now serves the fresh on-demand result from
+      // IncrementalCache). Without this, \`res.revalidate('/')\` runs
+      // getStaticProps with \`revalidateReason: 'on-demand'\` but the next
+      // GET / still returns the build-time HTML — fails
+      // \`test/e2e/revalidate-reason\` "on-demand".
+      try {
+        if (
+          isPrerenderRevalidate &&
+          __invokedResponse &&
+          __invokedResponse.status >= 200 &&
+          __invokedResponse.status < 300
+        ) {
+          if (!globalThis.__CREEK_PATH_REVALIDATED_AT) {
+            globalThis.__CREEK_PATH_REVALIDATED_AT = new Map();
+          }
+          const now = Date.now();
+          const keys = [resolvedPathname, url.pathname, servePath].filter(Boolean);
+          for (const k of keys) {
+            globalThis.__CREEK_PATH_REVALIDATED_AT.set(k, now);
           }
         }
       } catch {}
