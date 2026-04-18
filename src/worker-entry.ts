@@ -143,8 +143,25 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
     .map((p, i) => `import * as __bootManifest${i} from ${JSON.stringify(p)};\nvoid __bootManifest${i};`)
     .join("\n");
 
+  // Edge chunks self-register by calling \`globalThis.TURBOPACK.push(...)\` at
+  // evaluation time, so their module bodies have side effects that esbuild
+  // preserves. Node-side SSR chunks under \`.next/server/chunks/\` use CJS
+  // \`module.exports = [id, factory, id, factory, ...]\` and have no side
+  // effects — esbuild was pruning them even though we imported them, leaving
+  // module factories like the server-actions registry unregistered. This
+  // surfaced as \`Module N was instantiated because it was required from
+  // module M, but the module factory is not available\` whenever an edge
+  // route tried to invoke a server action.
+  //
+  // Reading \`.default\` forces the import to survive tree-shaking, and when
+  // it's the CJS array shape we forge a TURBOPACK push so the edge runtime's
+  // registry picks up every factory — same mechanism edge chunks already use.
   const edgeOtherChunkImports = (opts.edgeOtherChunkPaths || [])
-    .map((p: string, i: number) => `import * as __edgeChunk${i} from ${JSON.stringify(p)};\nvoid __edgeChunk${i};`)
+    .map((p: string, i: number) =>
+      `import * as __edgeChunk${i} from ${JSON.stringify(p)};\n` +
+      `if (__edgeChunk${i} && Array.isArray(__edgeChunk${i}.default)) (globalThis.TURBOPACK ||= []).push([${JSON.stringify("__creek_cjs_" + i)}, ...__edgeChunk${i}.default]);\n` +
+      `else void __edgeChunk${i};`,
+    )
     .join("\n");
 
   // Mirror each \`.wasm\` CompiledWasm export onto globalThis under the

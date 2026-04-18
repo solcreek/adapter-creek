@@ -224,7 +224,8 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
             if (chunkPaths) {
               for (const raw of chunkPaths) {
                 const rel = raw.replace(/"/g, "");
-                const absPath = path.join(ctx.distDir, "server", "edge", rel);
+                const absPath = await resolveEdgeOtherChunkPath(ctx.distDir, rel);
+                if (!absPath) continue;
                 await addEdgeChunkImportPath(edgeOtherChunkPaths, absPath);
                 console.log(`  [Creek Adapter] Edge otherChunk: ${path.basename(absPath)}`);
               }
@@ -266,12 +267,10 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
           if (chunksMatch) {
             const chunkPaths = chunksMatch[1].match(/"([^"]+)"/g);
             if (chunkPaths) {
-              const edgeRootDir = path.join(ctx.distDir, "server", "edge");
               for (const raw of chunkPaths) {
                 const rel = raw.replace(/"/g, "");
-                // Turbopack edge wrapper otherChunks are emitted relative to
-                // .next/server/edge/, e.g. "chunks/ssr/<file>.js".
-                const absPath = path.join(edgeRootDir, rel);
+                const absPath = await resolveEdgeOtherChunkPath(ctx.distDir, rel);
+                if (!absPath) continue;
                 await addEdgeChunkImportPath(edgeOtherChunkPaths, absPath);
               }
             }
@@ -287,6 +286,24 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   try {
     const edgeChunksDir = path.join(ctx.distDir, "server", "edge", "chunks");
     const chunkPaths = await collectJsFilesRecursive(edgeChunksDir);
+    for (const chunkPath of chunkPaths) {
+      await addEdgeChunkImportPath(edgeOtherChunkPaths, chunkPath);
+    }
+  } catch {}
+
+  // Also preload node-side SSR chunks. Turbopack emits the server actions
+  // registry (module 3103 on a representative build — the one that maps
+  // action hex → handler fn) into \`.next/server/chunks/ssr/\` regardless
+  // of runtime, but edge-wrappers don't list those paths in their
+  // \`otherChunks\`. Without this, edge routes that invoke a server action
+  // throw \`Module N was instantiated because it was required from module M,
+  // but the module factory is not available\` at request time. Factory
+  // registration is side-effect free (just pushes onto globalThis.TURBOPACK),
+  // so preloading is safe — any Node-only factory body only runs if
+  // someone actually requires that specific module.
+  try {
+    const nodeChunksDir = path.join(ctx.distDir, "server", "chunks");
+    const chunkPaths = await collectJsFilesRecursive(nodeChunksDir);
     for (const chunkPath of chunkPaths) {
       await addEdgeChunkImportPath(edgeOtherChunkPaths, chunkPath);
     }
@@ -574,6 +591,44 @@ async function addEdgeChunkImportPath(paths: string[], absPath: string): Promise
   if (!paths.includes(importPath)) {
     paths.push(importPath);
   }
+}
+
+/**
+ * Resolve a chunk reference from a Turbopack edge-wrapper's \`otherChunks\`
+ * list. Turbopack emits heterogeneous path forms within the same list:
+ *   - absolute paths: \`/abs/path/.next/server/chunks/foo.js\`
+ *   - edge-relative:  \`chunks/ssr/foo.js\`      → \`{distDir}/server/edge/{rel}\`
+ *   - dist-relative:  \`server/chunks/foo.js\`   → \`{distDir}/{rel}\`
+ *
+ * The third form is the one that broke Server Actions — Turbopack emits
+ * the server-actions registry chunk (module 3103) into
+ * \`.next/server/chunks/ssr/\` but edge-wrappers reference it via
+ * \`server/chunks/...\`. Before this fix, all three forms were blindly joined
+ * to \`{distDir}/server/edge\`, producing non-existent paths for forms 1 + 3.
+ * The chunk was never imported, its module factories never registered, and
+ * any request that invoked a server action threw
+ * \`Module 3103 was instantiated ... but the module factory is not available\`.
+ *
+ * Returns null if no candidate exists on disk.
+ */
+async function resolveEdgeOtherChunkPath(
+  distDir: string,
+  rel: string,
+): Promise<string | null> {
+  const candidates: string[] = [];
+  if (path.isAbsolute(rel)) {
+    candidates.push(rel);
+  } else {
+    candidates.push(path.join(distDir, "server", "edge", rel));
+    candidates.push(path.join(distDir, rel));
+  }
+  for (const cand of candidates) {
+    try {
+      await fs.access(cand);
+      return cand;
+    } catch {}
+  }
+  return null;
 }
 
 async function getSafeEdgeImportPath(absPath: string): Promise<string> {
