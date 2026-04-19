@@ -3677,6 +3677,42 @@ async function __handleRequestInner(request, env, ctx) {
           servePath = "/";
           staticEntry = STATIC_PAGES["/"];
         }
+        // Config rewrites whose destination is a prerendered dynamic page
+        // (in STATIC_PAGES but only bracket-form in PATHNAMES) are dropped
+        // by resolveRoutes — it surfaces no resolvedPathname/invocationTarget
+        // and we'd otherwise 404. Re-apply the rewrite lists manually here
+        // so the downstream static-serve branch can find the prerendered
+        // HTML for the rewrite target.
+        // Fixes prerender.test.ts "should allow rewriting to SSG page
+        // with fallback: false" (\`/about\` → \`/lang/en/about\`) and the
+        // blocking-fallback variant.
+        if (!staticEntry && !HANDLERS[servePath] && ROUTING) {
+          for (const list of [ROUTING.beforeFiles || [], ROUTING.afterFiles || []]) {
+            for (const rule of list) {
+              if (!rule?.sourceRegex || !rule?.destination) continue;
+              let re;
+              try { re = new RegExp(rule.sourceRegex, "i"); } catch { continue; }
+              const m = servePath.match(re);
+              if (!m) continue;
+              let dest = rule.destination;
+              for (let i = 1; i < m.length; i++) {
+                if (m[i] !== undefined) dest = dest.replace(new RegExp("\\\\$" + i, "g"), m[i]);
+              }
+              if (m.groups) {
+                for (const [k, v] of Object.entries(m.groups)) {
+                  if (v !== undefined) dest = dest.replace(new RegExp("\\\\$" + k, "g"), v);
+                }
+              }
+              const destPath = dest.split("?")[0];
+              if (STATIC_PAGES[destPath]) {
+                servePath = destPath;
+                staticEntry = STATIC_PAGES[destPath];
+                break;
+              }
+            }
+            if (staticEntry) break;
+          }
+        }
       }
       const staticAssetPath = staticEntry?.assetPath;
       // \`_rsc\` query param alone does NOT indicate an RSC request — Next.js
