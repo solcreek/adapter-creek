@@ -578,6 +578,37 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       (_match, filename) => filename.replace(/^"\.\//, '"'),
     );
 
+    // Strip `AsyncLocalStorage.snapshot()` bindings in Next's
+    // `server/app-render/async-local-storage.js` and its Turbopack-inlined
+    // variants. On workerd, `ALS.snapshot()` captures the CURRENT IoContext
+    // and invoking the returned function from a later request throws
+    // "Cannot perform I/O on behalf of a different request". Next uses
+    // `createSnapshot()` / `runInCleanSnapshot: ALS.snapshot()` for cache-
+    // invalidation + edge-action callback propagation — both paths cross
+    // request boundaries on workerd. Replace the snapshot binding with a
+    // direct passthrough, matching @opennextjs/cloudflare's `patchUseCacheIO`
+    // (their comment: "TODO: Find a better fix for this issue.").
+    //
+    // Four forms exist post-bundling:
+    //   1. `function createSnapshot() { if (X) return X.snapshot(); return function(fn,...args){...}; }`
+    //      — clean esm form from next/dist/esm (one copy embedded by wrangler).
+    //   2. `function <name>() { return X ? X.snapshot() : function(a,...b){ return a(...b); }; }`
+    //      — Turbopack's minified module-level shim (edge-side copies).
+    //   3. `a.s(["bindSnapshot", 0, q, "createSnapshot", 0, function(){ return p ? p.snapshot() : ...; }])`
+    //      — Turbopack's export-binding form in the same shim.
+    //   4. `runInCleanSnapshot: X ? X.snapshot() : function(a,...b){ return a(...b); }`
+    //      — inlined call-site in the bundled work-store constructor.
+    // A single regex `(\w+) ? \1.snapshot() : ` stripped from the minified
+    // forms covers 2/3/4; form 1 uses an if-guard so handle it separately.
+    workerCode = workerCode.replace(
+      /if\s*\(\s*(\w+)\s*\)\s*\{\s*return\s+\1\.snapshot\(\);\s*\}/g,
+      "// Ignored snapshot",
+    );
+    workerCode = workerCode.replace(
+      /(\w+)\s*\?\s*\1\.snapshot\(\)\s*:\s*/g,
+      "",
+    );
+
     // Turbopack's node.js runtime implements top-level-await by assigning
     // \`module.exports = <Promise>\`. esbuild's \`__toESM\` wraps imports with
     // \`__create(__getProtoOf(mod))\`, and for a Promise that yields a plain
