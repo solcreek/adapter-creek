@@ -11,6 +11,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
+import { createRequire } from "node:module";
 
 export interface BundleOptions {
   workerSource: string;
@@ -405,12 +406,23 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   // Bundle with wrangler --dry-run
   // Wrangler internally uses esbuild but with Turbopack-aware resolution
   // and proper CJS/ESM interop for CF Workers.
-  // Ensure @next/routing is resolvable from the project directory.
-  // It's a dependency of the adapter, not the user's project.
-  // Symlink it into the project's node_modules if missing.
+  // Ensure @next/routing is resolvable from the project directory. It's a
+  // dependency of the adapter, not the user's project, so wrangler can't
+  // find it when run from the project's cwd. Resolve via \`createRequire\`
+  // rather than guessing \`adapterDir/node_modules/@next/routing\` — pnpm's
+  // virtual-store layout means that path often doesn't exist (the real
+  // install lives under \`node_modules/.pnpm/@next+routing@X/\`), and the
+  // guess only works for the link-protocol install of the adapter.
   const projectNodeModules = path.join(path.dirname(opts.distDir), "node_modules");
   const routingDest = path.join(projectNodeModules, "@next", "routing");
-  const routingSrc = path.join(adapterDir, "node_modules", "@next", "routing");
+  const adapterRequire = createRequire(path.join(adapterDir, "package.json"));
+  let routingSrc: string;
+  try {
+    routingSrc = path.dirname(adapterRequire.resolve("@next/routing/package.json"));
+  } catch {
+    // Fallback to the legacy guess so a classic link-install still works.
+    routingSrc = path.join(adapterDir, "node_modules", "@next", "routing");
+  }
   try {
     await fs.access(routingDest);
   } catch {
