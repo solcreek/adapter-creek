@@ -6129,6 +6129,26 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     if (ctLower.includes("text/html")) {
       h.delete("content-length");
     }
+    // Disable auto-compression for streaming RSC / Server-Action responses.
+    // When content-type is text/x-component (Flight payload) the body is a
+    // React-RSC stream that must reach the browser chunk-by-chunk; Miniflare's
+    // HTTP layer otherwise buffers the whole response to apply gzip based on
+    // the client's Accept-Encoding, which collapses a 5s streamed action into
+    // a single at-EOF delivery and breaks any client-side \`response.body\`
+    // reader that drives progressive UI (e.g. actions-streaming's
+    // /readable-stream test where <h3> never renders because setChunks()
+    // doesn't fire until after the test's 5s waitForSelector times out).
+    // \`Content-Encoding: identity\` is the HTTP-spec way to opt out of
+    // encoding and takes precedence over \`encodeBody: "manual"\` in the
+    // dev-server HTTP proxy. Leave compression enabled for other content
+    // types so HTML / JSON / assets still gzip normally.
+    if (
+      !responseDisallowsBody &&
+      !h.has("content-encoding") &&
+      (ctLower.includes("text/x-component") || ctLower.includes("text/event-stream"))
+    ) {
+      h.set("content-encoding", "identity");
+    }
     const body = responseDisallowsBody ? null : readable;
     const init = {
       status,
