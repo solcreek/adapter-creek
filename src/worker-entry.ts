@@ -5331,28 +5331,16 @@ function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, 
     // PPR/postponed prerenders need the route handler so the shell can
     // stream and later resolve its dynamic segments. Serving their fallback
     // HTML directly from assets leaves the client stuck on the loading shell.
-    //
-    // Under \`cacheComponents: true\` / \`experimentalPPR: true\`, every route
-    // carries \`pprChain.headers\` regardless of whether it actually has
-    // dynamic segments to resume. Narrow the skip to \`postponedState\` alone
-    // so fully-static PPR pages (no \`<Suspense>\`) can serve their prerendered
-    // HTML directly — otherwise the handler re-renders at request time and
-    // \`getSentinelValue()\` reads \`NEXT_PHASE\` as unset ("at runtime") instead
-    // of the baked-in "at buildtime". Fixes cache-components.server-action
-    // "should prerender pages with inline server actions".
-    //
-    // Restrict the widening to the .html entry (HTML fallback) — the sibling
-    // \`*.rsc\` prerender entry still goes through the handler. The segment
-    // cache uses the Flight response to decide whether a prefetched entry
-    // is fully-static; serving the \`.rsc\` as a static asset bypasses the
-    // per-request Flight headers that the client needs for cache decisions,
-    // which cascades into segment-cache regressions (basic,
-    // max-prefetch-inlining, prefetch-scheduling, refresh, etc.).
+    // Only gate on \`postponedState\` — \`pprChain.headers\` is set on every
+    // route under \`cacheComponents: true\` / \`experimentalPPR: true\` whether
+    // or not the route actually has dynamic segments to resume. Fully-static
+    // routes under PPR (e.g. layout + client component, no \`<Suspense>\`)
+    // have \`postponedState\` unset, and their prerendered HTML is the final
+    // response — serve it directly so the build-time sentinel isn't
+    // clobbered by a fresh runtime render (fixes cache-components.server-
+    // action "should prerender pages with inline server actions" which
+    // expected \`at buildtime\` and received \`at runtime\`).
     if (prerender.fallback.postponedState) continue;
-    const isRscEntry = prerender.pathname.endsWith(".rsc");
-    const pprShellHeaders = (prerender as unknown as { pprChain?: { headers?: unknown } })
-      .pprChain?.headers;
-    if (pprShellHeaders && isRscEntry) continue;
 
     const assetPath = __isStaticPagePathname(prerender.pathname)
       ? path.join(prerender.pathname, "index.html")
