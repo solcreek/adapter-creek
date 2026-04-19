@@ -415,7 +415,14 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     await fs.access(routingDest);
   } catch {
     await fs.mkdir(path.join(projectNodeModules, "@next"), { recursive: true });
-    await fs.symlink(routingSrc, routingDest, "junction");
+    try {
+      await fs.symlink(routingSrc, routingDest, "junction");
+    } catch (err: unknown) {
+      // Racy repeat runs (same project dir rebuilt back-to-back) can leave a
+      // dangling symlink that \`access\` reports as missing while \`symlink\`
+      // still refuses to overwrite.
+      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
+    }
   }
 
   const bundleDir = path.join(opts.outputDir, "__bundle");
