@@ -2112,25 +2112,41 @@ function __initManifests() {
           // Fixes temporary-references edge variant + other edge SA tests.
           const nodeWorkers = serverActionsManifest.node?.[id]?.workers;
           const edgeWorkers = serverActionsManifest.edge?.[id]?.workers;
-          const workers = nodeWorkers || edgeWorkers;
-          if (!workers) return undefined;
+          if (!nodeWorkers && !edgeWorkers) return undefined;
           // Mirror Next.js manifests-singleton.createServerModuleMap:
           // in a combined worker, an action's moduleId differs per page
           // (e.g. getHeader has moduleId 98913 on /header but 47627 on
           // /header/node/form). Always pick the worker for the CURRENT
           // page so the module factory that was preloaded by that page's
           // route entry is the one we dispatch to.
+          //
+          // Merge node + edge workers for the per-page lookup: when a
+          // page lives in the edge runtime its worker entry is only
+          // present under \`edge\`, and picking \`nodeWorkers\` first +
+          // falling back to \`Object.values()[0]\` would dispatch to the
+          // nodejs-chunk copy instead — that copy carries the nodejs
+          // build-time bindings (e.g. \`pathPrefix = '/nodejs'\` when the
+          // fixture reads \`process.env.NEXT_RUNTIME\` at module scope),
+          // so the action ends up referencing the wrong page. Fixes
+          // next-after-app-deploy edge variants where
+          // \`revalidatePath(pathPrefix + '/server-action')\` revalidated
+          // \`/nodejs/server-action\` on an \`/edge/...\` POST.
           const workStore = typeof __nextWorkAsyncStorage?.getStore === "function"
             ? __nextWorkAsyncStorage.getStore()
             : undefined;
+          const mergedWorkers = Object.assign(
+            Object.create(null),
+            nodeWorkers || {},
+            edgeWorkers || {},
+          );
           let entry;
           if (workStore?.page) {
             const pageKey = workStore.page.startsWith("app")
               ? workStore.page
               : "app" + workStore.page;
-            entry = workers[pageKey];
+            entry = mergedWorkers[pageKey];
           }
-          if (!entry) entry = Object.values(workers)[0];
+          if (!entry) entry = Object.values(mergedWorkers)[0];
           return entry ? { id: entry.moduleId, name: id, chunks: [], async: entry.async } : undefined;
         }
       }),
