@@ -609,6 +609,59 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       "",
     );
 
+    // Unify Next's `*AsyncStorageInstance` singletons across Turbopack
+    // chunks via a `globalThis` key. Turbopack emits the `work-unit-async-
+    // storage-instance.js` / `work-async-storage-instance.js` / etc.
+    // factories INLINE into every chunk that references them (see the
+    // `'turbopack-transition': 'next-shared'` import attribute in the
+    // next-shared layer); each chunk evaluates its own
+    // `createAsyncLocalStorage()` call and gets a fresh ALS instance.
+    // On the edge-runtime server-action path this fragments the store:
+    // the action handler runs `workUnitAsyncStorage.run(d, fn)` inside
+    // chunk A's ALS, the inner `headers()` call reads from chunk B's
+    // ALS, finds no store, and throws "headers was called outside a
+    // request scope". Node action path survives because its caller +
+    // callee happen to resolve to the same chunk's copy.
+    //
+    // Fix: rewrite the module factory bodies to key the ALS on the
+    // exported instance name (`workUnitAsyncStorageInstance`, etc.)
+    // under a single `globalThis.__CREEK_ALS` bag, so all chunks share
+    // one instance per logical store. Name-keyed is narrower than
+    // "dedup every `new AsyncLocalStorage()`" — we don't accidentally
+    // merge unrelated per-store ALSes (tracing requestStorage,
+    // react-server-dom temporaryReferences, etc.).
+    //
+    // Target pattern (both `a.i(N)` and `a.r(N)` create-variants
+    // exist):
+    //   let <v> = (0, a.i(43291).createAsyncLocalStorage)();
+    //   …short gap…
+    //   a.s(["<Name>AsyncStorageInstance", 0, <v>], …)
+    // Replacement keeps the original create call so the per-isolate
+    // fallback works if globalThis isn't carried through an unusual
+    // loader; the `??=` idempotently promotes the first copy into the
+    // shared bag.
+    workerCode = workerCode.replace(
+      /let\s+(\w+)\s*=\s*(\(0,\s*a\.[ir]\(\d+\)\.createAsyncLocalStorage\)\(\));([\s\S]{0,400}?a\.s\(\["(\w+AsyncStorageInstance)",\s*0,\s*\1\])/g,
+      (_match, varName: string, createCall: string, tail: string, storeName: string) =>
+        `let ${varName} = ((globalThis.__CREEK_ALS ??= {})["${storeName}"] ??= ${createCall});${tail}`,
+    );
+    // Same dedup for the CJS-wrapped variants esbuild produces when it
+    // bundles Next's non-Turbopack ESM copy. Two observed shapes:
+    //   a. `var <Name>AsyncStorageInstance = (0, _als.createAsyncLocalStorage)();`
+    //      — top-level from `work-unit-async-storage-instance.js` etc.
+    //   b. `Object.defineProperty(c, "<Name>AsyncStorageInstance", {…get…return <v>…}); let <v> = (0, a.r(N).createAsyncLocalStorage)();`
+    //      — Turbopack-emitted CJS compiled form (edge chunks).
+    workerCode = workerCode.replace(
+      /var\s+(\w+AsyncStorageInstance)\s*=\s*(\(0,\s*\w+\.createAsyncLocalStorage\)\(\));/g,
+      (_match, storeName: string, createCall: string) =>
+        `var ${storeName} = ((globalThis.__CREEK_ALS ??= {})["${storeName}"] ??= ${createCall});`,
+    );
+    workerCode = workerCode.replace(
+      /(Object\.defineProperty\(c,\s*"(\w+AsyncStorageInstance)",\s*\{[^}]*get:\s*(?:\/\*[^*]*\*\/\s*)?(?:__name\()?function\(\)\s*\{\s*return (\w+);[^}]*\}[\s\S]*?\}\);)\s*let\s+\3\s*=\s*(\(0,\s*a\.[ir]\(\d+\)\.createAsyncLocalStorage\)\(\))/g,
+      (_match, prefix: string, storeName: string, varName: string, createCall: string) =>
+        `${prefix}\nlet ${varName} = ((globalThis.__CREEK_ALS ??= {})["${storeName}"] ??= ${createCall})`,
+    );
+
     // Turbopack's node.js runtime implements top-level-await by assigning
     // \`module.exports = <Promise>\`. esbuild's \`__toESM\` wraps imports with
     // \`__create(__getProtoOf(mod))\`, and for a Promise that yields a plain
