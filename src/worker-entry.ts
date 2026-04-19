@@ -5331,7 +5331,16 @@ function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, 
     // PPR/postponed prerenders need the route handler so the shell can
     // stream and later resolve its dynamic segments. Serving their fallback
     // HTML directly from assets leaves the client stuck on the loading shell.
-    if (prerender.fallback.postponedState || prerender.pprChain?.headers) continue;
+    // Only gate on \`postponedState\` — \`pprChain.headers\` is set on every
+    // route under \`cacheComponents: true\` / \`experimentalPPR: true\` whether
+    // or not the route actually has dynamic segments to resume. Fully-static
+    // routes under PPR (e.g. layout + client component, no \`<Suspense>\`)
+    // have \`postponedState\` unset, and their prerendered HTML is the final
+    // response — serve it directly so the build-time sentinel isn't
+    // clobbered by a fresh runtime render (fixes cache-components.server-
+    // action "should prerender pages with inline server actions" which
+    // expected \`at buildtime\` and received \`at runtime\`).
+    if (prerender.fallback.postponedState) continue;
 
     const assetPath = __isStaticPagePathname(prerender.pathname)
       ? path.join(prerender.pathname, "index.html")
