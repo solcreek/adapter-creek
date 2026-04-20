@@ -4471,9 +4471,22 @@ async function __handleRequestInner(request, env, ctx) {
         !(isISRPage && hasHandler)
       ) {
         try {
-          const baseAssetPath = staticAssetPath.endsWith("/index.html")
-            ? staticAssetPath.replace(/\\/index\\.html$/, "")
-            : staticAssetPath.replace(/\\.html$/, "");
+          // For nested paths (\`/foo/index.html\`) the RSC sibling is
+          // \`/foo.rsc\` — strip the trailing \`/index.html\` to get the base.
+          // But the ROOT \`/index.html\` is special: its sibling lives at
+          // \`/index.rsc\` (same basename, no sibling-above semantics). Strip
+          // only the \`.html\` suffix there so \`baseAssetPath\` stays
+          // \`/index\` and \`baseAssetPath + ".rsc"\` resolves to \`/index.rsc\`.
+          // Without this, root \`/\` RSC prefetch requests fell through to
+          // the dynamic handler (which bakes search params into the
+          // response) instead of serving the neutral build-time shell —
+          // breaking app-prefetch "should not unintentionally modify the
+          // requested prefetch by escaping the uri encoded query params".
+          const baseAssetPath = staticAssetPath === "/index.html"
+            ? "/index"
+            : staticAssetPath.endsWith("/index.html")
+              ? staticAssetPath.replace(/\\/index\\.html$/, "")
+              : staticAssetPath.replace(/\\.html$/, "");
           // Segment prefetch — Next.js client sends
           // \`next-router-segment-prefetch: /blog/[author]/__PAGE__\` during
           // Link-driven partial prefetches and expects just THAT segment,
