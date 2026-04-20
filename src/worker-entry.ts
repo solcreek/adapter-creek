@@ -943,11 +943,20 @@ function __getMiddlewareMatchers() {
   if (__middlewareMatchersCache !== null) return __middlewareMatchersCache;
   __middlewareMatchersCache = [];
   try {
-    const manifest = __parseJsonManifest("middleware-manifest.json", null);
-    if (!manifest) return __middlewareMatchersCache;
-    const mw = manifest.middleware?.["/"]; // middleware is always at "/"
-    if (mw && Array.isArray(mw.matchers)) {
-      for (const m of mw.matchers) {
+    // Next 16+: proxy.ts (and middleware.ts) matchers live in
+    // \`functions-config-manifest.json\` under \`functions["/_middleware"]\`.
+    // \`middleware-manifest.json\` is empty for proxy.ts fixtures, so a
+    // matchers lookup there wrongly returns no matchers → \`__shouldRunMiddleware\`
+    // defaults to true → middleware runs on prefetch requests even when
+    // \`missing: [Next-Router-Prefetch]\` was configured.
+    // Fixes concurrent-navigations/mismatching-prefetch: the test's
+    // proxy.ts excludes prefetches via \`missing\`, but without this
+    // lookup we'd rewrite /a?mismatch-rewrite=./b → /b on the prefetch
+    // request and serve page B's shell instead of page A's.
+    const fnManifest = __parseJsonManifest("functions-config-manifest.json", null);
+    const fnMw = fnManifest?.functions?.["/_middleware"];
+    if (fnMw && Array.isArray(fnMw.matchers)) {
+      for (const m of fnMw.matchers) {
         try {
           __middlewareMatchersCache.push({
             regex: new RegExp(m.regexp),
@@ -955,6 +964,23 @@ function __getMiddlewareMatchers() {
             missing: m.missing || null,
           });
         } catch {}
+      }
+    }
+    // Legacy path — older middleware-manifest.json shape still seen in
+    // some Next versions and adapter-bun fixtures.
+    if (__middlewareMatchersCache.length === 0) {
+      const manifest = __parseJsonManifest("middleware-manifest.json", null);
+      const mw = manifest?.middleware?.["/"]; // middleware is always at "/"
+      if (mw && Array.isArray(mw.matchers)) {
+        for (const m of mw.matchers) {
+          try {
+            __middlewareMatchersCache.push({
+              regex: new RegExp(m.regexp),
+              has: m.has || null,
+              missing: m.missing || null,
+            });
+          } catch {}
+        }
       }
     }
   } catch {}
