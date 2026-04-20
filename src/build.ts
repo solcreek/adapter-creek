@@ -21,6 +21,11 @@ type BuildContext = Parameters<NonNullable<NextAdapter["onBuildComplete"]>>[0];
 
 const OUTPUT_DIR = ".creek/adapter-output";
 
+interface ExternalModuleLoader {
+  id: string;
+  importSpecifier: string;
+}
+
 export async function handleBuild(ctx: BuildContext): Promise<void> {
   const outputDir = path.join(ctx.projectDir, OUTPUT_DIR);
   const assetsDir = path.join(outputDir, "assets");
@@ -333,6 +338,12 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   }
 
   // Step 4: Generate worker entry
+  console.log("  [Creek Adapter] Scanning external modules...");
+  const externalModules = await collectExternalizedModules(ctx.distDir);
+  if (externalModules.length > 0) {
+    console.log(`  [Creek Adapter] ${externalModules.length} external modules preloaded`);
+  }
+  console.log("  [Creek Adapter] Generating worker entry...");
   const workerSource = generateWorkerEntry({
     buildId: ctx.buildId,
     routing: ctx.routing,
@@ -347,7 +358,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     composableCacheSeedsByShell: composableCacheSeedEntries,
     wasmHashToFilename: Array.from(wasmHashToFilename.entries()),
     wasmLengthToFilename: Array.from(wasmLengthToFilename.entries()),
-    externalModules: await collectExternalizedModules(ctx.distDir),
+    externalModules,
     turbopackRuntimePath,
     edgeRegistrationChunkPath,
     edgeRuntimeModuleIds,
@@ -356,6 +367,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   });
 
   // Step 4: Bundle with esbuild
+  console.log("  [Creek Adapter] Bundling worker...");
   const serverFiles = await bundleForWorkers({
     workerSource,
     outputDir: serverDir,
@@ -789,7 +801,7 @@ async function collectUserFiles(
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico",
     ".svg", ".wasm", ".pdf",
   ]);
-  const MAX_TOTAL_BYTES = 4 * 1024 * 1024; // 4MB cap (base64 inflates binary)
+  const MAX_TOTAL_BYTES = 10 * 1024 * 1024; // 10MB cap (base64 inflates binary)
 
   const files: Record<string, string> = {};
   let totalBytes = 0;
@@ -809,7 +821,8 @@ async function collectUserFiles(
       if (files[fileOutputPath]) continue;
 
       const ext = path.extname(fileOutputPath).toLowerCase();
-      const isText = TEXT_EXTENSIONS.has(ext);
+      const isDeclarationFile = fileOutputPath.endsWith(".d.ts");
+      const isText = TEXT_EXTENSIONS.has(ext) || isDeclarationFile;
       const isBinary = BINARY_EXTENSIONS.has(ext);
       if (!isText && !isBinary) continue;
 
@@ -822,7 +835,7 @@ async function collectUserFiles(
       // fonts/wasm as sibling assets.
       // Fixes og-api node-runtime (\`/og-node\`) and
       // use-cache-metadata-route-handler opengraph/icon image tests.
-      if (fileOutputPath.includes("node_modules/") && !isBinary) continue;
+      if (fileOutputPath.includes("node_modules/") && !isBinary && !isDeclarationFile) continue;
 
       try {
         if (isText) {
@@ -868,24 +881,37 @@ export interface PrerenderEntry {
   initialHeaders?: Record<string, string | string[]>;
   initialExpiration?: number;
   pprHeaders?: Record<string, string>;
+  lastModified?: number;
+  segmentPaths?: string[];
 }
 
 /**
- * Collect prerender entries from build outputs for cache seeding.
- * Reads fallback HTML files and extracts metadata for ISR.
+ * Collect prerender entries from build outputs for App Router PPR/cache seeding.
+ * Pages Router prerenders are served from assets and don't need to be embedded
+ * in the worker bundle.
  */
 async function collectPrerenderEntries(outputs: BuildContext["outputs"]): Promise<PrerenderEntry[]> {
   const entries: PrerenderEntry[] = [];
-  // Limit prerender entries to prevent oversized worker bundles.
+  // Limit PPR entries to prevent oversized worker bundles.
   // Large apps can have hundreds of prerenders, each with full HTML.
   const MAX_PRERENDER_ENTRIES = 50;
 
   for (const prerender of outputs.prerenders) {
     if (!prerender.fallback?.filePath) continue;
+    const hasPostponedState =
+      typeof prerender.fallback.postponedState === "string" &&
+      prerender.fallback.postponedState.length > 0;
+    const hasPprHeaders = !!prerender.pprChain?.headers;
+    if (!hasPostponedState && !hasPprHeaders) continue;
     if (entries.length >= MAX_PRERENDER_ENTRIES) break;
 
     try {
       const html = await fs.readFile(prerender.fallback.filePath, "utf-8");
+      const stat = await fs.stat(prerender.fallback.filePath).catch(() => null);
+      const metaPath = prerender.fallback.filePath.replace(/\.(html|body)$/, ".meta");
+      const meta = await fs.readFile(metaPath, "utf-8")
+        .then((raw) => JSON.parse(raw))
+        .catch(() => null);
       entries.push({
         pathname: prerender.pathname,
         html,
@@ -895,6 +921,8 @@ async function collectPrerenderEntries(outputs: BuildContext["outputs"]): Promis
         initialHeaders: prerender.fallback.initialHeaders,
         initialExpiration: prerender.fallback.initialExpiration,
         pprHeaders: prerender.pprChain?.headers,
+        lastModified: stat?.mtimeMs,
+        segmentPaths: Array.isArray(meta?.segmentPaths) ? meta.segmentPaths : undefined,
       });
     } catch {
       // Skip prerenders whose fallback file can't be read
@@ -989,7 +1017,7 @@ async function collectComposableCacheSeeds(
  * then bundles them, and our patched externalImport returns the cached
  * module from \`globalThis.__CREEK_EXT_MODS\`.
  */
-async function collectExternalizedModules(distDir: string): Promise<string[]> {
+async function collectExternalizedModules(distDir: string): Promise<ExternalModuleLoader[]> {
   const found = new Set<string>();
   const scanDir = async (dir: string) => {
     try {
@@ -997,11 +1025,11 @@ async function collectExternalizedModules(distDir: string): Promise<string[]> {
       for (const e of entries) {
         const full = path.join(dir, e.name);
         if (e.isDirectory()) await scanDir(full);
-        else if (e.name.startsWith("[externals]") && e.name.endsWith(".js")) {
+        else if (e.name.endsWith(".js")) {
           try {
             const content = await fs.readFile(full, "utf-8");
-            const m = content.match(/e\.y\("([^"]+)"\)/);
-            if (m) found.add(m[1]);
+            const matches = content.matchAll(/\w+\.y\("([^"]+)"\)/g);
+            for (const m of matches) found.add(m[1]);
           } catch {}
         }
       }
@@ -1009,7 +1037,116 @@ async function collectExternalizedModules(distDir: string): Promise<string[]> {
   };
   await scanDir(path.join(distDir, "server", "chunks"));
   await scanDir(path.join(distDir, "server", "edge", "chunks"));
-  return Array.from(found);
+
+  const projectRoot = path.dirname(distDir);
+  return Promise.all(
+    Array.from(found).map(async (id) => ({
+      id,
+      importSpecifier: await resolveExternalImportSpecifier(projectRoot, id),
+    })),
+  );
+}
+
+function stripTurbopackPackageAlias(specifier: string): string {
+  const parts = specifier.split("/");
+  const packageIndex = specifier.startsWith("@") ? 1 : 0;
+  const packageName = parts[packageIndex];
+  if (!packageName) return specifier;
+  const match = /^(.*)-[0-9a-f]{16}$/i.exec(packageName);
+  if (!match || !match[1]) return specifier;
+  parts[packageIndex] = match[1];
+  return parts.join("/");
+}
+
+function splitPackageSpecifier(specifier: string): { packageName: string; subpath: string } | null {
+  if (specifier.startsWith(".") || specifier.startsWith("/") || specifier.startsWith("node:")) return null;
+  const parts = specifier.split("/");
+  if (specifier.startsWith("@")) {
+    if (parts.length < 2 || !parts[0] || !parts[1]) return null;
+    return {
+      packageName: `${parts[0]}/${parts[1]}`,
+      subpath: parts.length > 2 ? `./${parts.slice(2).join("/")}` : ".",
+    };
+  }
+  if (!parts[0]) return null;
+  return {
+    packageName: parts[0],
+    subpath: parts.length > 1 ? `./${parts.slice(1).join("/")}` : ".",
+  };
+}
+
+async function resolveExternalImportSpecifier(projectRoot: string, runtimeSpecifier: string): Promise<string> {
+  const unaliased = stripTurbopackPackageAlias(runtimeSpecifier);
+  const split = splitPackageSpecifier(unaliased);
+  if (!split) return unaliased;
+
+  const packageJsonPath = path.join(
+    projectRoot,
+    "node_modules",
+    ...split.packageName.split("/"),
+    "package.json",
+  );
+  let packageJson: any;
+  try {
+    packageJson = JSON.parse(await fs.readFile(packageJsonPath, "utf-8"));
+  } catch {
+    return unaliased;
+  }
+
+  const exportTarget = resolvePackageExportTarget(packageJson.exports, split.subpath);
+  if (exportTarget && !exportTarget.startsWith(".") && !exportTarget.startsWith("/")) {
+    return unaliased;
+  }
+  if (exportTarget) {
+    return path.join(path.dirname(packageJsonPath), exportTarget);
+  }
+
+  if (split.subpath === "." && typeof packageJson.module === "string") {
+    return path.join(path.dirname(packageJsonPath), packageJson.module);
+  }
+  if (split.subpath === "." && typeof packageJson.main === "string") {
+    return path.join(path.dirname(packageJsonPath), packageJson.main);
+  }
+  return unaliased;
+}
+
+function resolvePackageExportTarget(exportsField: unknown, subpath: string): string | null {
+  if (!exportsField) return null;
+  if (typeof exportsField === "string" || Array.isArray(exportsField)) {
+    return subpath === "." ? pickConditionalExportTarget(exportsField) : null;
+  }
+  if (typeof exportsField !== "object") return null;
+
+  const exportsObj = exportsField as Record<string, unknown>;
+  const hasSubpathKeys = Object.keys(exportsObj).some((key) => key === "." || key.startsWith("./"));
+  const selected = hasSubpathKeys ? exportsObj[subpath] : subpath === "." ? exportsField : undefined;
+  return pickConditionalExportTarget(selected);
+}
+
+function pickConditionalExportTarget(value: unknown): string | null {
+  if (typeof value === "string") return value;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const target = pickConditionalExportTarget(item);
+      if (target) return target;
+    }
+    return null;
+  }
+  if (!value || typeof value !== "object") return null;
+
+  const conditions = value as Record<string, unknown>;
+  for (const condition of ["node", "import", "module", "default"]) {
+    if (Object.prototype.hasOwnProperty.call(conditions, condition)) {
+      const target = pickConditionalExportTarget(conditions[condition]);
+      if (target) return target;
+    }
+  }
+  for (const [condition, targetValue] of Object.entries(conditions)) {
+    if (condition === "types" || condition === "browser" || condition === "require") continue;
+    const target = pickConditionalExportTarget(targetValue);
+    if (target) return target;
+  }
+  return null;
 }
 
 function formatSize(bytes: number): string {

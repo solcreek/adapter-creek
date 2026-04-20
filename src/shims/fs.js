@@ -32,6 +32,60 @@ function maybeDecodeBinary(value, enc) {
   return bytes;
 }
 
+function normalizePath(filePath) {
+  return String(filePath).replace(/\\/g, "/");
+}
+
+function trimLeadingSlashes(filePath) {
+  return normalizePath(filePath).replace(/^\/+/, "");
+}
+
+function directoryCandidates(dirPath) {
+  const normalized = trimLeadingSlashes(dirPath).replace(/\/+$/, "");
+  const candidates = [normalized];
+  for (const marker of ["node_modules/", ".next/"]) {
+    const index = normalized.lastIndexOf(marker);
+    if (index > 0) candidates.push(normalized.slice(index));
+  }
+  return [...new Set(candidates.filter(Boolean))];
+}
+
+function relativeToEmbeddedDirectory(key, dirPath) {
+  const normalizedKey = trimLeadingSlashes(key);
+  for (const candidate of directoryCandidates(dirPath)) {
+    if (normalizedKey.startsWith(candidate + "/")) {
+      return normalizedKey.slice(candidate.length + 1);
+    }
+    const marker = "/" + candidate + "/";
+    const index = normalizedKey.lastIndexOf(marker);
+    if (index !== -1) {
+      return normalizedKey.slice(index + marker.length);
+    }
+  }
+  return undefined;
+}
+
+function listUserFilesInDirectory(dirPath) {
+  const files = globalThis.__USER_FILES;
+  if (!files) return [];
+  const entries = new Set();
+  for (const key in files) {
+    const relative = relativeToEmbeddedDirectory(key, dirPath);
+    if (!relative) continue;
+    const entry = relative.split("/")[0];
+    if (entry) entries.add(entry);
+  }
+  return [...entries];
+}
+
+function isUserFilesDirectory(filePath) {
+  return listUserFilesInDirectory(filePath).length > 0;
+}
+
+function joinPath(dirPath, entry) {
+  return normalizePath(dirPath).replace(/\/+$/, "") + "/" + entry;
+}
+
 // Look up a path in __USER_FILES (user-side text files like data.json that
 // route handlers read via fs.readFileSync). Embedded keys are paths relative
 // to outputFileTracingRoot; runtime requests come through process.cwd()
@@ -40,30 +94,34 @@ function maybeDecodeBinary(value, enc) {
 function findInUserFiles(filePath) {
   const files = globalThis.__USER_FILES;
   if (!files) return undefined;
-  if (files[filePath] !== undefined) return files[filePath];
+  const requestedPath = normalizePath(filePath);
+  if (files[requestedPath] !== undefined) return files[requestedPath];
   // Normalize the requested path to a relative form for comparison.
-  const requestedTail = filePath.replace(/^\/+/, "");
+  const requestedTail = trimLeadingSlashes(requestedPath);
   for (const key in files) {
+    const normalizedKey = normalizePath(key);
     // Embedded key is a suffix of the requested path:
     //   key  = "app/dashboard/data.json"
     //   req  = "/app/dashboard/data.json"  (cwd "/" + relative)
-    if (filePath.endsWith("/" + key) || filePath === key) return files[key];
+    if (requestedPath.endsWith("/" + normalizedKey) || requestedPath === normalizedKey) return files[key];
     // Requested tail is a suffix of the embedded key (monorepo case):
     //   key  = "apps/www/app/data.json"
     //   req  = "/app/data.json"  (page used a project-relative path)
-    if (key.endsWith("/" + requestedTail) || key === requestedTail) return files[key];
+    if (normalizedKey.endsWith("/" + requestedTail) || normalizedKey === requestedTail) return files[key];
   }
   // Last-resort: match on basename for bundled sibling assets whose
   // request path is derived from `fileURLToPath(new URL('./X', import.meta.url))`
   // and ends up with a chunk-relative path that shares nothing with the
   // embedded `node_modules/...` key except the filename. Only applies to
-  // binary assets (wasm / fonts / images) so text data files with common
-  // names like `config.json` don't collide across unrelated directories.
-  // Fixes next/og node-runtime `fs.readFileSync` of bundled wasm/ttf.
-  const reqBase = filePath.split("/").pop() || "";
-  if (/\.(wasm|ttf|otf|woff2?)$/i.test(reqBase)) {
+  // binary assets (wasm / fonts / images) and TypeScript's default lib
+  // declaration files. The latter may be requested as bare `lib.es5.d.ts`
+  // because the bundled TypeScript module has no meaningful __filename.
+  // Fixes next/og node-runtime `fs.readFileSync` of bundled wasm/ttf and
+  // twoslash loading `typescript/lib/lib.*.d.ts` in Workers.
+  const reqBase = requestedPath.split("/").pop() || "";
+  if (/\.(wasm|ttf|otf|woff2?)$/i.test(reqBase) || /^lib\..*\.d\.ts$/i.test(reqBase)) {
     for (const key in files) {
-      if (key.split("/").pop() === reqBase) return files[key];
+      if (normalizePath(key).split("/").pop() === reqBase) return files[key];
     }
   }
   return undefined;
@@ -71,6 +129,7 @@ function findInUserFiles(filePath) {
 
 export const existsSync = (filePath) => {
   if (findInUserFiles(filePath) !== undefined) return true;
+  if (isUserFilesDirectory(filePath)) return true;
   if (typeof globalThis.__MANIFESTS === "undefined") return false;
   for (const key of Object.keys(globalThis.__MANIFESTS)) {
     if (key === filePath || key.endsWith(filePath)) return true;
@@ -112,14 +171,32 @@ export const readFileSync = (filePath, enc) => {
 export const writeFileSync = noop;
 export const mkdirSync = noop;
 export const unlinkSync = noop;
-export const readdirSync = () => [];
+export const readdirSync = (dirPath, options) => {
+  const entries = listUserFilesInDirectory(dirPath);
+  if (options && typeof options === "object" && options.withFileTypes) {
+    return entries.map((name) => ({
+      name,
+      isFile: () => findInUserFiles(joinPath(dirPath, name)) !== undefined,
+      isDirectory: () => isUserFilesDirectory(joinPath(dirPath, name)),
+      isSymbolicLink: () => false,
+    }));
+  }
+  return entries;
+};
+export const realpathSync = Object.assign((filePath) => String(filePath), {
+  native: (filePath) => String(filePath),
+});
 export const statSync = (filePath) => {
-  const exists = existsSync(filePath);
+  const userContent = findInUserFiles(filePath);
+  const fileExists = userContent !== undefined;
+  const directoryExists = !fileExists && isUserFilesDirectory(filePath);
+  const exists = fileExists || directoryExists;
   return {
-    isFile: () => exists,
-    isDirectory: () => false,
+    isFile: () => fileExists,
+    isDirectory: () => directoryExists,
+    isSymbolicLink: () => false,
     mtime: new Date(),
-    size: exists ? (readFileSync(filePath, "utf8")?.length || 0) : 0,
+    size: fileExists ? (maybeDecodeBinary(userContent, "utf8")?.length || 0) : 0,
   };
 };
 export const accessSync = noop;
@@ -134,7 +211,7 @@ export const promises = {
   readAll: async (filePath, enc) => readFileSync(filePath, enc),
   writeFile: async () => {},
   mkdir: async () => {},
-  readdir: async () => [],
+  readdir: async (dirPath, options) => readdirSync(dirPath, options),
   stat: async (filePath) => statSync(filePath),
   access: async () => {},
   unlink: async () => {},
@@ -143,6 +220,6 @@ export const promises = {
 
 export default {
   existsSync, readFileSync, readAll, writeFileSync, mkdirSync, unlinkSync,
-  readdirSync, statSync, accessSync, createReadStream, createWriteStream,
+  readdirSync, realpathSync, statSync, accessSync, createReadStream, createWriteStream,
   promises,
 };

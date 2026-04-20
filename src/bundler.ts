@@ -11,7 +11,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
-import { createRequire } from "node:module";
+import { builtinModules, createRequire } from "node:module";
 
 export interface BundleOptions {
   workerSource: string;
@@ -174,6 +174,85 @@ ${cases.join("\n")}
   }
 }
 
+async function patchNodeExternalRequireConditions(distDir: string): Promise<void> {
+  const serverChunksDir = path.join(distDir, "server", "chunks");
+  const projectRoot = path.dirname(distDir);
+  const projectRequire = createRequire(path.join(projectRoot, "package.json"));
+  const builtins = new Set([
+    ...builtinModules,
+    ...builtinModules.map((name) => `node:${name}`),
+  ]);
+
+  let entries: string[];
+  try {
+    entries = await fs.readdir(serverChunksDir);
+  } catch {
+    return;
+  }
+
+  const externalRequirePattern =
+    /(\w+\.x\(\s*(["'])([^"']+)\2\s*,\s*\(\)\s*=>\s*)require\(\s*(["'])\3\4\s*\)(\s*\))/g;
+  const stripTurbopackPackageAlias = (specifier: string): string | null => {
+    const parts = specifier.split("/");
+    const packageIndex = specifier.startsWith("@") ? 1 : 0;
+    const packageName = parts[packageIndex];
+    if (!packageName) return null;
+    const match = /^(.*)-[0-9a-f]{16}$/i.exec(packageName);
+    if (!match || !match[1]) return null;
+    parts[packageIndex] = match[1];
+    return parts.join("/");
+  };
+
+  for (const entry of entries) {
+    if (!entry.startsWith("[externals]") || !entry.endsWith(".js")) continue;
+
+    const filePath = path.join(serverChunksDir, entry);
+    let code: string;
+    try {
+      code = await fs.readFile(filePath, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!code.includes(".x(") || !code.includes("require(")) continue;
+
+    const patched = code.replace(
+      externalRequirePattern,
+      (match, prefix: string, _quote: string, specifier: string, _requireQuote: string, suffix: string) => {
+        if (
+          specifier.startsWith(".") ||
+          specifier.startsWith("/") ||
+          builtins.has(specifier) ||
+          specifier === "next" ||
+          specifier.startsWith("next/") ||
+          specifier.startsWith("@next/")
+        ) {
+          return match;
+        }
+
+        let resolved: string;
+        try {
+          resolved = projectRequire.resolve(specifier);
+        } catch {
+          const unaliased = stripTurbopackPackageAlias(specifier);
+          if (!unaliased) return match;
+          try {
+            resolved = projectRequire.resolve(unaliased);
+          } catch {
+            return match;
+          }
+        }
+        if (resolved.endsWith(".node")) return match;
+
+        return `${prefix}require(${JSON.stringify(resolved)})${suffix}`;
+      },
+    );
+
+    if (patched !== code) {
+      await fs.writeFile(filePath, patched);
+    }
+  }
+}
+
 async function patchAppPageManifestSingletons(distDir: string): Promise<void> {
   const ssrDir = path.join(distDir, "server", "chunks", "ssr");
   let entries: string[] = [];
@@ -310,12 +389,106 @@ function patchBundledManifestSingleton(workerCode: string): string {
   return workerCode;
 }
 
+function stripAsyncLocalStorageSnapshotTernaries(workerCode: string): string {
+  const snapshotCall = ".snapshot()";
+  let out = "";
+  let last = 0;
+  let searchFrom = 0;
+
+  const isIdent = (ch: string) => /[A-Za-z0-9_$]/.test(ch);
+  const skipWsBack = (i: number) => {
+    while (i > 0 && /\s/.test(workerCode[i - 1])) i--;
+    return i;
+  };
+  const skipWsForward = (i: number) => {
+    while (i < workerCode.length && /\s/.test(workerCode[i])) i++;
+    return i;
+  };
+
+  while (true) {
+    const snapshotIndex = workerCode.indexOf(snapshotCall, searchFrom);
+    if (snapshotIndex === -1) break;
+
+    let rightNameStart = snapshotIndex;
+    while (rightNameStart > 0 && isIdent(workerCode[rightNameStart - 1])) {
+      rightNameStart--;
+    }
+    const name = workerCode.slice(rightNameStart, snapshotIndex);
+    if (!name) {
+      searchFrom = snapshotIndex + snapshotCall.length;
+      continue;
+    }
+
+    let qIndex = skipWsBack(rightNameStart);
+    if (workerCode[qIndex - 1] !== "?") {
+      searchFrom = snapshotIndex + snapshotCall.length;
+      continue;
+    }
+    qIndex--;
+
+    let leftNameEnd = skipWsBack(qIndex);
+    let leftNameStart = leftNameEnd;
+    while (leftNameStart > 0 && isIdent(workerCode[leftNameStart - 1])) {
+      leftNameStart--;
+    }
+    if (workerCode.slice(leftNameStart, leftNameEnd) !== name) {
+      searchFrom = snapshotIndex + snapshotCall.length;
+      continue;
+    }
+
+    let colonIndex = skipWsForward(snapshotIndex + snapshotCall.length);
+    if (workerCode[colonIndex] !== ":") {
+      searchFrom = snapshotIndex + snapshotCall.length;
+      continue;
+    }
+    colonIndex = skipWsForward(colonIndex + 1);
+
+    out += workerCode.slice(last, leftNameStart);
+    last = colonIndex;
+    searchFrom = colonIndex;
+  }
+
+  return out ? out + workerCode.slice(last) : workerCode;
+}
+
+function patchUseCachePrerenderDanglingPromiseBailout(workerCode: string): string {
+  const serializedKeyPattern =
+    /let\s+(\w+)\s*=\s*"string"\s*==\s*typeof\s+(\w+)\s*\?\s*\2\s*:\s*await\s+(\w+)\(\2\),\s*(\w+)\s*=\s*(\w+)\.rootParams/g;
+
+  return workerCode.replace(
+    serializedKeyPattern,
+    (
+      match: string,
+      serializedKeyVar: string,
+      encodedKeyVar: string,
+      encodeFnVar: string,
+      rootParamsVar: string,
+      workUnitStoreVar: string,
+      offset: number,
+      fullCode: string,
+    ) => {
+      const followingCode = fullCode.slice(offset, offset + 3000);
+      const hangingCallPattern = new RegExp(
+        String.raw`\(0,\s*(\w+)\.makeHangingPromise\)\(\s*${workUnitStoreVar}\.renderSignal\s*,\s*(\w+)\.route`,
+      );
+      const hangingCallMatch = hangingCallPattern.exec(followingCode);
+      if (!hangingCallMatch) return match;
+
+      const makeHangingPromiseVar = hangingCallMatch[1];
+      const workStoreVar = hangingCallMatch[2];
+
+      return `let ${serializedKeyVar} = "string" == typeof ${encodedKeyVar} ? ${encodedKeyVar} : await ${encodeFnVar}(${encodedKeyVar}); if ("prerender" === ${workUnitStoreVar}.type && "string" == typeof ${serializedKeyVar}) { let __creekDanglingThenableStart = ${serializedKeyVar}.lastIndexOf("$@"); if (__creekDanglingThenableStart !== -1 && ${serializedKeyVar}.indexOf(":", __creekDanglingThenableStart) === -1) return (0, ${makeHangingPromiseVar}.makeHangingPromise)(${workUnitStoreVar}.renderSignal, ${workStoreVar}.route, 'dynamic "use cache"'); } let ${rootParamsVar} = ${workUnitStoreVar}.rootParams`;
+    },
+  );
+}
+
 export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   // Patch Turbopack runtime BEFORE wrangler bundles.
   // Turbopack's R.c() dynamically loads chunks from the filesystem.
   // CF Workers has no filesystem, so we replace R.c() with a switch
   // statement that maps chunk paths to static require() calls.
   await patchTurbopackRuntime(opts.distDir);
+  await patchNodeExternalRequireConditions(opts.distDir);
   await patchAppPageManifestSingletons(opts.distDir);
 
   // Write the generated worker entry
@@ -370,6 +543,12 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       // throws \`sharp is not a function\`. Aliasing to a shim whose default
       // is undefined makes \`@vercel/og\` fall back to its resvg.wasm path.
       "sharp": path.join(adapterDir, "src", "shims", "sharp.js"),
+      // Some packages intentionally leave unreachable dynamic imports such as
+      // `if (Math.random() < 0) import("fail")` in their ESM entry. Turbopack
+      // externalizes the package and never resolves that branch, but wrangler
+      // follows it once we preload the concrete ESM file. Stub it so the dead
+      // branch remains harmless.
+      "fail": path.join(adapterDir, "src", "shims", "empty.js"),
       // Replace Next's track-module-loading.{instance,external} with a
       // per-request AsyncLocalStorage version. The original keeps a
       // module-level CacheSignal whose internal setImmediate closure
@@ -392,9 +571,17 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
         path.join(adapterDir, "src", "shims", "track-module-loading.js"),
       "next/dist/server/app-render/module-loading/track-module-loading.instance.js":
         path.join(adapterDir, "src", "shims", "track-module-loading.js"),
-      // NOTE: load-manifest and fast-set-immediate shims exist in src/shims/
-      // but are handled by the fs shim (manifest loading) and nodejs_compat
-      // (setImmediate) respectively, so no alias needed.
+      // Next's fast-set-immediate module patches node:timers/promises, whose
+      // ESM namespace is frozen in Workers. More importantly, workerd can run
+      // the next setTimeout(0) stage before a setImmediate scheduled by the
+      // previous cache-components stage. The shim keeps native setImmediate
+      // except during Next's explicit fast-immediate capture window.
+      "next/dist/server/node-environment-extensions/fast-set-immediate.external":
+        path.join(adapterDir, "src", "shims", "fast-set-immediate.js"),
+      "next/dist/server/node-environment-extensions/fast-set-immediate.external.js":
+        path.join(adapterDir, "src", "shims", "fast-set-immediate.js"),
+      // NOTE: load-manifest shim exists in src/shims/ but is handled by the
+      // fs shim (manifest loading), so no alias needed.
       // NOTE: http/node:http is NOT aliased — CF Workers nodejs_compat provides it.
       // The worker entry uses our custom IncomingMessage/ServerResponse inline via
       // the NODE_BRIDGE_CODE template, which imports from "http" (the built-in).
@@ -497,6 +684,33 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     workerCode = workerCode.replace(
       /err\.code !== "ENOENT" && err\.code !== "MODULE_NOT_FOUND" && err\.code !== "ERR_MODULE_NOT_FOUND"/g,
       'err.code !== "ENOENT" && err.code !== "MODULE_NOT_FOUND" && err.code !== "ERR_MODULE_NOT_FOUND" && !err.message?.includes("is not supported")',
+    );
+
+    // Some libraries hide builtin requires from the bundler, e.g.
+    // @typescript/vfs constructs `require("path")` via String.fromCharCode.
+    // Wrangler can't statically rewrite that, so esbuild's __require helper
+    // throws at runtime even though the node:path wrapper is already present
+    // elsewhere in the bundle. Route those builtin dynamic requires back to
+    // wrangler's generated require_path() module when available.
+    workerCode = workerCode.replace(
+      /throw Error\('Dynamic require of "' \+ x \+ '" is not supported'\);/,
+      'if ((x === "path" || x === "node:path") && typeof require_path === "function") return require_path();\n  throw Error(\'Dynamic require of "\' + x + \'" is not supported\');',
+    );
+    workerCode = workerCode.replace(
+      /(throw Error\('Dynamic require of "' \+ x \+ '" is not supported'\);\n\}\);)/,
+      '$1\n__require.resolve = (id) => id === "typescript" ? "node_modules/typescript/lib/typescript.js" : id;',
+    );
+
+    // `next/dist/server/node-environment.js` imports
+    // `./node-environment-extensions/fast-set-immediate.external` by relative
+    // path, so Wrangler's bare-specifier alias cannot intercept it. If the
+    // original module installs first, our scoped shim stores Next's patched
+    // timer functions as its "native" originals and the workerd ordering fix
+    // becomes re-entrant. Route that side-effect import to the aliased shim
+    // module that Wrangler emitted for Turbopack's external import.
+    workerCode = workerCode.replace(
+      /\brequire_fast_set_immediate_external\(\);/g,
+      'typeof init_fast_set_immediate === "function" ? init_fast_set_immediate() : require_fast_set_immediate_external();',
     );
 
     // Next.js's \`getInstrumentationModule\` does
@@ -604,10 +818,15 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       /if\s*\(\s*(\w+)\s*\)\s*\{\s*return\s+\1\.snapshot\(\);\s*\}/g,
       "// Ignored snapshot",
     );
-    workerCode = workerCode.replace(
-      /(\w+)\s*\?\s*\1\.snapshot\(\)\s*:\s*/g,
-      "",
-    );
+    workerCode = stripAsyncLocalStorageSnapshotTernaries(workerCode);
+    // `use cache` arguments that contain an unresolved React thenable marker
+    // (`$@`) during a prerender are request-bound values. Next's dynamic
+    // access instrumentation usually catches this before cache fill, but an
+    // async params transform can hide the access until after serialization.
+    // Node eventually trips the 50s cache-fill timeout; under workerd that
+    // blocks the whole response. Treat the cache function as a dynamic hole
+    // immediately so the PPR fallback shell can resume.
+    workerCode = patchUseCachePrerenderDanglingPromiseBailout(workerCode);
 
     // Unify Next's `*AsyncStorageInstance` singletons across Turbopack
     // chunks via a `globalThis` key. Turbopack emits the `work-unit-async-

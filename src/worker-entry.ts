@@ -6,7 +6,7 @@
  * standard CJS modules that esbuild can bundle.
  */
 
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import * as path from "node:path";
 import type { NextAdapter } from "next";
 
@@ -46,6 +46,8 @@ export interface WorkerEntryOptions {
     initialStatus?: number;
     initialHeaders?: Record<string, string | string[]>;
     pprHeaders?: Record<string, string>;
+    lastModified?: number;
+    segmentPaths?: string[];
   }>;
   /**
    * Composable cache (`'use cache'`) entries extracted from build-time
@@ -86,15 +88,12 @@ export interface WorkerEntryOptions {
   wasmLengthToFilename?: Array<[number, string]>;
   /**
    * Module specifiers that Turbopack marked as externals but that the
-   * user's code references at runtime via dynamic import. Wrangler's
-   * \`externalImport(id)\` runtime helper calls \`await import(id)\` which
-   * workerd refuses — the worker would 500 with "No such module".
-   * Eagerly \`import\` each specifier from the worker entry so wrangler
-   * bundles them, and register them in \`globalThis.__CREEK_EXT_MODS\` so
-   * our patched \`externalImport\` returns the cached module without
-   * going through workerd's broken external loader.
+   * user's code references at runtime via dynamic import. \`id\` is the
+   * exact runtime specifier passed to Turbopack's externalImport helper;
+   * \`importSpecifier\` is the concrete module path we ask wrangler to
+   * bundle for that id.
    */
-  externalModules?: string[];
+  externalModules?: Array<{ id: string; importSpecifier: string }>;
   /**
    * Absolute path to the user's \`.next/server/instrumentation.js\` when the
    * project actually provides one (not our \`module.exports = {}\` placeholder).
@@ -128,7 +127,8 @@ interface HandlerEntry {
 export function generateWorkerEntry(opts: WorkerEntryOptions): string {
   const handlers = collectHandlers(opts.outputs, opts.manifests);
   const pathnames = collectPathnames(opts.outputs, opts.manifests);
-  const staticPageMap = collectStaticPageMap(opts.outputs);
+  const serverActionPages = collectServerActionPagePathnames(opts.manifests);
+  const staticPageMap = collectStaticPageMap(opts.outputs, serverActionPages);
   const revalidatePaths = collectRevalidatePaths(opts.outputs);
   const composableCacheSeedsByShell = opts.composableCacheSeedsByShell ?? [];
 
@@ -223,8 +223,8 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
     ? ""
     : "globalThis.__CREEK_EXT_LOADERS = globalThis.__CREEK_EXT_LOADERS || {};\n" +
       (opts.externalModules ?? [])
-        .map((spec: string) =>
-          `globalThis.__CREEK_EXT_LOADERS[${JSON.stringify(spec)}] = () => import(${JSON.stringify(spec)});`
+        .map((entry) =>
+          `globalThis.__CREEK_EXT_LOADERS[${JSON.stringify(entry.id)}] = () => import(${JSON.stringify(entry.importSpecifier)});`
         )
         .join("\n");
 
@@ -332,10 +332,12 @@ if (typeof WebAssembly !== "undefined" && typeof WebAssembly.instantiate === "fu
 }
 
 // Polyfill process methods and env that Next.js uses.
+const __CREEK_NODE_ENV_KEY = "NODE_ENV";
+const __CREEK_NEXT_RUNTIME_KEY = "NEXT_RUNTIME";
 if (typeof process !== "undefined") {
   if (!process.env) process.env = {};
-  if (!process.env.NODE_ENV) process.env.NODE_ENV = "production";
-  if (!process.env.NEXT_RUNTIME) process.env.NEXT_RUNTIME = "nodejs";
+  if (!process.env[__CREEK_NODE_ENV_KEY]) process.env[__CREEK_NODE_ENV_KEY] = "production";
+  if (!process.env[__CREEK_NEXT_RUNTIME_KEY]) process.env[__CREEK_NEXT_RUNTIME_KEY] = "nodejs";
   if (!process.version) process.version = "v20.0.0";
   if (!process.versions) process.versions = { node: "20.0.0" };
   if (!process.cwd) process.cwd = () => "/";
@@ -357,6 +359,7 @@ import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
 import { IncrementalCache } from "next/dist/server/lib/incremental-cache/index.js";
 import { tagsManifest as __nextTagsManifest } from "next/dist/server/lib/incremental-cache/tags-manifest.external.js";
 import { workAsyncStorage as __nextWorkAsyncStorage } from "next/dist/server/app-render/work-async-storage.external.js";
+import { Buffer } from "node:buffer";
 import { DurableObject } from "cloudflare:workers";
 
 // Boot manifest globals before importing edge runtime chunks.
@@ -744,6 +747,13 @@ globalThis.__USER_FILES = ${JSON.stringify(opts.userFiles)};
 
 // Prerender entries for ISR cache seeding (PPR shells + static prerenders)
 const __PRERENDER_ENTRIES = ${JSON.stringify(opts.prerenderEntries)};
+const __CREEK_PRERENDER_ENTRY_BY_PATH = (() => {
+  const map = new Map();
+  for (const entry of __PRERENDER_ENTRIES) {
+    if (entry && typeof entry.pathname === "string") map.set(entry.pathname, entry);
+  }
+  return map;
+})();
 
 function __findManifestEntry(manifestName) {
   if (!globalThis.__MANIFESTS) return null;
@@ -1259,17 +1269,17 @@ async function __withEdgeRouteEnv(entryKey, fn) {
     process.env[key] = String(value);
   }
 
-  const hadNextRuntime = Object.prototype.hasOwnProperty.call(process.env, "NEXT_RUNTIME");
-  const previousNextRuntime = process.env.NEXT_RUNTIME;
-  process.env.NEXT_RUNTIME = "edge";
+  const hadNextRuntime = Object.prototype.hasOwnProperty.call(process.env, __CREEK_NEXT_RUNTIME_KEY);
+  const previousNextRuntime = process.env[__CREEK_NEXT_RUNTIME_KEY];
+  process.env[__CREEK_NEXT_RUNTIME_KEY] = "edge";
 
   try {
     return await fn();
   } finally {
     if (hadNextRuntime) {
-      process.env.NEXT_RUNTIME = previousNextRuntime;
+      process.env[__CREEK_NEXT_RUNTIME_KEY] = previousNextRuntime;
     } else {
-      delete process.env.NEXT_RUNTIME;
+      delete process.env[__CREEK_NEXT_RUNTIME_KEY];
     }
     for (const key of missing) delete process.env[key];
     for (const [key, value] of previous) process.env[key] = value;
@@ -1449,6 +1459,73 @@ function __creekKV() {
   }
 }
 
+async function __creekFetchAssetBuffer(assetPath) {
+  const store = (() => {
+    try { return __INTERNAL_FETCH_CONTEXT.getStore(); } catch { return null; }
+  })();
+  const env = store?.env;
+  if (!env?.ASSETS || !store?.origin) return null;
+  try {
+    const res = await env.ASSETS.fetch(
+      new Request(new URL(assetPath, store.origin), { headers: store.request?.headers })
+    );
+    if (!res.ok) return null;
+    return Buffer.from(await res.arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+async function __creekSeededAppPageEntry(key, ctx) {
+  if (ctx?.kind !== "APP_PAGE") return null;
+  const seed = __CREEK_PRERENDER_ENTRY_BY_PATH.get(key);
+  if (!seed || !seed.pprHeaders || seed.pathname.includes("[")) return null;
+  const hasRevalidate = typeof seed.initialRevalidate === "number" && seed.initialRevalidate > 0;
+  const hasFullyStaticPprOutput = !seed.postponedState;
+  if (!hasRevalidate && !hasFullyStaticPprOutput) return null;
+
+  const headers = seed.initialHeaders && typeof seed.initialHeaders === "object"
+    ? Object.assign({}, seed.initialHeaders)
+    : undefined;
+  const tagsHeader = headers?.["x-next-cache-tags"];
+  const tags = typeof tagsHeader === "string"
+    ? tagsHeader.split(",").map((t) => t.trim()).filter(Boolean)
+    : [];
+
+  const rscData = !ctx.isFallback && (!ctx.isRoutePPREnabled || seed.postponedState == null)
+    ? await __creekFetchAssetBuffer(key + ".rsc")
+    : undefined;
+  if (!ctx.isFallback && (!ctx.isRoutePPREnabled || seed.postponedState == null) && !rscData) {
+    return null;
+  }
+
+  let segmentData;
+  if (Array.isArray(seed.segmentPaths) && seed.segmentPaths.length > 0) {
+    const segments = new Map();
+    for (const segmentPath of seed.segmentPaths) {
+      if (typeof segmentPath !== "string") continue;
+      const buf = await __creekFetchAssetBuffer(key + ".segments" + segmentPath + ".segment.rsc");
+      if (buf) segments.set(segmentPath, buf);
+    }
+    if (segments.size > 0) segmentData = segments;
+  }
+
+  return {
+    value: {
+      kind: "APP_PAGE",
+      html: seed.html,
+      rscData,
+      postponed: seed.postponedState,
+      headers,
+      status: seed.initialStatus,
+      segmentData,
+    },
+    lastModified: typeof seed.lastModified === "number" ? seed.lastModified : Date.now(),
+    tags,
+    revalidate: typeof seed.initialRevalidate === "number" ? seed.initialRevalidate : undefined,
+  };
+}
+
 class CreekCacheHandler {
   constructor(ctx) {
     if (!globalThis.__CREEK_CACHE) globalThis.__CREEK_CACHE = new Map();
@@ -1456,7 +1533,7 @@ class CreekCacheHandler {
     if (!globalThis.__CREEK_TAG_INVALIDATED_AT) globalThis.__CREEK_TAG_INVALIDATED_AT = new Map();
   }
 
-  async get(key) {
+  async get(key, ctx) {
     // L1: in-memory
     let entry = globalThis.__CREEK_CACHE.get(key);
 
@@ -1475,6 +1552,13 @@ class CreekCacheHandler {
       }
     }
 
+    if (!entry) {
+      entry = await __creekSeededAppPageEntry(key, ctx);
+      if (entry) {
+        globalThis.__CREEK_CACHE.set(key, entry);
+      }
+    }
+
     if (!entry) return null;
 
     const age = (Date.now() - entry.lastModified) / 1000;
@@ -1489,9 +1573,13 @@ class CreekCacheHandler {
     // time and include them in the invalidation check. Without this,
     // revalidatePath and after() + revalidatePath have no effect on ISR
     // page caches. Fixes next-after-app-deploy, trailingslash revalidate.
-    const checkTags = Array.isArray(entry.tags) ? entry.tags.slice() : [];
-    checkTags.push(...__creekImplicitTagsForKey(key));
-    const staleByTag = await __creekTagsInvalidatedSince(checkTags, entry.lastModified);
+    const explicitTags = Array.isArray(entry.tags) ? entry.tags.slice() : [];
+    const implicitPathTags = __creekImplicitTagsForKey(key);
+    const expiredByImplicitPathTag = await __creekTagsInvalidatedSince(implicitPathTags, entry.lastModified);
+    if (expiredByImplicitPathTag) {
+      return null;
+    }
+    const staleByTag = await __creekTagsInvalidatedSince(explicitTags, entry.lastModified);
 
     // Stale by time-based revalidate
     const staleByTime =
@@ -1666,24 +1754,28 @@ class CreekComposableCacheHandler {
         if (seeds) {
           const seed = seeds.get(cacheKey);
           if (seed) {
+            let seedInvalidated = false;
             for (const tag of seed.tags) {
               const state = globalThis.__CREEK_CC_TAG_STATE.get(tag);
               if (state && state.expire !== undefined && state.expire > seed.timestamp) {
                 // Seed invalidated by a runtime tag flip — fall through to
                 // normal handler path so a fresh render happens.
+                seedInvalidated = true;
                 break;
               }
             }
-            return {
-              value: new ReadableStream({
-                start(c) { c.enqueue(seed.value); c.close(); },
-              }),
-              tags: seed.tags,
-              stale: seed.stale,
-              timestamp: seed.timestamp,
-              expire: seed.expire,
-              revalidate: seed.revalidate,
-            };
+            if (!seedInvalidated) {
+              return {
+                value: new ReadableStream({
+                  start(c) { c.enqueue(seed.value); c.close(); },
+                }),
+                tags: seed.tags,
+                stale: seed.stale,
+                timestamp: seed.timestamp,
+                expire: seed.expire,
+                revalidate: seed.revalidate,
+              };
+            }
           }
         }
       }
@@ -2429,6 +2521,285 @@ function __asByteStream(stream) {
       const { done, value } = await reader.read();
       if (done) { controller.close(); return; }
       controller.enqueue(value);
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  });
+}
+
+function __creekIndexOfBytes(haystack, needle) {
+  if (needle.length === 0) return 0;
+  const max = haystack.length - needle.length;
+  outer: for (let i = 0; i <= max; i++) {
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[i + j] !== needle[j]) continue outer;
+    }
+    return i;
+  }
+  return -1;
+}
+
+function __creekMergeBytes(chunks, totalLength) {
+  const out = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+}
+
+function __creekPatchFlightStaticBoundaryStream(stream) {
+  if (!stream) return stream;
+
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const chunks = [];
+  let totalLength = 0;
+  let boundaryId = null;
+  let patched = false;
+  const MAX_PREFIX_BYTES = 128 * 1024;
+
+  return new ReadableStream({
+    type: "bytes",
+    async pull(controller) {
+      if (patched) {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+        } else {
+          controller.enqueue(value);
+        }
+        return;
+      }
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          if (totalLength > 0) controller.enqueue(__creekMergeBytes(chunks, totalLength));
+          controller.close();
+          patched = true;
+          return;
+        }
+
+        chunks.push(value);
+        totalLength += value.byteLength;
+        const prefix = __creekMergeBytes(chunks, totalLength);
+        const text = decoder.decode(prefix);
+
+        if (boundaryId === null) {
+          const match = text.match(/"l":"\\$@([0-9a-z]+)"/i);
+          if (match) boundaryId = match[1];
+        }
+
+        if (boundaryId !== null) {
+          const lineNeedle = encoder.encode("\\n" + boundaryId + ":");
+          let lineStart = __creekIndexOfBytes(prefix, lineNeedle);
+          if (lineStart !== -1) {
+            lineStart += 1;
+          } else {
+            const startNeedle = encoder.encode(boundaryId + ":");
+            if (__creekIndexOfBytes(prefix.subarray(0, startNeedle.length), startNeedle) === 0) {
+              lineStart = 0;
+            }
+          }
+
+          if (lineStart !== -1) {
+            let digitStart = lineStart + boundaryId.length + 1;
+            let digitEnd = digitStart;
+            while (
+              digitEnd < prefix.length &&
+              prefix[digitEnd] >= 48 &&
+              prefix[digitEnd] <= 57
+            ) {
+              digitEnd++;
+            }
+            if (digitEnd > digitStart) {
+              const replacement = encoder.encode(String(lineStart));
+              const out = new Uint8Array(
+                prefix.length - (digitEnd - digitStart) + replacement.length
+              );
+              out.set(prefix.subarray(0, digitStart), 0);
+              out.set(replacement, digitStart);
+              out.set(prefix.subarray(digitEnd), digitStart + replacement.length);
+              controller.enqueue(out);
+              chunks.length = 0;
+              totalLength = 0;
+              patched = true;
+              return;
+            }
+          }
+        }
+
+        if (totalLength >= MAX_PREFIX_BYTES) {
+          controller.enqueue(prefix);
+          chunks.length = 0;
+          totalLength = 0;
+          patched = true;
+          return;
+        }
+      }
+    },
+    cancel(reason) { return reader.cancel(reason); },
+  });
+}
+
+function __creekPatchHtmlFlightStaticBoundaryStream(stream) {
+  if (!stream) return stream;
+
+  const reader = stream.getReader();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const chunks = [];
+  let totalLength = 0;
+  let patched = false;
+  const MAX_PREFIX_BYTES = 256 * 1024;
+  const marker = 'self.__next_f.push([1,"';
+  const escapedNewline = String.fromCharCode(92, 110);
+
+  function patchPrefix(prefix) {
+    const text = decoder.decode(prefix);
+    let searchFrom = 0;
+
+    while (true) {
+      const markerIndex = text.indexOf(marker, searchFrom);
+      if (markerIndex === -1) return null;
+
+      const payloadStart = markerIndex + marker.length;
+      let payloadEnd = -1;
+      let escaped = false;
+      for (let i = payloadStart; i < text.length; i++) {
+        const ch = text[i];
+        if (escaped) {
+          escaped = false;
+          continue;
+        }
+        if (ch === "\\\\") {
+          escaped = true;
+          continue;
+        }
+        if (ch === '"') {
+          payloadEnd = i;
+          break;
+        }
+      }
+
+      if (payloadEnd === -1) return null;
+
+      const rawPayload = text.slice(payloadStart, payloadEnd);
+      let payload;
+      try {
+        payload = JSON.parse('"' + rawPayload + '"');
+      } catch {
+        searchFrom = payloadEnd + 1;
+        continue;
+      }
+
+      const boundaryMatch = payload.match(/"l":"\\$@([0-9a-z]+)"/i);
+      if (!boundaryMatch) {
+        searchFrom = payloadEnd + 1;
+        continue;
+      }
+
+      const boundaryId = boundaryMatch[1];
+      let lineStart = payload.indexOf("\\n" + boundaryId + ":");
+      if (lineStart !== -1) {
+        lineStart += 1;
+      } else if (payload.startsWith(boundaryId + ":")) {
+        lineStart = 0;
+      }
+
+      if (lineStart === -1) {
+        searchFrom = payloadEnd + 1;
+        continue;
+      }
+
+      const lineStartBytes = encoder.encode(payload.slice(0, lineStart)).length;
+      const escapedLineNeedle = escapedNewline + boundaryId + ":";
+      let rawLineStart = rawPayload.indexOf(escapedLineNeedle);
+      let digitStart;
+      if (rawLineStart !== -1) {
+        digitStart = rawLineStart + escapedLineNeedle.length;
+      } else if (rawPayload.startsWith(boundaryId + ":")) {
+        rawLineStart = 0;
+        digitStart = boundaryId.length + 1;
+      } else {
+        searchFrom = payloadEnd + 1;
+        continue;
+      }
+
+      let digitEnd = digitStart;
+      while (
+        digitEnd < rawPayload.length &&
+        rawPayload.charCodeAt(digitEnd) >= 48 &&
+        rawPayload.charCodeAt(digitEnd) <= 57
+      ) {
+        digitEnd++;
+      }
+
+      if (digitEnd === digitStart) {
+        searchFrom = payloadEnd + 1;
+        continue;
+      }
+
+      const patchedRawPayload =
+        rawPayload.slice(0, digitStart) +
+        String(lineStartBytes) +
+        rawPayload.slice(digitEnd);
+      return encoder.encode(
+        text.slice(0, payloadStart) +
+        patchedRawPayload +
+        text.slice(payloadEnd)
+      );
+    }
+  }
+
+  return new ReadableStream({
+    type: "bytes",
+    async pull(controller) {
+      if (patched) {
+        const { done, value } = await reader.read();
+        if (done) {
+          controller.close();
+        } else {
+          controller.enqueue(value);
+        }
+        return;
+      }
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          if (totalLength > 0) {
+            const prefix = __creekMergeBytes(chunks, totalLength);
+            const out = patchPrefix(prefix) || prefix;
+            controller.enqueue(out);
+          }
+          controller.close();
+          patched = true;
+          return;
+        }
+
+        chunks.push(value);
+        totalLength += value.byteLength;
+        const prefix = __creekMergeBytes(chunks, totalLength);
+        const out = patchPrefix(prefix);
+        if (out) {
+          controller.enqueue(out);
+          chunks.length = 0;
+          totalLength = 0;
+          patched = true;
+          return;
+        }
+
+        if (totalLength >= MAX_PREFIX_BYTES) {
+          controller.enqueue(prefix);
+          chunks.length = 0;
+          totalLength = 0;
+          patched = true;
+          return;
+        }
+      }
     },
     cancel(reason) { return reader.cancel(reason); },
   });
@@ -3972,6 +4343,7 @@ async function __handleRequestInner(request, env, ctx) {
               const headers = new Headers(segmentRes.headers);
               headers.set("content-type", "text/x-component");
               headers.set("Vary", "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch");
+              headers.set("x-nextjs-postponed", "2");
               headers.set("x-nextjs-prerender", "1");
               headers.set("x-nextjs-deployment-id", DEPLOYMENT_ID);
               if (staticEntry?.cacheTags) {
@@ -4643,22 +5015,26 @@ async function __handleRequestInner(request, env, ctx) {
           } catch {}
         }
 
-        // Merge middleware-emitted response headers (Set-Cookie from
-        // \`NextResponse.next()\` / \`response.cookies.set()\` /
-        // \`draftMode().enable()\`) onto the edge handler's final response.
-        // Without this, edge API routes swallow Set-Cookie from middleware
-        // (node-runtime API routes + app pages go through \`invokeNodeHandler\`
-        // which already appends resolvedHeaders, so this only shows up on
-        // edge handlers). Fixes app-dir/app-middleware "Supports draft mode"
-        // for Edge Functions.
+        // Merge middleware-emitted response headers onto the edge handler's
+        // final response. The node bridge does this in flushHeaders(); edge
+        // handlers return a Web Response directly, so they need the same merge
+        // here or NextResponse.next({ headers }) silently disappears.
         const __applyMwResponseHeaders = (edgeRes) => {
           if (!(edgeRes instanceof Response)) return edgeRes;
           if (!result?.resolvedHeaders) return edgeRes;
           let touched = false;
           const merged = new Headers(edgeRes.headers);
           result.resolvedHeaders.forEach((val, key) => {
-            if (key.toLowerCase() === "set-cookie") {
+            const lower = key.toLowerCase();
+            if (lower === "set-cookie") {
               merged.append(key, val);
+              touched = true;
+            } else if (
+              lower !== "content-encoding" &&
+              lower !== "content-length" &&
+              lower !== "transfer-encoding"
+            ) {
+              merged.set(key, val);
               touched = true;
             }
           });
@@ -5044,7 +5420,7 @@ async function __handleRequestInner(request, env, ctx) {
       });
     }
   } catch {}
-  // Strip stale Content-Encoding from dynamic responses. Edge API routes
+  // Strip stale compressed Content-Encoding from dynamic responses. Edge API routes
   // commonly do \`fetch(remoteUrl)\` and forward the Response — fetch()
   // automatically decompresses brotli/gzip bodies, but the remote's
   // \`Content-Encoding: br\` header stays attached to the new Response.
@@ -5057,7 +5433,8 @@ async function __handleRequestInner(request, env, ctx) {
     if (
       response &&
       typeof response.headers?.has === "function" &&
-      response.headers.has("content-encoding")
+      response.headers.has("content-encoding") &&
+      response.headers.get("content-encoding") !== "identity"
     ) {
       const url2 = new URL(request.url);
       const isStaticAsset = url2.pathname.startsWith("/_next/static/") ||
@@ -5267,6 +5644,7 @@ function collectBootManifestPaths(manifests: Record<string, string>): string[] {
  */
 interface StaticPageEntry {
   assetPath: string;
+  routerType: "APP" | "PAGES";
   // App router pages that call notFound() / redirect() / permanentRedirect()
   // are pre-rendered to HTML at build time, but their HTTP status (404 / 307 /
   // 308) and redirect Location header live in the prerender metadata. The
@@ -5283,6 +5661,32 @@ interface StaticPageEntry {
   // a server action calls updateTag/revalidateTag on one of these tags,
   // the stale static asset is bypassed and the handler runs fresh.
   cacheTags?: string[];
+}
+
+function routePatternMatches(routePattern: string, pathname: string): boolean {
+  if (!routePattern.includes("[")) return routePattern === pathname;
+
+  const patternSegments = routePattern.split("/").filter(Boolean);
+  const pathSegments = pathname.split("/").filter(Boolean);
+  let pathIndex = 0;
+
+  for (const segment of patternSegments) {
+    if (segment.startsWith("[[...") && segment.endsWith("]]")) {
+      return true;
+    }
+    if (segment.startsWith("[...") && segment.endsWith("]")) {
+      return pathIndex < pathSegments.length;
+    }
+    if (segment.startsWith("[") && segment.endsWith("]")) {
+      if (pathIndex >= pathSegments.length) return false;
+      pathIndex++;
+      continue;
+    }
+    if (pathSegments[pathIndex] !== segment) return false;
+    pathIndex++;
+  }
+
+  return pathIndex === pathSegments.length;
 }
 
 // Collect paths whose build-time prerender has an ISR revalidate > 0 AND
@@ -5323,15 +5727,79 @@ function collectRevalidatePaths(outputs: BuildContext["outputs"]): string[] {
   return Array.from(paths);
 }
 
-function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, StaticPageEntry> {
+function serverActionWorkerKeyToPathname(workerKey: string): string | null {
+  if (!workerKey.startsWith("app/")) return null;
+  const parts = workerKey
+    .slice(4)
+    .split("/")
+    .filter((part) =>
+      part &&
+      part !== "page" &&
+      !part.startsWith("(") &&
+      !part.startsWith("@")
+    );
+  return parts.length === 0 ? "/" : "/" + parts.join("/");
+}
+
+function collectServerActionPagePathnames(manifests: Record<string, string>): Set<string> {
+  const pages = new Set<string>();
+  for (const [key, content] of Object.entries(manifests)) {
+    if (!key.replaceAll("\\", "/").endsWith("/server-reference-manifest.json")) continue;
+    try {
+      const manifest = JSON.parse(content) as {
+        node?: Record<string, { workers?: Record<string, unknown> }>;
+        edge?: Record<string, { workers?: Record<string, unknown> }>;
+      };
+      for (const actionMap of [manifest.node, manifest.edge]) {
+        if (!actionMap) continue;
+        for (const action of Object.values(actionMap)) {
+          if (!action?.workers) continue;
+          for (const workerKey of Object.keys(action.workers)) {
+            const pathname = serverActionWorkerKeyToPathname(workerKey);
+            if (pathname) pages.add(pathname);
+          }
+        }
+      }
+    } catch {
+      // Ignore malformed manifests; static fallback just stays disabled.
+    }
+  }
+  return pages;
+}
+
+function prerenderHtmlHasBoundServerAction(filePath: string | undefined): boolean {
+  if (!filePath) return false;
+  try {
+    const html = readFileSync(filePath, "utf-8");
+    return html.includes('$ACTION_REF_') || /\$ACTION_\d+:/u.test(html);
+  } catch {
+    return false;
+  }
+}
+
+function collectStaticPageMap(
+  outputs: BuildContext["outputs"],
+  serverActionPages: Set<string>,
+): Record<string, StaticPageEntry> {
   const map: Record<string, StaticPageEntry> = {};
+  const appPathnames = [
+    ...outputs.appPages.map((p) => stripRouteGroups(p.pathname)),
+    ...outputs.appRoutes.map((r) => stripRouteGroups(r.pathname)),
+  ];
+  const classifyRouterType = (pathname: string): StaticPageEntry["routerType"] => {
+    const normalized = stripRouteGroups(pathname);
+    return appPathnames.some((appPathname) => routePatternMatches(appPathname, normalized))
+      ? "APP"
+      : "PAGES";
+  };
+
   for (const file of outputs.staticFiles) {
     // Only include HTML pages, not _next/static/* assets. Use the bracket-aware
     // helper so dynamic segments like /catch-all/[...slug] aren't misclassified
     // as having a file extension.
     if (__isStaticPagePathname(file.pathname)) {
       const assetPath = path.join(file.pathname, "index.html");
-      const entry: StaticPageEntry = { assetPath };
+      const entry: StaticPageEntry = { assetPath, routerType: classifyRouterType(file.pathname) };
       // Map the original pathname
       map[file.pathname] = entry;
       // Also map normalized form: /index → /, /foo/index → /foo
@@ -5347,13 +5815,22 @@ function collectStaticPageMap(outputs: BuildContext["outputs"]): Record<string, 
     // PPR/postponed prerenders need the route handler so the shell can
     // stream and later resolve its dynamic segments. Serving their fallback
     // HTML directly from assets leaves the client stuck on the loading shell.
-    if (prerender.fallback.postponedState || prerender.pprChain?.headers) continue;
+    // Exception: a concrete Server Action page with PPR headers but no
+    // postponed state is fully static HTML whose form carries build-time
+    // encrypted bound args. Serve that HTML from assets so action POST resume
+    // sees the same bound payload that Next generated at build.
+    const staticServerActionPpr =
+      !prerender.fallback.postponedState &&
+      !!prerender.pprChain?.headers &&
+      serverActionPages.has(prerender.pathname) &&
+      prerenderHtmlHasBoundServerAction(prerender.fallback.filePath);
+    if (prerender.fallback.postponedState || (prerender.pprChain?.headers && !staticServerActionPpr)) continue;
 
     const assetPath = __isStaticPagePathname(prerender.pathname)
       ? path.join(prerender.pathname, "index.html")
       : prerender.pathname;
 
-    const entry: StaticPageEntry = { assetPath };
+    const entry: StaticPageEntry = { assetPath, routerType: classifyRouterType(prerender.pathname) };
     if (typeof prerender.fallback.initialStatus === "number") {
       entry.status = prerender.fallback.initialStatus;
     }
@@ -5427,7 +5904,10 @@ function collectPathnames(
 const NODE_BRIDGE_CODE = `
 import { EventEmitter } from "node:events";
 import { IncomingMessage as _IM, ServerResponse as _SR } from "http";
+import http from "node:http";
+import https from "node:https";
 import { Socket } from "net";
+import { PassThrough } from "node:stream";
 
 // Extend built-in IncomingMessage with buffered body support.
 // The built-in node:http IncomingMessage works for most cases but
@@ -5472,6 +5952,17 @@ class IncomingMessage extends _IM {
     return this;
   }
   resume() { this._startFlowing(); return super.resume(); }
+  pipe(dest, opts) {
+    if (dest?.__isRequestRequest) {
+      if (this.method && !dest.explicitMethod) dest.method = this.method;
+      if (this.headers) {
+        for (const key of Object.keys(this.headers)) {
+          if (!dest.hasHeader?.(key)) dest.setHeader?.(key, this.headers[key]);
+        }
+      }
+    }
+    return super.pipe(dest, opts);
+  }
   [Symbol.asyncIterator]() {
     // Ensure buffered body is flushed into the Readable before the
     // native iterator starts awaiting "readable" / "end" events.
@@ -5480,6 +5971,216 @@ class IncomingMessage extends _IM {
   }
 }
 const ServerResponse = _SR;
+
+function __creekIsLoopbackHost(hostname) {
+  return hostname === "localhost" ||
+    hostname === "127.0.0.1" ||
+    hostname === "::1" ||
+    hostname === "[::1]";
+}
+
+function __creekNormalizeHttpRequestArgs(input, options, cb, defaultProtocol) {
+  if (typeof options === "function") {
+    cb = options;
+    options = undefined;
+  }
+  const base =
+    input instanceof URL
+      ? Object.fromEntries(input.searchParams ? [] : [])
+      : {};
+  let opts = {};
+  if (typeof input === "string" || input instanceof URL) {
+    const parsed = new URL(String(input));
+    opts = {
+      protocol: parsed.protocol,
+      hostname: parsed.hostname,
+      port: parsed.port,
+      path: parsed.pathname + parsed.search,
+      href: parsed.href,
+      ...options,
+    };
+  } else if (input && typeof input === "object") {
+    opts = { ...input, ...options };
+  } else {
+    opts = { ...(options || {}) };
+  }
+
+  const protocol = opts.protocol || defaultProtocol;
+  const rawHost = opts.hostname || opts.host || "localhost";
+  const hostString = String(rawHost);
+  const hostname = opts.hostname
+    ? String(opts.hostname)
+    : hostString.startsWith("[")
+      ? hostString.slice(1, hostString.indexOf("]"))
+      : hostString.split(":")[0];
+  const hostPort = (() => {
+    if (opts.port != null && opts.port !== "") return String(opts.port);
+    const match = hostString.match(/:(\\d+)$/);
+    return match ? match[1] : "";
+  })();
+  const host = hostPort ? hostString.includes(":") && !opts.hostname ? hostString : hostname + ":" + hostPort : hostString;
+  const requestPath = opts.path || ((opts.pathname || "/") + (opts.search || ""));
+  const url = new URL(protocol + "//" + host + requestPath);
+  return { url, options: opts, callback: cb };
+}
+
+function __creekShouldFetchHttpRequest(url) {
+  let store = null;
+  try { store = __INTERNAL_FETCH_CONTEXT.getStore(); } catch {}
+  if (!store?.origin) return false;
+  let current;
+  try { current = new URL(store.origin); } catch { return false; }
+  if (url.protocol !== current.protocol) return false;
+  if (url.host === current.host) return true;
+  return __creekIsLoopbackHost(url.hostname) &&
+    __creekIsLoopbackHost(current.hostname) &&
+    (url.port || (url.protocol === "https:" ? "443" : "80")) ===
+      (current.port || (current.protocol === "https:" ? "443" : "80"));
+}
+
+async function __creekSameOriginFetch(url, init) {
+  let store = null;
+  try { store = __INTERNAL_FETCH_CONTEXT.getStore(); } catch {}
+  if (store?.env && store?.ctx && typeof __handleRequest === "function") {
+    return __handleRequest(new Request(url, init), store.env, store.ctx);
+  }
+  return fetch(url, init);
+}
+
+class CreekFetchClientRequest extends EventEmitter {
+  constructor(url, options, cb) {
+    super();
+    this.url = url;
+    this.options = options || {};
+    this.method = String(this.options.method || "GET").toUpperCase();
+    this.headers = new Headers(this.options.headers || {});
+    this.chunks = [];
+    this.finished = false;
+    this.destroyed = false;
+    this.writable = true;
+    if (typeof cb === "function") this.on("response", cb);
+    queueMicrotask(() => {
+      const socket = new EventEmitter();
+      socket.connecting = false;
+      socket._connecting = false;
+      socket.setTimeout = () => socket;
+      socket.destroy = () => {};
+      this.emit("socket", socket);
+    });
+  }
+  setHeader(name, value) { this.headers.set(name, String(value)); }
+  getHeader(name) { return this.headers.get(name); }
+  removeHeader(name) { this.headers.delete(name); }
+  setTimeout(_ms, cb) { if (typeof cb === "function") this.once("timeout", cb); return this; }
+  abort() { this.destroy(new Error("Request aborted")); }
+  destroy(err) {
+    if (this.destroyed) return this;
+    this.destroyed = true;
+    if (err) queueMicrotask(() => this.emit("error", err));
+    return this;
+  }
+  write(chunk, encoding, cb) {
+    if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
+    if (chunk != null) {
+      if (typeof chunk === "string") {
+        this.chunks.push(new TextEncoder().encode(chunk));
+      } else if (chunk instanceof Uint8Array) {
+        this.chunks.push(chunk);
+      } else {
+        this.chunks.push(new Uint8Array(chunk));
+      }
+    }
+    if (typeof cb === "function") queueMicrotask(cb);
+    return true;
+  }
+  end(chunk, encoding, cb) {
+    if (typeof chunk === "function") { cb = chunk; chunk = undefined; encoding = undefined; }
+    if (typeof encoding === "function") { cb = encoding; encoding = undefined; }
+    if (chunk != null) this.write(chunk, encoding);
+    if (typeof cb === "function") queueMicrotask(cb);
+    if (!this.finished) {
+      this.finished = true;
+      this._dispatch().catch((err) => this.destroy(err));
+    }
+    return this;
+  }
+  async _dispatch() {
+    if (this.destroyed) return;
+    const headers = new Headers(this.headers);
+    if (headers.has("accept-encoding")) headers.set("accept-encoding", "identity");
+    const bodyAllowed = this.method !== "GET" && this.method !== "HEAD";
+    let body;
+    if (bodyAllowed && this.chunks.length > 0) {
+      const total = this.chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+      const merged = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of this.chunks) {
+        merged.set(chunk, offset);
+        offset += chunk.length;
+      }
+      body = merged;
+      if (!headers.has("content-length")) headers.set("content-length", String(total));
+    }
+    const response = await __creekSameOriginFetch(this.url, {
+      method: this.method,
+      headers,
+      body,
+      redirect: "manual",
+    });
+    if (this.destroyed) return;
+    const res = new PassThrough();
+    res.socket = { authorized: true };
+    res.statusCode = response.status;
+    res.statusMessage = response.statusText || "";
+    res.responseUrl = response.url || this.url.href;
+    res.headers = {};
+    res.rawHeaders = [];
+    response.headers.forEach((value, key) => {
+      res.headers[key.toLowerCase()] = value;
+      res.rawHeaders.push(key, value);
+    });
+    this.emit("response", res);
+    try {
+      if (response.body) {
+        const reader = response.body.getReader();
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          res.write(Buffer.from(value));
+        }
+      }
+      res.end();
+    } catch (err) {
+      res.emit("error", err);
+    }
+  }
+}
+
+function __creekPatchHttpModule(mod, defaultProtocol) {
+  if (!mod || mod.__creekFetchPatched) return;
+  const nativeRequest = mod.request.bind(mod);
+  const nativeGet = mod.get?.bind(mod);
+  mod.request = function(input, options, cb) {
+    const normalized = __creekNormalizeHttpRequestArgs(input, options, cb, defaultProtocol);
+    if (__creekShouldFetchHttpRequest(normalized.url)) {
+      return new CreekFetchClientRequest(normalized.url, normalized.options, normalized.callback);
+    }
+    return nativeRequest(input, options, cb);
+  };
+  if (nativeGet) {
+    mod.get = function(input, options, cb) {
+      const req = mod.request(input, options, cb);
+      req.end();
+      return req;
+    };
+  }
+  mod.__creekFetchPatched = true;
+}
+
+try {
+  __creekPatchHttpModule(http, "http:");
+  __creekPatchHttpModule(https, "https:");
+} catch {}
 
 function decodeRouteParam(value) {
   if (typeof value !== "string") return value;
@@ -6141,11 +6842,56 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     // \`res.setHeader\`, the downstream HTTP layer truncates the body to
     // match the (now-stale) length, cutting off the tail of __NEXT_DATA__
     // and producing "Unterminated string in JSON" client errors.
-    const ctLower = String(h.get("content-type") || "").toLowerCase();
+    let ctLower = String(h.get("content-type") || "").toLowerCase();
+    // Server Action redirects to Pages Router routes intentionally do not
+    // have a valid Flight payload. If the outer action response keeps
+    // text/x-component, the client tries to apply an empty/invalid RSC stream
+    // and lands in the App Router error UI instead of hard-navigating.
+    const actionRedirect = h.get("x-action-redirect");
+    if (actionRedirect) {
+      const redirectTarget = actionRedirect.split(";")[0] || "";
+      try {
+        const redirectUrl = new URL(redirectTarget, url.origin);
+        if (redirectUrl.origin === url.origin) {
+          const redirectPath = redirectUrl.pathname || "/";
+          const staticPageRedirect =
+            STATIC_PAGES[redirectPath] ||
+            (redirectPath !== "/" && redirectPath.endsWith("/")
+              ? STATIC_PAGES[redirectPath.slice(0, -1)]
+              : undefined);
+          const redirectHandler =
+            HANDLERS[redirectPath] ||
+            (redirectPath !== "/" && redirectPath.endsWith("/")
+              ? HANDLERS[redirectPath.slice(0, -1)]
+              : undefined) ||
+            HANDLERS[redirectPath + "/index"];
+          if (staticPageRedirect?.routerType === "PAGES" || redirectHandler?.type === "PAGES") {
+            h.set("content-type", "text/plain;charset=UTF-8");
+            ctLower = "text/plain;charset=utf-8";
+            h.delete("content-length");
+          }
+        }
+      } catch {}
+    }
+    // App Page RSC requests must be exposed to the browser as Flight
+    // payloads. When cacheComponents serves an SSG/ISR RSC payload from
+    // Next's incremental cache, the body can be Flight while the inherited
+    // cached HTML metadata still says text/html. The App Router client treats
+    // non-Flight content-types as MPA navigations, so it never learns/writes
+    // the segment cache from the navigation response.
+    if (handlerType === "APP_PAGE" && isRSCRequest && !actionRedirect) {
+      h.set("content-type", "text/x-component");
+      h.delete("content-length");
+      ctLower = "text/x-component";
+    }
     if (ctLower.includes("text/html")) {
       h.delete("content-length");
     }
-    // Disable auto-compression for streaming RSC / Server-Action responses.
+    // Disable auto-compression for responses where the body can be produced
+    // before Next.js's background waitUntil work completes. Miniflare's HTTP
+    // proxy buffers gzip output until EOF, so a small JSON App Route response
+    // can be ready immediately but not reach the test client until a stale
+    // fetch revalidation finishes and the stream closes.
     // When content-type is text/x-component (Flight payload) the body is a
     // React-RSC stream that must reach the browser chunk-by-chunk; Miniflare's
     // HTTP layer otherwise buffers the whole response to apply gzip based on
@@ -6157,15 +6903,40 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     // \`Content-Encoding: identity\` is the HTTP-spec way to opt out of
     // encoding and takes precedence over \`encodeBody: "manual"\` in the
     // dev-server HTTP proxy. Leave compression enabled for other content
-    // types so HTML / JSON / assets still gzip normally.
+    // types so HTML / Pages JSON / assets still gzip normally.
+    const shouldUseIdentityEncoding =
+      ctLower.includes("text/x-component") ||
+      ctLower.includes("text/event-stream") ||
+      (handlerType === "APP_ROUTE" && ctLower.includes("application/json"));
     if (
       !responseDisallowsBody &&
       !h.has("content-encoding") &&
-      (ctLower.includes("text/x-component") || ctLower.includes("text/event-stream"))
+      shouldUseIdentityEncoding
     ) {
       h.set("content-encoding", "identity");
     }
-    const body = responseDisallowsBody ? null : readable;
+    let body = responseDisallowsBody ? null : readable;
+    if (
+      body &&
+      handlerType === "APP_PAGE" &&
+      isRSCRequest &&
+      !actionRedirect &&
+      ctLower.includes("text/x-component")
+    ) {
+      body = __creekPatchFlightStaticBoundaryStream(body);
+      h.delete("content-length");
+    }
+    if (
+      body &&
+      handlerType === "APP_PAGE" &&
+      !isRSCRequest &&
+      !actionRedirect &&
+      ctLower.includes("text/html") &&
+      h.get("x-nextjs-postponed") === "1"
+    ) {
+      body = __creekPatchHtmlFlightStaticBoundaryStream(body);
+      h.delete("content-length");
+    }
     const init = {
       status,
       statusText: res.statusMessage || "",
