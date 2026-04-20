@@ -1,0 +1,307 @@
+diff --git a/test/e2e/app-dir/actions-allowed-origins/app-action-disallowed-origins.test.ts b/test/e2e/app-dir/actions-allowed-origins/app-action-disallowed-origins.test.ts
+index a3db53effb..5eb809b006 100644
+--- a/test/e2e/app-dir/actions-allowed-origins/app-action-disallowed-origins.test.ts
++++ b/test/e2e/app-dir/actions-allowed-origins/app-action-disallowed-origins.test.ts
+@@ -25,7 +25,7 @@ describe('app-dir action disallowed origins', () => {
+       const t = await browser.elementByCss('#res').text()
+       return t.includes('Invalid Server Actions request.') ||
+         // In prod the message is hidden
+-        t.includes('https://react.dev/errors/441')
++        t.includes('An error occurred in the Server Components render.')
+         ? 'yes'
+         : 'no'
+     }, 'yes')
+diff --git a/test/e2e/app-dir/actions/app-action.test.ts b/test/e2e/app-dir/actions/app-action.test.ts
+index e4adb0640c..0af078fbab 100644
+--- a/test/e2e/app-dir/actions/app-action.test.ts
++++ b/test/e2e/app-dir/actions/app-action.test.ts
+@@ -11,7 +11,7 @@ import fs from 'node:fs/promises'
+ import { join } from 'node:path'
+ 
+ const GENERIC_RSC_ERROR =
+-  'Error: Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++  'Error: An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+ 
+ describe('app-dir action handling', () => {
+   const { next, isNextDev, isNextStart, isNextDeploy, isTurbopack } =
+diff --git a/test/e2e/app-dir/catch-error/catch-error-react-compiler.test.ts b/test/e2e/app-dir/catch-error/catch-error-react-compiler.test.ts
+index 15fcaeb0bd..5e490a4369 100644
+--- a/test/e2e/app-dir/catch-error/catch-error-react-compiler.test.ts
++++ b/test/e2e/app-dir/catch-error/catch-error-react-compiler.test.ts
+@@ -73,7 +73,7 @@ _describe('app-dir - unstable_catchError with react compiler', () => {
+     expect(await browser.elementByCss('#error-boundary-message').text()).toBe(
+       isNextDev
+         ? 'this is a test'
+-        : 'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++        : 'An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+     )
+ 
+     await browser.elementByCss('#retry').click().waitForElementByCss('#recover')
+diff --git a/test/e2e/app-dir/catch-error/catch-error.test.ts b/test/e2e/app-dir/catch-error/catch-error.test.ts
+index 20ba393e61..d3f9ad36ae 100644
+--- a/test/e2e/app-dir/catch-error/catch-error.test.ts
++++ b/test/e2e/app-dir/catch-error/catch-error.test.ts
+@@ -61,7 +61,7 @@ describe('app-dir - unstable_catchError', () => {
+     expect(await browser.elementByCss('#error-boundary-message').text()).toBe(
+       isNextDev
+         ? 'this is a test'
+-        : 'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++        : 'An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+     )
+ 
+     await browser.elementByCss('#retry').click().waitForElementByCss('#recover')
+diff --git a/test/e2e/app-dir/errors/index.test.ts b/test/e2e/app-dir/errors/index.test.ts
+index e45d61a10e..90c69833a2 100644
+--- a/test/e2e/app-dir/errors/index.test.ts
++++ b/test/e2e/app-dir/errors/index.test.ts
+@@ -54,7 +54,7 @@ describe('app-dir - errors', () => {
+       ).toBe(
+         isNextDev
+           ? 'this is a test'
+-          : 'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++          : 'An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+       )
+       expect(
+         await browser.waitForElementByCss('#error-boundary-digest').text()
+@@ -79,7 +79,7 @@ describe('app-dir - errors', () => {
+       ).toBe(
+         isNextDev
+           ? 'this is a test'
+-          : 'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++          : 'An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+       )
+       expect(
+         await browser.waitForElementByCss('#error-boundary-digest').text()
+@@ -102,7 +102,7 @@ describe('app-dir - errors', () => {
+       ).toBe(
+         isNextDev
+           ? 'undefined'
+-          : 'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++          : 'An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+       )
+       expect(
+         await browser.waitForElementByCss('#error-boundary-digest').text()
+@@ -137,7 +137,7 @@ describe('app-dir - errors', () => {
+       ).toBe(
+         isNextDev
+           ? 'null'
+-          : 'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++          : 'An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+       )
+       expect(
+         await browser.waitForElementByCss('#error-boundary-digest').text()
+@@ -172,7 +172,7 @@ describe('app-dir - errors', () => {
+       ).toBe(
+         isNextDev
+           ? 'this is a test'
+-          : 'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++          : 'An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+       )
+       expect(
+         await browser.waitForElementByCss('#error-boundary-digest').text()
+@@ -271,7 +271,9 @@ describe('app-dir - errors', () => {
+         expect.objectContaining({
+           message: isNextDev
+             ? 'custom server error'
+-            : 'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.',
++            : 'An error occurred in the Server Components render. ' +
++              'The specific message is omitted in production builds to avoid leaking sensitive details. ' +
++              'A digest property is included on this error instance which may provide additional details about the nature of the error.',
+         }),
+       ])
+     })
+@@ -372,7 +374,7 @@ describe('app-dir - errors', () => {
+         ).toBe(
+           isNextDev
+             ? 'this is a test'
+-            : 'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++            : 'An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+         )
+ 
+         // Enable recovery via globalThis.__nextTestRecover
+diff --git a/test/e2e/app-dir/global-error/basic/index.test.ts b/test/e2e/app-dir/global-error/basic/index.test.ts
+index d49cd5aca2..21e93827b1 100644
+--- a/test/e2e/app-dir/global-error/basic/index.test.ts
++++ b/test/e2e/app-dir/global-error/basic/index.test.ts
+@@ -55,7 +55,7 @@ describe('app dir - global-error', () => {
+     expect(await browser.elementByCss('#error').text()).toBe(
+       isNextDev
+         ? 'Global error: server page error'
+-        : 'Global error: Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++        : 'Global error: An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+     )
+     expect(await browser.elementByCss('#digest').text()).toMatch(/\w+/)
+   })
+@@ -117,7 +117,7 @@ describe('app dir - global-error', () => {
+     expect(await browser.elementByCss('#error').text()).toBe(
+       isNextDev
+         ? 'Global error: Metadata error'
+-        : 'Global error: Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++        : 'Global error: An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+     )
+   })
+ 
+diff --git a/test/e2e/app-dir/global-error/layout-error/index.test.ts b/test/e2e/app-dir/global-error/layout-error/index.test.ts
+index fc5636efef..bc73c994dd 100644
+--- a/test/e2e/app-dir/global-error/layout-error/index.test.ts
++++ b/test/e2e/app-dir/global-error/layout-error/index.test.ts
+@@ -33,7 +33,7 @@ describe('app dir - global error - layout error', () => {
+     expect(await browser.elementByCss('#error').text()).toBe(
+       isNextDev
+         ? 'Global error: layout error'
+-        : 'Global error: Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++        : 'Global error: An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+     )
+     expect(await browser.elementByCss('#digest').text()).toMatch(/\w+/)
+   })
+diff --git a/test/e2e/app-dir/log-file/app/client/page.tsx b/test/e2e/app-dir/log-file/app/client/page.tsx
+index a8ef33ab83..ca2414d7b1 100644
+--- a/test/e2e/app-dir/log-file/app/client/page.tsx
++++ b/test/e2e/app-dir/log-file/app/client/page.tsx
+@@ -1,10 +1,10 @@
+ 'use client'
+ 
+-import { useInsertionEffect } from 'react'
++import { useEffect } from 'react'
+ 
+ export default function ClientPage() {
+-  useInsertionEffect(() => {
+-    // Logging in client component useInsertionEffect
++  useEffect(() => {
++    // Logging in client component useEffect
+     // Test complex partial circular object
+     const circularObj: any = {
+       name: 'test',
+diff --git a/test/e2e/app-dir/log-file/log-file.test.ts b/test/e2e/app-dir/log-file/log-file.test.ts
+index a046aad5f2..e536dfb62d 100644
+--- a/test/e2e/app-dir/log-file/log-file.test.ts
++++ b/test/e2e/app-dir/log-file/log-file.test.ts
+@@ -137,8 +137,8 @@ describe('log-file', () => {
+         // Only browser only logs are being forwarded to terminal
+         expect(newLogContent).toMatchInlineSnapshot(`
+          "{"timestamp":"xx:xx:xx.xxx","source":"Browser","level":"LOG","message":"Client: Complex circular object: {\\"data\\":{\\"nested\\":{\\"items\\":[1,2,3],\\"value\\":42},\\"parent\\":\\"[Circular]\\"},\\"metadata\\":{\\"name\\":\\"safe stringify\\",\\"version\\":\\"1.0.0\\"},\\"name\\":\\"test\\"}"}
+-         {"timestamp":"xx:xx:xx.xxx","source":"Browser","level":"ERROR","message":"Client: This is an error message from client component \\n    at ClientPage.useInsertionEffect (app/client/page.tsx:25:13)\\n  23 |     circularObj.data.parent = circularObj\\n  24 |     console.log('Client: Complex circular object:', circularObj)\\n> 25 |     console.error('Client: This is an error message from client component')\\n     |             ^\\n  26 |     console.warn('Client: This is a warning message from client component')\\n  27 |   }, [])\\n  28 | (app/client/page.tsx:25:13)"}
+-         {"timestamp":"xx:xx:xx.xxx","source":"Server","level":"ERROR","message":"[browser] \\"Client: This is an error message from client component\\" \\"\\\\n    at ClientPage.useInsertionEffect (app/client/page.tsx:25:13)\\\\n  23 |     circularObj.data.parent = circularObj\\\\n  24 |     console.log('Client: Complex circular object:', circularObj)\\\\n> 25 |     console.error('Client: This is an error message from client component')\\\\n     |             ^\\\\n  26 |     console.warn('Client: This is a warning message from client component')\\\\n  27 |   }, [])\\\\n  28 |\\" \\"(app/client/page.tsx:25:13)\\""}
++         {"timestamp":"xx:xx:xx.xxx","source":"Browser","level":"ERROR","message":"Client: This is an error message from client component \\n    at ClientPage.useEffect (app/client/page.tsx:25:13)\\n  23 |     circularObj.data.parent = circularObj\\n  24 |     console.log('Client: Complex circular object:', circularObj)\\n> 25 |     console.error('Client: This is an error message from client component')\\n     |             ^\\n  26 |     console.warn('Client: This is a warning message from client component')\\n  27 |   }, [])\\n  28 | (app/client/page.tsx:25:13)"}
++         {"timestamp":"xx:xx:xx.xxx","source":"Server","level":"ERROR","message":"[browser] \\"Client: This is an error message from client component\\" \\"\\\\n    at ClientPage.useEffect (app/client/page.tsx:25:13)\\\\n  23 |     circularObj.data.parent = circularObj\\\\n  24 |     console.log('Client: Complex circular object:', circularObj)\\\\n> 25 |     console.error('Client: This is an error message from client component')\\\\n     |             ^\\\\n  26 |     console.warn('Client: This is a warning message from client component')\\\\n  27 |   }, [])\\\\n  28 |\\" \\"(app/client/page.tsx:25:13)\\""}
+          {"timestamp":"xx:xx:xx.xxx","source":"Browser","level":"WARN","message":"Client: This is a warning message from client component"}
+          {"timestamp":"xx:xx:xx.xxx","source":"Server","level":"WARN","message":"[browser] \\"Client: This is a warning message from client component\\" \\"(app/client/page.tsx:26:13)\\""}"
+         `)
+diff --git a/test/e2e/app-dir/navigation/app/search-params/[foo]/page.js b/test/e2e/app-dir/navigation/app/search-params/[foo]/page.js
+index a5bee257a4..b4aa44f53a 100644
+--- a/test/e2e/app-dir/navigation/app/search-params/[foo]/page.js
++++ b/test/e2e/app-dir/navigation/app/search-params/[foo]/page.js
+@@ -1,12 +1,13 @@
+ 'use client'
+ import { useParams, useRouter } from 'next/navigation'
+-import { useInsertionEffect, useState } from 'react'
++import { useState } from 'react'
++import { useEffect } from 'react'
+ 
+ export default function Page() {
+   const params = useParams()
+   const router = useRouter()
+   const [count, setCount] = useState(0)
+-  useInsertionEffect(() => {
++  useEffect(() => {
+     console.log('params changed')
+   }, [params])
+   return (
+diff --git a/test/e2e/app-dir/navigation/app/use-router/navigate.js b/test/e2e/app-dir/navigation/app/use-router/navigate.js
+index e36c48fec3..b6d09adeb2 100644
+--- a/test/e2e/app-dir/navigation/app/use-router/navigate.js
++++ b/test/e2e/app-dir/navigation/app/use-router/navigate.js
+@@ -1,16 +1,14 @@
+ 'use client'
+ import { useRouter } from 'next/navigation'
+-import { useState } from 'react'
++import { useEffect, useState } from 'react'
+ 
+ export function NavigateAndTrackRouterIdentity({ href }) {
+   const router = useRouter()
+-  const [prevRouter, setPrevRouter] = useState(router)
+ 
+-  const [changedCount, setChangedCount] = useState(0)
+-  if (prevRouter !== router) {
+-    setPrevRouter(router)
++  const [changedCount, setChangedCount] = useState(-1)
++  useEffect(() => {
+     setChangedCount((p) => p + 1)
+-  }
++  }, [router])
+ 
+   const [navigationCount, setNavigationCount] = useState(0)
+   const navigate = () => {
+diff --git a/test/e2e/app-dir/navigation/navigation.test.ts b/test/e2e/app-dir/navigation/navigation.test.ts
+index 1b17ea17cb..50ae883365 100644
+--- a/test/e2e/app-dir/navigation/navigation.test.ts
++++ b/test/e2e/app-dir/navigation/navigation.test.ts
+@@ -85,7 +85,9 @@ describe('app dir - navigation', () => {
+           router: 'app',
+           pathname: '/search-params/foo',
+           // App Router doesn't re-render on initial load (the params are baked
+-          // server side).
++          // server side). In development, effects will render twice.
++
++          // TODO: modern StrictMode does not double invoke effects during hydration: https://github.com/facebook/react/pull/28951
+           waitForNEffects: 1,
+         },
+         {
+diff --git a/test/e2e/app-dir/navigation/pages/search-params-pages/[foo]/index.js b/test/e2e/app-dir/navigation/pages/search-params-pages/[foo]/index.js
+index 34a925d1e0..a7e85fb338 100644
+--- a/test/e2e/app-dir/navigation/pages/search-params-pages/[foo]/index.js
++++ b/test/e2e/app-dir/navigation/pages/search-params-pages/[foo]/index.js
+@@ -1,11 +1,12 @@
+ import { useParams, useRouter } from 'next/navigation'
+-import { useState, useInsertionEffect } from 'react'
++import { useState } from 'react'
++import { useEffect } from 'react'
+ 
+ export default function Page() {
+   const params = useParams()
+   const router = useRouter()
+   const [count, setCount] = useState(0)
+-  useInsertionEffect(() => {
++  useEffect(() => {
+     console.log('params changed')
+   }, [params])
+   return (
+diff --git a/test/e2e/app-dir/segment-cache/prefetch-runtime/prefetch-runtime.test.ts b/test/e2e/app-dir/segment-cache/prefetch-runtime/prefetch-runtime.test.ts
+index c240d7b355..5f3f709e4b 100644
+--- a/test/e2e/app-dir/segment-cache/prefetch-runtime/prefetch-runtime.test.ts
++++ b/test/e2e/app-dir/segment-cache/prefetch-runtime/prefetch-runtime.test.ts
+@@ -1081,7 +1081,7 @@ describe('runtime prefetching', () => {
+         STATIC_CONTENT
+       )
+       expect(await browser.elementById('error-boundary').text()).toInclude(
+-        'Error boundary: Minified React error #441;'
++        'Error boundary: An error occurred in the Server Components render'
+       )
+     })
+   })
+diff --git a/test/e2e/app-dir/taint/process-taint.test.ts b/test/e2e/app-dir/taint/process-taint.test.ts
+index cbba0a5cf9..f53091bdbe 100644
+--- a/test/e2e/app-dir/taint/process-taint.test.ts
++++ b/test/e2e/app-dir/taint/process-taint.test.ts
+@@ -1,7 +1,7 @@
+ import { nextTestSetup } from 'e2e-utils'
+ 
+ const GENERIC_RSC_ERROR =
+-  'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++  'An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+ 
+ export function runTest({ next, isNextDev }) {
+   it('should error when passing process env to client component', async () => {
+diff --git a/test/e2e/app-dir/use-cache/use-cache.test.ts b/test/e2e/app-dir/use-cache/use-cache.test.ts
+index 4b87f3c852..802425d6b9 100644
+--- a/test/e2e/app-dir/use-cache/use-cache.test.ts
++++ b/test/e2e/app-dir/use-cache/use-cache.test.ts
+@@ -14,7 +14,7 @@ import {
+ import { PrerenderManifest } from 'next/dist/build'
+ 
+ const GENERIC_RSC_ERROR =
+-  'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
++  'An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+ 
+ const withCacheComponents = process.env.__NEXT_CACHE_COMPONENTS === 'true'
+ 

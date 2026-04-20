@@ -36,3 +36,26 @@ with a warning rather than failing.
   ([Datadog metric linked in the PR](https://github.com/vercel/next.js/pull/91734)) —
   unflaking is a test-only change.
 - **When to drop**: once our pinned Next.js ref includes `c53f5863e3`.
+
+### `0002-revert-react-441-test-expectations.patch`
+
+- **Upstream commit this reverts**: `4fc3664eed` — [vercel/next.js#92945](https://github.com/vercel/next.js/pull/92945)
+  ("Upgrade React from `fef12a01-20260413` to `da9325b5-20260417`")
+- **Date of upstream**: 2026-04-20
+- **What**: reverts the test expectation from `Minified React error #441`
+  back to `An error occurred in the Server Components render. The
+  specific message is omitted...`. The React upgrade that produces the
+  `#441` format landed on canary branch on Apr 20 but hasn't been
+  published as a `next@canary` npm tag yet — the current published tag
+  (`next@16.3.0-canary.2`, cut Apr 18) still bundles the older React.
+  The test harness installs `next` from npm (`pnpm install`), so even
+  when our local `nextjs/` checkout is canary HEAD, the fixture ends up
+  with the older compiled React and produces the older error text.
+- **When to drop**: once `npm view next@canary` returns a version
+  that includes commit `4fc3664eed`. Verify with:
+  ```
+  npm pack next@canary --pack-destination /tmp
+  tar -xzf /tmp/next-*.tgz -C /tmp/next-check --strip-components=1
+  grep -l "Minified React error #441" /tmp/next-check/dist/compiled/react-server-dom-webpack*/cjs/*.browser.production.js
+  ```
+  If that grep finds a match, the patch is no longer needed.
