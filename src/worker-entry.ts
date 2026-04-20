@@ -4546,6 +4546,12 @@ async function __handleRequestInner(request, env, ctx) {
               headers.set("x-nextjs-postponed", "2");
               headers.set("x-nextjs-prerender", "1");
               headers.set("x-nextjs-deployment-id", DEPLOYMENT_ID);
+              // Match vanilla's \`Cache-Control: s-maxage=31536000\` for
+              // prerendered RSC segments. The Workers Assets default of
+              // \`public, max-age=0, must-revalidate\` makes the browser
+              // revalidate on every reuse, which bypasses the Next client's
+              // segment cache on some transitions.
+              headers.set("cache-control", "s-maxage=31536000");
               if (staticEntry?.cacheTags) {
                 headers.set("x-next-cache-tags", String(staticEntry.cacheTags));
               }
@@ -4568,12 +4574,28 @@ async function __handleRequestInner(request, env, ctx) {
               const headers = new Headers(rscRes.headers);
               headers.set("content-type", "text/x-component");
               headers.set("Vary", "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch");
-              const staleTime = staticEntry?.initialRevalidate;
-              if (typeof staleTime === "number") {
-                headers.set("x-nextjs-stale-time", String(staleTime));
+              // Prefer the build-time stale-time (from \`.meta\` sidecar) —
+              // that's what vanilla sends. Fallback to the ISR revalidate
+              // window for routes configured with \`revalidate\`.
+              const staleTime =
+                staticEntry?.staleTime ??
+                (typeof staticEntry?.initialRevalidate === "number"
+                  ? String(staticEntry.initialRevalidate)
+                  : undefined);
+              if (staleTime) {
+                headers.set("x-nextjs-stale-time", staleTime);
               }
               headers.set("x-nextjs-prerender", "1");
               headers.set("x-nextjs-deployment-id", DEPLOYMENT_ID);
+              // Match vanilla's \`Cache-Control: s-maxage=31536000\` for
+              // prerendered RSC so the browser/CDN reuses the response for
+              // the full TTL. The Workers Assets default forces revalidation
+              // on every load, which defeats the Next client's prefetch
+              // cache-key alignment on URL-encoded query params (\`%20\`
+              // matches on cache lookup but the wrapping fetch treated the
+              // entry as stale, pushing navigation through a second resolve
+              // step that missed the sync DOM-update window).
+              headers.set("cache-control", "s-maxage=31536000");
               if (staticEntry?.cacheTags) {
                 headers.set("x-next-cache-tags", String(staticEntry.cacheTags));
               }
@@ -5861,6 +5883,13 @@ interface StaticPageEntry {
   // a server action calls updateTag/revalidateTag on one of these tags,
   // the stale static asset is bypassed and the handler runs fresh.
   cacheTags?: string[];
+  // \`x-nextjs-stale-time\` value from the build-time \`.meta\` sidecar.
+  // Vanilla Next sends this on every prerendered RSC (default 300s for
+  // static routes). Without it the Next client falls back to its 5-minute
+  // internal default, but the missing header removes a signal the segment
+  // cache reconciles entries with — matching vanilla keeps client cache
+  // behavior identical, which matters for prefetch-hit-then-click flows.
+  staleTime?: string;
 }
 
 function routePatternMatches(routePattern: string, pathname: string): boolean {
@@ -5995,15 +6024,27 @@ function collectStaticPageMap(
   // Fixes resume-data-cache's \`expect(random2).not.toBe(first)\`
   // post-revalidation assertion for \`'use cache'\` pages.
   const cacheTagsByPathname = new Map<string, string[]>();
+  const staleTimeByPathname = new Map<string, string>();
   for (const pe of prerenderEntries) {
     const raw = pe.metaHeaders?.["x-next-cache-tags"] ?? pe.initialHeaders?.["x-next-cache-tags"];
-    if (typeof raw !== "string" || raw.length === 0) continue;
-    const tags = raw.split(",").map((t) => t.trim()).filter(Boolean);
-    if (tags.length > 0) cacheTagsByPathname.set(pe.pathname, tags);
+    if (typeof raw === "string" && raw.length > 0) {
+      const tags = raw.split(",").map((t) => t.trim()).filter(Boolean);
+      if (tags.length > 0) cacheTagsByPathname.set(pe.pathname, tags);
+    }
+    const st = pe.metaHeaders?.["x-nextjs-stale-time"] ?? pe.initialHeaders?.["x-nextjs-stale-time"];
+    if (typeof st === "string" && st.length > 0) {
+      staleTimeByPathname.set(pe.pathname, st);
+    } else if (typeof st === "number") {
+      staleTimeByPathname.set(pe.pathname, String(st));
+    }
   }
   const applyCacheTags = (pathname: string, entry: StaticPageEntry) => {
     const tags = cacheTagsByPathname.get(pathname);
     if (tags && !entry.cacheTags) entry.cacheTags = tags;
+  };
+  const applyStaleTime = (pathname: string, entry: StaticPageEntry) => {
+    const st = staleTimeByPathname.get(pathname);
+    if (st && !entry.staleTime) entry.staleTime = st;
   };
   const appPathnames = [
     ...outputs.appPages.map((p) => stripRouteGroups(p.pathname)),
@@ -6024,12 +6065,14 @@ function collectStaticPageMap(
       const assetPath = path.join(file.pathname, "index.html");
       const entry: StaticPageEntry = { assetPath, routerType: classifyRouterType(file.pathname) };
       applyCacheTags(file.pathname, entry);
+      applyStaleTime(file.pathname, entry);
       // Map the original pathname
       map[file.pathname] = entry;
       // Also map normalized form: /index → /, /foo/index → /foo
       if (file.pathname.endsWith("/index")) {
         const parent = file.pathname.slice(0, -6) || "/";
         applyCacheTags(parent, entry);
+        applyStaleTime(parent, entry);
         map[parent] = entry;
       }
     }
@@ -6077,6 +6120,7 @@ function collectStaticPageMap(
     if (typeof cacheTagsHeader === "string" && cacheTagsHeader.length > 0) {
       entry.cacheTags = cacheTagsHeader.split(",").map((t) => t.trim()).filter(Boolean);
     }
+    applyStaleTime(prerender.pathname, entry);
     // ISR revalidation period: if > 0, the page should NOT be served
     // indefinitely from static assets — after the revalidate window
     // the handler must re-run getStaticProps. We store this on the
