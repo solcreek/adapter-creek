@@ -902,34 +902,41 @@ export interface PrerenderEntry {
  */
 async function collectPrerenderEntries(outputs: BuildContext["outputs"]): Promise<PrerenderEntry[]> {
   const entries: PrerenderEntry[] = [];
-  // Limit PPR entries to prevent oversized worker bundles.
-  // Large apps can have hundreds of prerenders, each with full HTML.
-  const MAX_PRERENDER_ENTRIES = 50;
-
+  // The Next adapter emits one \`prerenders\` entry per output file — including
+  // \`.rsc\` sidecars and \`.segments/*.segment.rsc\` fragments. Those aren't
+  // standalone page cache entries, they're assets fetched via the page seed.
+  // Filter to \`.html\` fallbacks so the prerender map only indexes actual
+  // page keys (e.g. \`/memory-pressure/30\`, not \`/memory-pressure/30.rsc\`).
   for (const prerender of outputs.prerenders) {
-    if (!prerender.fallback?.filePath) continue;
+    const fallback = prerender.fallback;
+    if (!fallback?.filePath || !fallback.filePath.endsWith(".html")) continue;
     const hasPostponedState =
-      typeof prerender.fallback.postponedState === "string" &&
-      prerender.fallback.postponedState.length > 0;
+      typeof fallback.postponedState === "string" &&
+      fallback.postponedState.length > 0;
     const hasPprHeaders = !!prerender.pprChain?.headers;
-    if (!hasPostponedState && !hasPprHeaders) continue;
-    if (entries.length >= MAX_PRERENDER_ENTRIES) break;
+    const isPprChain = hasPostponedState || hasPprHeaders;
+    // Skip bracket-form fallback shells — they're handled via the
+    // \`__CREEK_POSTPONED_BY_SHELL\` regex map, not as direct page seeds.
+    if (!isPprChain && prerender.pathname.includes("[")) continue;
 
     try {
-      const html = await fs.readFile(prerender.fallback.filePath, "utf-8");
-      const stat = await fs.stat(prerender.fallback.filePath).catch(() => null);
-      const metaPath = prerender.fallback.filePath.replace(/\.(html|body)$/, ".meta");
+      const stat = await fs.stat(fallback.filePath).catch(() => null);
+      const metaPath = fallback.filePath.replace(/\.(html|body)$/, ".meta");
       const meta = await fs.readFile(metaPath, "utf-8")
         .then((raw) => JSON.parse(raw))
         .catch(() => null);
+      // Never inline HTML into the worker bundle — it can be multi-MB
+      // (e.g. memory-pressure pages are ~2MB each). \`__creekSeededAppPageEntry\`
+      // fetches HTML and RSC from the assets bucket at request time. The seed
+      // only carries the metadata needed to reconstruct the cache entry shape.
       entries.push({
         pathname: prerender.pathname,
-        html,
-        postponedState: prerender.fallback.postponedState,
-        initialRevalidate: prerender.fallback.initialRevalidate,
-        initialStatus: prerender.fallback.initialStatus,
-        initialHeaders: prerender.fallback.initialHeaders,
-        initialExpiration: prerender.fallback.initialExpiration,
+        html: "",
+        postponedState: fallback.postponedState,
+        initialRevalidate: fallback.initialRevalidate,
+        initialStatus: fallback.initialStatus,
+        initialHeaders: fallback.initialHeaders,
+        initialExpiration: fallback.initialExpiration,
         pprHeaders: prerender.pprChain?.headers,
         lastModified: stat?.mtimeMs,
         segmentPaths: Array.isArray(meta?.segmentPaths) ? meta.segmentPaths : undefined,

@@ -1506,7 +1506,17 @@ async function __creekFetchAssetBuffer(assetPath) {
 async function __creekSeededAppPageEntry(key, ctx) {
   if (ctx?.kind !== "APP_PAGE") return null;
   const seed = __CREEK_PRERENDER_ENTRY_BY_PATH.get(key);
-  if (!seed || !seed.pprHeaders || seed.pathname.includes("[")) return null;
+  // Bracket-form fallback shells go through \`__CREEK_POSTPONED_BY_SHELL\`
+  // regex mapping, not direct seeds. Seeds only cover concrete paths.
+  if (!seed || seed.pathname.includes("[")) return null;
+  // Only seed PPR-chain pages. Non-PPR static pages flow through the
+  // static-asset fast-path (\`STATIC_PAGES\` lookup in the main handler) —
+  // intercepting them here would race the fast-path and can cause the
+  // cache-handler entry to win for hard navigations whose route-level
+  // metadata differs from the seed's build-time value (e.g. app-prefetch's
+  // \`/\` where a query-param prefetch asserts that the freshly-rendered RSC,
+  // not the stale seeded one, determines the accordion visibility).
+  if (!seed.pprHeaders) return null;
   const hasRevalidate = typeof seed.initialRevalidate === "number" && seed.initialRevalidate > 0;
   const hasFullyStaticPprOutput = !seed.postponedState;
   if (!hasRevalidate && !hasFullyStaticPprOutput) return null;
@@ -1526,6 +1536,16 @@ async function __creekSeededAppPageEntry(key, ctx) {
     return null;
   }
 
+  // HTML is never inlined in the bundle — fetch from the assets bucket.
+  // Seeded entries are not cached in L1 (see CreekCacheHandler.get below)
+  // so we don't pin 2MB-per-page HTML into isolate memory.
+  let html = seed.html;
+  if (!html) {
+    const htmlAssetKey = key === "/" ? "/index.html" : key + ".html";
+    const htmlBuf = await __creekFetchAssetBuffer(htmlAssetKey);
+    html = htmlBuf ? htmlBuf.toString("utf-8") : "";
+  }
+
   let segmentData;
   if (Array.isArray(seed.segmentPaths) && seed.segmentPaths.length > 0) {
     const segments = new Map();
@@ -1540,7 +1560,7 @@ async function __creekSeededAppPageEntry(key, ctx) {
   return {
     value: {
       kind: "APP_PAGE",
-      html: seed.html,
+      html,
       rscData,
       postponed: seed.postponedState,
       headers,
@@ -1550,6 +1570,7 @@ async function __creekSeededAppPageEntry(key, ctx) {
     lastModified: typeof seed.lastModified === "number" ? seed.lastModified : Date.now(),
     tags,
     revalidate: typeof seed.initialRevalidate === "number" ? seed.initialRevalidate : undefined,
+    __creekSeeded: true,
   };
 }
 
@@ -1581,7 +1602,12 @@ class CreekCacheHandler {
 
     if (!entry) {
       entry = await __creekSeededAppPageEntry(key, ctx);
-      if (entry) {
+      // Don't pin seeded entries to L1 — HTML/RSC fetched from assets can be
+      // multiple MB per page (e.g. memory-pressure's 60 × ~3MB would exhaust
+      // the isolate budget). Assets binding reads are fast in-process, so
+      // re-fetching per request is cheap. Only fresh entries written via
+      // \`set()\` need L1 — those represent rendered content not in assets.
+      if (entry && !entry.__creekSeeded) {
         globalThis.__CREEK_CACHE.set(key, entry);
       }
     }
