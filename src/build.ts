@@ -883,6 +883,16 @@ export interface PrerenderEntry {
   pprHeaders?: Record<string, string>;
   lastModified?: number;
   segmentPaths?: string[];
+  /**
+   * Headers captured from the `.meta` sidecar file next to the prerendered
+   * HTML (e.g. `.next/server/app/index.meta`). `initialHeaders` comes from
+   * `prerender-manifest.json` and *does not* include the `x-next-cache-tags`
+   * entry for cacheComponents routes — those tags are only written to the
+   * per-route `.meta` file. Without reading them, our runtime tag-staleness
+   * check (`__CREEK_TAG_INVALIDATED_AT` ∩ `staticEntry.cacheTags`) never
+   * fires for cacheComponents pages, so `revalidateTag` silently fails.
+   */
+  metaHeaders?: Record<string, string | string[]>;
 }
 
 /**
@@ -923,6 +933,10 @@ async function collectPrerenderEntries(outputs: BuildContext["outputs"]): Promis
         pprHeaders: prerender.pprChain?.headers,
         lastModified: stat?.mtimeMs,
         segmentPaths: Array.isArray(meta?.segmentPaths) ? meta.segmentPaths : undefined,
+        metaHeaders:
+          meta?.headers && typeof meta.headers === "object"
+            ? meta.headers
+            : undefined,
       });
     } catch {
       // Skip prerenders whose fallback file can't be read

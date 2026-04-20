@@ -48,6 +48,7 @@ export interface WorkerEntryOptions {
     pprHeaders?: Record<string, string>;
     lastModified?: number;
     segmentPaths?: string[];
+    metaHeaders?: Record<string, string | string[]>;
   }>;
   /**
    * Composable cache (`'use cache'`) entries extracted from build-time
@@ -128,7 +129,7 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
   const handlers = collectHandlers(opts.outputs, opts.manifests);
   const pathnames = collectPathnames(opts.outputs, opts.manifests);
   const serverActionPages = collectServerActionPagePathnames(opts.manifests);
-  const staticPageMap = collectStaticPageMap(opts.outputs, serverActionPages);
+  const staticPageMap = collectStaticPageMap(opts.outputs, serverActionPages, opts.prerenderEntries);
   const revalidatePaths = collectRevalidatePaths(opts.outputs);
   const composableCacheSeedsByShell = opts.composableCacheSeedsByShell ?? [];
 
@@ -5953,8 +5954,31 @@ function prerenderHtmlHasBoundServerAction(filePath: string | undefined): boolea
 function collectStaticPageMap(
   outputs: BuildContext["outputs"],
   serverActionPages: Set<string>,
+  prerenderEntries: WorkerEntryOptions["prerenderEntries"],
 ): Record<string, StaticPageEntry> {
   const map: Record<string, StaticPageEntry> = {};
+
+  // Build a pathname → cacheTags lookup from prerenderEntries (which reads
+  // \`.meta\` files at build time). The \`x-next-cache-tags\` header for
+  // cacheComponents routes (e.g. \`/\` with \`'use cache'\`) only appears in
+  // the .meta sidecar — \`prerender.fallback.initialHeaders\` omits it. We
+  // need these tags on \`StaticPageEntry\` so the runtime
+  // \`__CREEK_TAG_INVALIDATED_AT\` check at the static-asset fast-path
+  // correctly bypasses on \`revalidateTag\` — otherwise the revalidated CC
+  // tag just lives in memory and the prerendered HTML keeps being served.
+  // Fixes resume-data-cache's \`expect(random2).not.toBe(first)\`
+  // post-revalidation assertion for \`'use cache'\` pages.
+  const cacheTagsByPathname = new Map<string, string[]>();
+  for (const pe of prerenderEntries) {
+    const raw = pe.metaHeaders?.["x-next-cache-tags"] ?? pe.initialHeaders?.["x-next-cache-tags"];
+    if (typeof raw !== "string" || raw.length === 0) continue;
+    const tags = raw.split(",").map((t) => t.trim()).filter(Boolean);
+    if (tags.length > 0) cacheTagsByPathname.set(pe.pathname, tags);
+  }
+  const applyCacheTags = (pathname: string, entry: StaticPageEntry) => {
+    const tags = cacheTagsByPathname.get(pathname);
+    if (tags && !entry.cacheTags) entry.cacheTags = tags;
+  };
   const appPathnames = [
     ...outputs.appPages.map((p) => stripRouteGroups(p.pathname)),
     ...outputs.appRoutes.map((r) => stripRouteGroups(r.pathname)),
@@ -5973,11 +5997,13 @@ function collectStaticPageMap(
     if (__isStaticPagePathname(file.pathname)) {
       const assetPath = path.join(file.pathname, "index.html");
       const entry: StaticPageEntry = { assetPath, routerType: classifyRouterType(file.pathname) };
+      applyCacheTags(file.pathname, entry);
       // Map the original pathname
       map[file.pathname] = entry;
       // Also map normalized form: /index → /, /foo/index → /foo
       if (file.pathname.endsWith("/index")) {
         const parent = file.pathname.slice(0, -6) || "/";
+        applyCacheTags(parent, entry);
         map[parent] = entry;
       }
     }
