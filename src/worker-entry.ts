@@ -1783,7 +1783,7 @@ class CreekComposableCacheHandler {
             let seedInvalidated = false;
             for (const tag of seed.tags) {
               const state = globalThis.__CREEK_CC_TAG_STATE.get(tag);
-              if (state && state.expire !== undefined && state.expire > seed.timestamp) {
+              if (state && state.stale !== undefined && state.stale > seed.timestamp) {
                 // Seed invalidated by a runtime tag flip — fall through to
                 // normal handler path so a fresh render happens.
                 seedInvalidated = true;
@@ -1810,12 +1810,18 @@ class CreekComposableCacheHandler {
     const entry = globalThis.__CREEK_CC_STORE.get(cacheKey);
     if (!entry) return undefined;
 
-    // If any tag attached to this entry has an expire timestamp newer than
-    // the entry's write time, the tag was invalidated AFTER this entry was
-    // written → treat as cache miss so the cached function re-runs.
+    // Tag staleness check: an entry is stale iff a tag it depends on was
+    // invalidated AFTER the entry was written. Compare against \`state.stale\`
+    // (the wall-clock timestamp of the invalidation call) — not
+    // \`state.expire\`, which tracks how long the stale signal itself lives,
+    // not the cutoff between "pre-invalidation" and "post-invalidation"
+    // entries. Using \`expire\` here made every entry written within a profile's
+    // expiry window (e.g. \`'minutes'\` → 3600s) look stale forever after one
+    // \`revalidateTag\` call, so the handler re-ran on every read even after a
+    // fresh entry was produced — blowing cache hit rates to zero.
     for (const tag of entry.tags) {
       const state = globalThis.__CREEK_CC_TAG_STATE.get(tag);
-      if (state && state.expire !== undefined && state.expire > entry.timestamp) {
+      if (state && state.stale !== undefined && state.stale > entry.timestamp) {
         return undefined;
       }
     }
