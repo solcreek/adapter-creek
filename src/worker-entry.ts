@@ -2959,140 +2959,7 @@ function __filterInternalRequestHeaders(req) {
   });
 }
 
-// RSC prefetch→navigation cache. When a \`<Link>\` component fires a prefetch
-// (\`next-router-prefetch: 1\`) Next's client router only caches the static
-// shell; the subsequent click then kicks off a full RSC fetch that has to
-// re-resolve dynamic parts (\`generateMetadata\`, async components, etc.).
-// For dynamic pages whose metadata takes seconds (e.g. the navigation test's
-// \`await setTimeout(5000)\` in \`generateMetadata\`), this means the post-click
-// navigation always takes >= that latency — even when the test already waited
-// for the prefetch to "complete".
-//
-// Vercel's edge infrastructure effectively short-circuits this via short-
-// lived upstream caching. Do the same in-worker: when a prefetch RSC comes
-// in, respond immediately with the shell AND kick off a full render in the
-// background via \`ctx.waitUntil\`; stash the full response bytes in an
-// in-memory map keyed on the full URL. When the same URL then comes in as a
-// non-prefetch RSC (the click handoff), serve the cached bytes instead of
-// re-running the handler. The cache is per-isolate, short-lived (10s), and
-// capped (20 entries) — it only covers the prefetch→click handoff window.
-const __CREEK_PREFETCH_CACHE_TTL_MS = 10_000;
-const __CREEK_PREFETCH_CACHE_MAX = 20;
-
-function __creekPrefetchCache() {
-  let cache = globalThis.__CREEK_PREFETCH_CACHE;
-  if (!cache) {
-    cache = new Map();
-    globalThis.__CREEK_PREFETCH_CACHE = cache;
-  }
-  return cache;
-}
-
-function __creekPrefetchInflight() {
-  let set = globalThis.__CREEK_PREFETCH_INFLIGHT;
-  if (!set) {
-    set = new Set();
-    globalThis.__CREEK_PREFETCH_INFLIGHT = set;
-  }
-  return set;
-}
-
-function __creekRscKey(url, request) {
-  // Include the next-url header so the cache keys track which page the
-  // prefetch was initiated FROM — the same target URL prefetched from
-  // \`/foo\` vs \`/bar\` yields different Flight trees (different parallel
-  // segments / layouts). Strip the \`_rsc\` cache-buster that Next adds to
-  // avoid a new key per re-prefetch.
-  const cleaned = new URL(url.toString());
-  cleaned.searchParams.delete("_rsc");
-  const base = cleaned.pathname + (cleaned.search || "");
-  const parent = request.headers.get("next-url") || "";
-  return base + "|" + parent;
-}
-
-function __creekIsRscRequest(request) {
-  return request.headers.has("rsc") || request.headers.has("next-router-state-tree");
-}
-
-function __creekIsPrefetchRequest(request) {
-  return (
-    request.headers.get("next-router-prefetch") === "1" ||
-    request.headers.has("next-router-segment-prefetch")
-  );
-}
-
-async function __creekTryServeFromPrefetchCache(request) {
-  if (!__creekIsRscRequest(request) || __creekIsPrefetchRequest(request)) {
-    return null;
-  }
-  const url = new URL(request.url);
-  const key = __creekRscKey(url, request);
-  const entry = __creekPrefetchCache().get(key);
-  if (!entry) return null;
-  if (Date.now() - entry.cachedAt > __CREEK_PREFETCH_CACHE_TTL_MS) {
-    __creekPrefetchCache().delete(key);
-    return null;
-  }
-  const headers = new Headers(entry.headers);
-  headers.set("x-creek-prefetch-cache", "HIT");
-  return new Response(entry.body, { status: entry.status, headers });
-}
-
-async function __creekStorePrefetchWarmResult(request, response) {
-  try {
-    if (response.status < 200 || response.status >= 400) return;
-    const cache = __creekPrefetchCache();
-    const url = new URL(request.url);
-    const key = __creekRscKey(url, request);
-    const body = new Uint8Array(await response.clone().arrayBuffer());
-    const headers = [];
-    response.headers.forEach((v, k) => headers.push([k, v]));
-    cache.set(key, { body, headers, status: response.status, cachedAt: Date.now() });
-    // Evict oldest when over cap (Map preserves insertion order).
-    while (cache.size > __CREEK_PREFETCH_CACHE_MAX) {
-      const oldestKey = cache.keys().next().value;
-      if (oldestKey === undefined) break;
-      cache.delete(oldestKey);
-    }
-  } catch {}
-}
-
-async function __creekWarmPrefetchInBackground(request, env, ctx) {
-  if (!__creekIsPrefetchRequest(request) || !__creekIsRscRequest(request)) return;
-  const url = new URL(request.url);
-  const key = __creekRscKey(url, request);
-  const inflight = __creekPrefetchInflight();
-  if (inflight.has(key)) return; // coalesce concurrent prefetches
-  // Skip if we already have a fresh cache entry.
-  const existing = __creekPrefetchCache().get(key);
-  if (existing && Date.now() - existing.cachedAt < __CREEK_PREFETCH_CACHE_TTL_MS) return;
-  inflight.add(key);
-  try {
-    const warmHeaders = new Headers(request.headers);
-    // Drop the prefetch signal so the handler produces a full RSC response.
-    warmHeaders.delete("next-router-prefetch");
-    warmHeaders.delete("next-router-segment-prefetch");
-    const warmUrl = new URL(url.toString());
-    warmUrl.searchParams.delete("_rsc");
-    const warmRequest = new Request(warmUrl, {
-      method: "GET",
-      headers: warmHeaders,
-    });
-    const warmResponse = await __handleRequestInner(warmRequest, env, ctx);
-    await __creekStorePrefetchWarmResult(warmRequest, warmResponse);
-  } catch {} finally {
-    inflight.delete(key);
-  }
-}
-
 async function __handleRequest(request, env, ctx) {
-  // Try the prefetch→nav cache before doing any work — if a background warm
-  // from a previous prefetch already has the full RSC bytes, serving them
-  // saves the handler's re-render latency (which for dynamic metadata pages
-  // can exceed the test's waitForSelector timeout).
-  const prefetchCacheHit = await __creekTryServeFromPrefetchCache(request);
-  if (prefetchCacheHit) return prefetchCacheHit;
-
   // Wrap every fetch in a per-request module-loading signal context.
   // The track-module-loading shim's \`__CREEK_WITH_MODULE_LOADING_CONTEXT\`
   // runs \`fn\` under an AsyncLocalStorage scope where \`getModuleLoadingSignal\`
@@ -3105,20 +2972,10 @@ async function __handleRequest(request, env, ctx) {
   // shim-global fallback guards module-init or any path that beats the
   // alias target into the bundle.
   const __withLoadCtx = globalThis.__CREEK_WITH_MODULE_LOADING_CONTEXT;
-  const run = () => __handleRequestInner(request, env, ctx);
-  const response = typeof __withLoadCtx === "function"
-    ? await __withLoadCtx(run)
-    : await run();
-
-  // When we just answered a prefetch RSC request, kick off a full background
-  // render to populate the cache for the impending click handoff.
-  if (__creekIsPrefetchRequest(request) && __creekIsRscRequest(request) && response.ok) {
-    try {
-      ctx.waitUntil(__creekWarmPrefetchInBackground(request, env, ctx));
-    } catch {}
+  if (typeof __withLoadCtx === "function") {
+    return __withLoadCtx(() => __handleRequestInner(request, env, ctx));
   }
-
-  return response;
+  return __handleRequestInner(request, env, ctx);
 }
 
 async function __handleRequestInner(request, env, ctx) {
