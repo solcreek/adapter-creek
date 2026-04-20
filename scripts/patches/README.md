@@ -1,9 +1,15 @@
 # nextjs/ upstream test patches
 
 Patches applied to the checked-out Next.js tree before running e2e tests.
-Each patch cherry-picks a specific upstream fix that landed after the
-Next.js tag we pin to (`v16.2.1` in CI, `v16.2.3` locally) but is
-relevant to tests this adapter runs.
+
+Per Next.js's official adapter-testing docs, CI tracks the `canary`
+branch (that's the default in
+`.github/workflows/test-e2e-deploy.yml`). Most upstream test fixes are
+already in canary, so these patches are primarily safety nets for when
+a local checkout is behind canary (e.g. running against a stable tag
+like `v16.2.4`, which does NOT receive test-only back-ports). The apply
+script is idempotent — patches already in the target tree are detected
+via `git apply --reverse --check` and skipped.
 
 ## How they're applied
 

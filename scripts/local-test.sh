@@ -7,15 +7,18 @@
 #   ./scripts/local-test.sh -g 1/4                    # Run test group 1 of 4
 #
 # Prerequisites:
-#   1. Next.js repo cloned at ./nextjs at the pinned tag (see
-#      .github/workflows/test-e2e-deploy.yml for the version we track):
-#        git clone --depth 25 --branch v16.2.4 https://github.com/vercel/next.js nextjs
+#   1. Next.js repo cloned at ./nextjs — per Next.js's official adapter-testing
+#      docs, track the \`canary\` branch (that's what Vercel's own adapter CIs
+#      do, and it's where test fixes land first):
+#        git clone --depth 25 --branch canary https://github.com/vercel/next.js nextjs
 #   2. Next.js built: cd nextjs && pnpm install && pnpm build && pnpm install
 #   3. Playwright installed: cd nextjs && pnpm playwright install chromium
 #   4. Adapter built: pnpm build
 #
 # This script will automatically apply any upstream test patches in
-# scripts/patches/ to the nextjs/ tree before running (idempotent).
+# scripts/patches/ to the nextjs/ tree before running (idempotent). If
+# your checkout is canary, most patches are already in-tree and are
+# silently skipped.
 #
 # Environment variables:
 #   CONCURRENCY  — parallel test workers (default: 2)
@@ -45,7 +48,7 @@ if [ ! -d "${NEXTJS_DIR}" ]; then
   echo ""
   echo "Setup:"
   echo "  cd ${ADAPTER_DIR}"
-  echo "  git clone --depth 25 --branch v16.2.4 https://github.com/vercel/next.js nextjs"
+  echo "  git clone --depth 25 --branch canary https://github.com/vercel/next.js nextjs"
   echo "  cd nextjs && pnpm install && pnpm build && pnpm install"
   echo "  pnpm playwright install chromium"
   exit 1
