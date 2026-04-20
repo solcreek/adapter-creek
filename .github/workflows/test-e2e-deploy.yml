@@ -4,8 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       nextjsRef:
+        # Pin to the latest stable Next.js tag. When bumping: verify the new
+        # version ships the fixes our adapter depends on (see
+        # scripts/patches/README.md for test-only fixes we still cherry-pick
+        # because stable doesn't pick them up from canary).
         description: 'Next.js repo ref (branch/tag/SHA)'
-        default: 'v16.2.1'
+        default: 'v16.2.4'
         type: string
   # Uncomment for nightly runs:
   # schedule:
@@ -24,9 +28,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           repository: vercel/next.js
-          ref: ${{ inputs.nextjsRef || 'canary' }}
+          ref: ${{ inputs.nextjsRef || 'v16.2.4' }}
           path: nextjs
           fetch-depth: 25
+
+      - name: Apply upstream test patches
+        # Cherry-picks test-only fixes from canary that Vercel didn't
+        # back-port to the stable release we're pinned to. Idempotent —
+        # see scripts/patches/README.md.
+        run: adapter/scripts/apply-nextjs-patches.sh nextjs
 
       - uses: actions/setup-node@v4
         with: { node-version: '20' }

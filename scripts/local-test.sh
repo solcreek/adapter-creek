@@ -7,14 +7,18 @@
 #   ./scripts/local-test.sh -g 1/4                    # Run test group 1 of 4
 #
 # Prerequisites:
-#   1. Next.js repo cloned at ./nextjs (git clone --depth 25 --branch canary https://github.com/vercel/next.js nextjs)
+#   1. Next.js repo cloned at ./nextjs at the pinned tag (see
+#      .github/workflows/test-e2e-deploy.yml for the version we track):
+#        git clone --depth 25 --branch v16.2.4 https://github.com/vercel/next.js nextjs
 #   2. Next.js built: cd nextjs && pnpm install && pnpm build && pnpm install
 #   3. Playwright installed: cd nextjs && pnpm playwright install chromium
 #   4. Adapter built: pnpm build
 #
+# This script will automatically apply any upstream test patches in
+# scripts/patches/ to the nextjs/ tree before running (idempotent).
+#
 # Environment variables:
 #   CONCURRENCY  — parallel test workers (default: 2)
-#   NEXT_REF     — Next.js branch/tag to use (default: canary)
 set -euo pipefail
 
 # Cleanup zombie wrangler/workerd processes on exit or kill
@@ -41,7 +45,7 @@ if [ ! -d "${NEXTJS_DIR}" ]; then
   echo ""
   echo "Setup:"
   echo "  cd ${ADAPTER_DIR}"
-  echo "  git clone --depth 25 --branch canary https://github.com/vercel/next.js nextjs"
+  echo "  git clone --depth 25 --branch v16.2.4 https://github.com/vercel/next.js nextjs"
   echo "  cd nextjs && pnpm install && pnpm build && pnpm install"
   echo "  pnpm playwright install chromium"
   exit 1
@@ -56,6 +60,11 @@ fi
 # Rebuild adapter if source changed
 echo "[local-test] Building adapter..."
 (cd "${ADAPTER_DIR}" && pnpm build) 2>&1
+
+# Apply upstream test patches (cherry-picks from canary not in our pinned
+# stable Next.js ref). Idempotent; see scripts/patches/README.md.
+chmod +x "${ADAPTER_DIR}/scripts/apply-nextjs-patches.sh"
+"${ADAPTER_DIR}/scripts/apply-nextjs-patches.sh" "${NEXTJS_DIR}"
 
 # Make scripts executable
 chmod +x "${ADAPTER_DIR}/scripts/e2e-deploy.sh"
