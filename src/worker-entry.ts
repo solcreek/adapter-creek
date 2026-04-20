@@ -3009,7 +3009,7 @@ async function __handleRequestInner(request, env, ctx) {
   const response = await __INTERNAL_FETCH_CONTEXT.run({ origin: new URL(request.url).origin, env, ctx, request }, async () => {
     try {
       __initManifests();
-      const url = new URL(request.url);
+      let url = new URL(request.url);
       // Reject URLs with malformed percent-encoding up front. Next.js
       // normally responds with 400 "Bad Request" for these (e.g. \`/%2\`)
       // — see middleware-general's "should respond with 400 on decode
@@ -3673,26 +3673,97 @@ async function __handleRequestInner(request, env, ctx) {
         }
       }
       if (result.redirect) {
-        // For Pages Router data requests, return 200 with
-        // \`x-nextjs-redirect\` header instead of a 3xx Location response.
-        // The Pages Router client fetchNextData reads this header to
-        // perform client-side navigation to the redirect target — a
-        // real 3xx would be followed by the browser (losing the SPA
-        // state) OR blocked by CORS if the target is external.
-        const isDataReq = url.pathname.startsWith("/_next/data/") ||
-          (BASE_PATH && url.pathname.startsWith(BASE_PATH + "/_next/data/"));
-        const redirectUrl = result.redirect.url.toString();
-        if (isDataReq) {
-          const headers = new Headers();
-          headers.set("content-type", "application/json");
-          headers.set("x-nextjs-redirect", redirectUrl);
-          headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
-          return new Response("{}", { status: 200, headers });
+        // Suppress i18n locale-detection redirects for non-root pathnames.
+        // \`@next/routing\`'s resolveRoutes emits a 307 to \`/\${locale}\${path}\`
+        // for any non-\`/_next/\` / non-\`/api/\` path whenever Accept-Language
+        // maps to a non-default locale — including \`/new\`, \`/about\`, etc.
+        // Next.js's own \`getLocaleRedirect\` (server/lib/i18n/get-locale-redirect)
+        // gates this redirect on \`denormalizePagePath(pathname) === '/'\`, so
+        // only the root path gets locale-redirected and specific pages stay
+        // unprefixed. Mirror that tighter gate so \`/new\` with
+        // Accept-Language: id is served directly with default locale (en),
+        // matching Vercel's behavior and unblocking
+        // i18n-preferred-locale-detection "should not request a path
+        // prefixed... when clicking link to index from a non-locale-prefixed
+        // path".
+        const isLocaleRedirect = (() => {
+          try {
+            const i18n = I18N;
+            if (!i18n?.locales || result.redirect.status !== 307) return false;
+            const base = BASE_PATH || "";
+            const currentPath = url.pathname.startsWith(base)
+              ? url.pathname.slice(base.length) || "/"
+              : url.pathname;
+            if (currentPath === "/") return false;
+            // Already locale-prefixed? Not a redirect we need to suppress.
+            const firstSeg = currentPath.split("/", 2)[1];
+            if (i18n.locales.includes(firstSeg)) return false;
+            const redirectPath = new URL(result.redirect.url.toString()).pathname;
+            const redirectRel = redirectPath.startsWith(base)
+              ? redirectPath.slice(base.length) || "/"
+              : redirectPath;
+            for (const locale of i18n.locales) {
+              const prefixed = "/" + locale + currentPath;
+              if (redirectRel === prefixed || redirectRel === prefixed + "/") {
+                return true;
+              }
+            }
+            return false;
+          } catch {
+            return false;
+          }
+        })();
+        if (!isLocaleRedirect) {
+          // For Pages Router data requests, return 200 with
+          // \`x-nextjs-redirect\` header instead of a 3xx Location response.
+          // The Pages Router client fetchNextData reads this header to
+          // perform client-side navigation to the redirect target — a
+          // real 3xx would be followed by the browser (losing the SPA
+          // state) OR blocked by CORS if the target is external.
+          const isDataReq = url.pathname.startsWith("/_next/data/") ||
+            (BASE_PATH && url.pathname.startsWith(BASE_PATH + "/_next/data/"));
+          const redirectUrl = result.redirect.url.toString();
+          if (isDataReq) {
+            const headers = new Headers();
+            headers.set("content-type", "application/json");
+            headers.set("x-nextjs-redirect", redirectUrl);
+            headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
+            return new Response("{}", { status: 200, headers });
+          }
+          return new Response(null, {
+            status: result.redirect.status,
+            headers: { Location: redirectUrl },
+          });
         }
-        return new Response(null, {
-          status: result.redirect.status,
-          headers: { Location: redirectUrl },
-        });
+        // Suppressed locale-redirect: synthesize the resolved routing state
+        // as if the request had landed on \`/\${defaultLocale}\${path}\`. Next's
+        // Pages Router generates one HANDLERS entry per (locale, page)
+        // combination — \`/en/new\`, \`/id/new\` — but never a bare \`/new\`, so
+        // falling through without this rewrite would 404 instead of serving
+        // the default-locale copy.
+        try {
+          const base = BASE_PATH || "";
+          const i18n = I18N;
+          const currentPath = url.pathname.startsWith(base)
+            ? url.pathname.slice(base.length) || "/"
+            : url.pathname;
+          const defaultLocale = i18n?.defaultLocale;
+          if (defaultLocale && currentPath !== "/") {
+            const rewrittenPath = base + "/" + defaultLocale + currentPath;
+            const rewritten = new URL(url.toString());
+            rewritten.pathname = rewrittenPath;
+            url = rewritten;
+            result = {
+              ...result,
+              redirect: undefined,
+              resolvedPathname: rewrittenPath,
+            };
+          } else {
+            result = { ...result, redirect: undefined };
+          }
+        } catch {
+          result = { ...result, redirect: undefined };
+        }
       }
       // Middleware and config redirects: resolveRoutes returns Location in
       // resolvedHeaders + 3xx status (not as result.redirect) when
