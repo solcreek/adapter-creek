@@ -2573,25 +2573,39 @@ function __creekPatchFlightStaticBoundaryStream(stream) {
         return;
       }
 
-      while (true) {
+      // First read: decide whether this stream needs the static-boundary
+      // rewrite at all. The \`"l":"$@<id>"\` marker lives in the JSON prelude
+      // at the very start of the stream — if the first chunk doesn't contain
+      // it, no static boundary will appear later and we can pass-through all
+      // subsequent chunks untouched. Without this fast-path, regular RSC
+      // responses (which don't use cacheComponents static boundaries) buffer
+      // all the way to EOF, which blocks progressive client commits: Next's
+      // client router queues server-action dispatches behind the pending
+      // navigation, so a 3s RSC body keeps a server action held for 3s —
+      // breaking tests like use-link-status "should remove pending state
+      // when server action triggers a redirect" that expect the action POST
+      // to fire within ~1s of the button click.
+      if (chunks.length === 0) {
         const { done, value } = await reader.read();
         if (done) {
-          if (totalLength > 0) controller.enqueue(__creekMergeBytes(chunks, totalLength));
           controller.close();
           patched = true;
           return;
         }
-
+        const firstText = decoder.decode(value, { stream: false });
+        const firstMatch = firstText.match(/"l":"\\$@([0-9a-z]+)"/i);
+        if (!firstMatch) {
+          controller.enqueue(value);
+          patched = true;
+          return;
+        }
+        boundaryId = firstMatch[1];
         chunks.push(value);
         totalLength += value.byteLength;
+      }
+
+      while (true) {
         const prefix = __creekMergeBytes(chunks, totalLength);
-        const text = decoder.decode(prefix);
-
-        if (boundaryId === null) {
-          const match = text.match(/"l":"\\$@([0-9a-z]+)"/i);
-          if (match) boundaryId = match[1];
-        }
-
         if (boundaryId !== null) {
           const lineNeedle = encoder.encode("\\n" + boundaryId + ":");
           let lineStart = __creekIndexOfBytes(prefix, lineNeedle);
@@ -2638,6 +2652,16 @@ function __creekPatchFlightStaticBoundaryStream(stream) {
           patched = true;
           return;
         }
+
+        const { done, value } = await reader.read();
+        if (done) {
+          if (totalLength > 0) controller.enqueue(prefix);
+          controller.close();
+          patched = true;
+          return;
+        }
+        chunks.push(value);
+        totalLength += value.byteLength;
       }
     },
     cancel(reason) { return reader.cancel(reason); },
