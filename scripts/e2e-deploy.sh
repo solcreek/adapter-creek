@@ -107,7 +107,21 @@ export NEXT_ADAPTER_PATH="${ADAPTER_PATH}"
 # every \`/_next/\` URL carries the right \`dpl\` query value matching
 # \`next.assetToken = next.deploymentId\`. Setting the env after build
 # means asset URLs lack the param and the test fails.
-PORT=$((3000 + RANDOM % 10000))
+# Chromium refuses to load URLs on its unsafe-ports list (ERR_UNSAFE_PORT)
+# — these are pre-defined ports associated with legacy services (IRC, SIP,
+# NFS, etc.). Random port allocation in a 10k range hits ~8 unsafe ports
+# per 10,000 runs, which surfaces as flaky "net::ERR_UNSAFE_PORT at
+# http://localhost:${PORT}/" Playwright errors that go green only on retry.
+# Reroll until we pick one outside Chromium's blocklist. List from
+# https://chromium.googlesource.com/chromium/src.git/+/refs/heads/main/net/base/port_util.cc
+UNSAFE_PORTS=" 1 7 9 11 13 15 17 19 20 21 22 23 25 37 42 43 53 69 77 79 87 95 101 102 103 104 109 110 111 113 115 117 119 123 135 137 139 143 161 179 389 427 465 512 513 514 515 526 530 531 532 540 548 554 556 563 587 601 636 989 990 993 995 1719 1720 1723 2049 3659 4045 5060 5061 6000 6566 6665 6666 6667 6668 6669 6697 10080 "
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  PORT=$((3000 + RANDOM % 10000))
+  case "${UNSAFE_PORTS}" in
+    *" ${PORT} "*) continue ;;
+    *) break ;;
+  esac
+done
 export NEXT_DEPLOYMENT_ID="${NEXT_DEPLOYMENT_ID:-local-${PORT}}"
 log "Pre-allocated PORT=${PORT}, NEXT_DEPLOYMENT_ID=${NEXT_DEPLOYMENT_ID}"
 
