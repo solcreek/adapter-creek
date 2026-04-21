@@ -40,22 +40,7 @@
       ],
       "_note": "All three markers (`$test-fallback-sentinel`, suspense data chunk, `$RC=function`) ARE present in the response — the adapter renders the page correctly with progressive streaming and the other two sub-tests (`should render initial styles of css-in-js in nodejs/edge SSR correctly`) pass. What fails is the EXACT ORDER assertion `['fallback', 'data', 'refresh-script']`: Miniflare's HTTP proxy auto-compresses text/html responses to EOF-gzipped single chunks, collapsing all three markers into one arrival. Node's `for await (const chunk of response.body)` then iterates a single decompressed chunk and the test's in-chunk check order (`data` → `refresh-script` → `fallback`) pushes the markers as `['data', 'refresh-script', 'fallback']` (backwards). Verified a local `Content-Encoding: identity` override + `Cache-Control: no-transform` both fail to disable miniflare's compression pass. In production CF Workers the edge compresses at byte-stream granularity (chunks preserved), so this is a dev-environment (miniflare) artefact, not an adapter defect. The other three server-inserted-html assertions (basic styled-jsx/styled-components SSR, both node + edge variants) pass."
     },
-    "test/e2e/app-dir/cache-components-allow-otel-spans/cache-components-allow-otel-spans.test.ts": {
-      "failed": [
-        "cache-components OTEL spans should allow creating Spans during prerendering at runtime - inside a Cache Components"
-      ],
-      "_note": "The test fails because `/novel/cache` route returns 500 error during runtime prerendering with OpenTelemetry spans. The OTEL instrumentation in CF Workers/workerd environment has compatibility issues with the Node.js-based OTEL auto-instrumentation (native modules, async_hooks, etc.). The other two sub-tests (build-time prerendering and fallback resuming) pass, indicating basic OTEL API support works, but runtime prerendering with spans fails due to environment differences between Node.js and workerd."
-    },
-    "test/e2e/app-dir/fallback-shells/fallback-shells.test.ts": {
-      "failed": [
-        "fallback-shells without IO should start and not postpone the response",
-        "fallback-shells with cached IO with generateStaticParams and the page not wrapped in Suspense and the params accessed in the cached page does not resume a postponed fallback shell",
-        "fallback-shells with cached IO with generateStaticParams and the page not wrapped in Suspense and the params accessed in a cached non-page function does not resume a postponed fallback shell",
-        "fallback-shells with cached IO with generateStaticParams and the page not wrapped in Suspense and params.then/catch/finally passed to a cached function does not resume a postponed fallback shell",
-        "fallback-shells with cached IO with generateStaticParams and the page not wrapped in Suspense and the params transformed with an async function and then passed to a cached function does not resume a postponed fallback shell"
-      ],
-      "_note": "These tests check for PPR (Partial Prerendering) fallback shell behavior that differs between Node.js and workerd environments. The fallback shells and streaming behavior in CF Workers has subtle timing and buffering differences from Node.js, causing these edge case PPR tests to fail. Core PPR functionality works (as evidenced by other passing tests), but these specific edge cases around params handling and suspense boundaries behave differently in the workerd runtime."
-    }
+    "_removed-skips-to-face-reality": "2026-04-21: we previously skipped the 6 cache-components-allow-otel-spans + fallback-shells subtests under this block, masking real adapter bugs. Removed to surface them as genuine CI failures. The cache-components-allow-otel-spans /novel/cache 500 is adapter-specific (see memory project_otel_investigation.md). The 5 fallback-shells subtests also fail on vanilla at pinned canary 16.3.0-canary.2, but they're in-scope to fix as part of partial-fallback route-shell upgrading (PR #89063 infra)."
   },
   "rules": {
     "include": [],
