@@ -482,6 +482,26 @@ function patchUseCachePrerenderDanglingPromiseBailout(workerCode: string): strin
   );
 }
 
+function patchNullFallbackPartialShellBlocking(workerCode: string): string {
+  const minifiedPartialFallbackUpgradePattern =
+    /true\s*!==\s*(\w+)\.experimental\.partialFallbacks\s*\|\|\s*\(null\s*==\s*(\w+)\s*\?\s*void\s*0\s*:\s*\2\.fallback\)\s*!==\s*null\s*\|\|\s*(\w+)\s*\|\|\s*(\w+)\s*\|\|\s*!\((\w+)\.length\s*>\s*0\)\s*\|\|\s*\((\w+)\s*=\s*(\w+)\.FallbackMode\.PRERENDER\)/g;
+
+  return workerCode.replace(
+    minifiedPartialFallbackUpgradePattern,
+    (
+      _match: string,
+      nextConfigVar: string,
+      prerenderInfoVar: string,
+      omittedFallbackParamVar: string,
+      unresolvedRootParamsVar: string,
+      remainingParamsVar: string,
+      fallbackModeVar: string,
+      fallbackEnumVar: string,
+    ) =>
+      `true !== ${nextConfigVar}.experimental.partialFallbacks || (null == ${prerenderInfoVar} ? void 0 : ${prerenderInfoVar}.fallback) !== null || ${omittedFallbackParamVar} || ${unresolvedRootParamsVar} || !(${remainingParamsVar}.length > 0) || (${fallbackModeVar} = ${fallbackEnumVar}.FallbackMode.BLOCKING_STATIC_RENDER)`,
+  );
+}
+
 export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   // Patch Turbopack runtime BEFORE wrangler bundles.
   // Turbopack's R.c() dynamically loads chunks from the filesystem.
@@ -827,6 +847,12 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     // blocks the whole response. Treat the cache function as a dynamic hole
     // immediately so the PPR fallback shell can resume.
     workerCode = patchUseCachePrerenderDanglingPromiseBailout(workerCode);
+    // Null-fallback partial routes don't have a concrete fallback artifact
+    // on disk; under workerd the follow-up path that tries to specialize a
+    // generic shell on the first request can surface as a static-generation
+    // bailout instead of completing the request. Keep these routes on the
+    // blocking path and let the concrete request render/cache directly.
+    workerCode = patchNullFallbackPartialShellBlocking(workerCode);
 
     // Unify Next's `*AsyncStorageInstance` singletons across Turbopack
     // chunks via a `globalThis` key. Turbopack emits the `work-unit-async-
