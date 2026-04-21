@@ -210,10 +210,42 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // 1. turbopack-..._edge-wrapper (modulePath — Turbopack runtime, imported by worker)
   // 2. node_modules_..._edge-wrapper (contains _ENTRIES registration + module loader)
   // File 2 is NOT referenced by modulePath, so we need to import it explicitly.
+  //
+  // Webpack builds take a different path: the middleware output's `assets`
+  // include `server/edge-runtime-webpack.js`, a tiny IIFE that installs a
+  // `webpackChunk_N_E.push` hook. Without importing it BEFORE `middleware.js`,
+  // the chunk push becomes a plain Array.push and the entry chunk never
+  // evaluates — `_ENTRIES["middleware_middleware"]` stays undefined and all
+  // middleware rewrites silently no-op (reproduces as search-params 404s).
   let edgeRegistrationChunkPath: string | undefined;
   let edgeRuntimeModuleIds: number[] = [];
   let edgeOtherChunkPaths: string[] = [];
+  let webpackEdgeRuntimePath: string | undefined;
+  let webpackEdgeBootstrapPath: string | undefined;
   if (ctx.outputs.middleware?.edgeRuntime) {
+    const mwAssets = ctx.outputs.middleware.assets || {};
+    for (const [rel, abs] of Object.entries(mwAssets)) {
+      if (/(^|\/)server\/edge-runtime-webpack\.js$/.test(rel)) {
+        webpackEdgeRuntimePath = abs;
+        console.log(`  [Creek Adapter] Webpack edge runtime: ${path.basename(abs)}`);
+        break;
+      }
+    }
+    // Webpack's middleware.js ends with `(_ENTRIES="u"<typeof _ENTRIES?{}:
+    // _ENTRIES).middleware_middleware=b` — a bare assignment that needs
+    // `_ENTRIES` to resolve to a writable global. esbuild bundles the file as
+    // strict-mode ESM, so the bare identifier throws ReferenceError unless
+    // `globalThis._ENTRIES` already exists. This bootstrap file ensures it
+    // does; importing it before the runtime/middleware imports runs it first
+    // (imports evaluate in declaration order).
+    if (webpackEdgeRuntimePath) {
+      const bootstrapPath = path.join(ctx.distDir, "server", "creek-edge-bootstrap.js");
+      await fs.writeFile(
+        bootstrapPath,
+        "globalThis._ENTRIES = globalThis._ENTRIES || {};\n"
+      );
+      webpackEdgeBootstrapPath = bootstrapPath;
+    }
     try {
       const edgeChunksDir = path.join(ctx.distDir, "server", "edge", "chunks");
       const files = await fs.readdir(edgeChunksDir);
@@ -363,6 +395,8 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     edgeRegistrationChunkPath,
     edgeRuntimeModuleIds,
     edgeOtherChunkPaths,
+    webpackEdgeRuntimePath,
+    webpackEdgeBootstrapPath,
     userInstrumentationPath,
   });
 

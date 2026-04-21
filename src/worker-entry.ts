@@ -74,6 +74,22 @@ export interface WorkerEntryOptions {
   /** Paths to edge otherChunks that need explicit import */
   edgeOtherChunkPaths?: string[];
   /**
+   * Path to `.next/server/edge-runtime-webpack.js` when the user built with
+   * `next build --webpack`. This tiny IIFE installs the chunk-push hook on
+   * `self.webpackChunk_N_E`; it must evaluate BEFORE `middleware.js` so the
+   * push that registers chunk 149 triggers entry evaluation and populates
+   * `_ENTRIES["middleware_middleware"]`. Turbopack builds don't emit this
+   * file — its absence is the signal to fall through to the Turbopack path.
+   */
+  webpackEdgeRuntimePath?: string;
+  /**
+   * Path to a tiny generated bootstrap file that predeclares
+   * `globalThis._ENTRIES`. Imported BEFORE the webpack runtime so that
+   * middleware.js's strict-mode bare `_ENTRIES = {}` has a global to resolve
+   * against (otherwise: ReferenceError at module evaluation).
+   */
+  webpackEdgeBootstrapPath?: string;
+  /**
    * [xxh3_128_hex, wasm_filename_with_ext] pairs. Turbopack edge bundles
    * access the compiled WebAssembly.Module via \`globalThis.wasm_<hex>\`.
    * Import each wasm (wrangler declares \`.wasm\` as CompiledWasm) and
@@ -386,6 +402,20 @@ ${edgeOtherChunkImports}
 ${handlerStaticImports}
 
 ${opts.outputs.middleware?.edgeRuntime ? `
+${opts.webpackEdgeBootstrapPath ? `
+// Predeclare \`globalThis._ENTRIES\` before webpack middleware evaluates —
+// middleware.js ends with a bare \`_ENTRIES = {}\` assignment that throws in
+// strict-mode ESM unless a global binding already exists.
+import * as __creek_edge_bootstrap from ${JSON.stringify(opts.webpackEdgeBootstrapPath)};
+void __creek_edge_bootstrap;
+` : ""}
+${opts.webpackEdgeRuntimePath ? `
+// Webpack edge runtime — installs \`webpackChunk_N_E.push\` hook. MUST load
+// before middleware.js, otherwise middleware's chunk push becomes a plain
+// Array.push, entry 149 never evaluates, and \`_ENTRIES\` stays empty.
+import * as __webpack_edge_runtime from ${JSON.stringify(opts.webpackEdgeRuntimePath)};
+void __webpack_edge_runtime;
+` : ""}
 // Import edge middleware runtime.
 import * as __middleware_edge from ${JSON.stringify(opts.outputs.middleware.edgeRuntime.modulePath)};
 void __middleware_edge;
