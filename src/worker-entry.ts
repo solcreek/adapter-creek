@@ -1912,22 +1912,30 @@ class CreekComposableCacheHandler {
       }
     }
 
-    // Time-based staleness: return undefined when \`cacheLife.revalidate\` has
-    // elapsed so Next's use-cache wrapper takes the MISS branch (sync regen)
-    // instead of serving-stale + async bg-revalidate. Vanilla gets sync regen
-    // for runtime PPR prerenders because its \`workStore.isStaticGeneration\`
-    // is true in that context (\`supportsDynamicResponse: false\` via
-    // base-server's renderHTML path); our adapter can't replicate that
-    // renderOpts override safely — doing so at the rm.render layer breaks
-    // cache-warming in the 2-phase prerender flow. Wiring the staleness cut
-    // through the cache handler gets the same behaviour with one-phase
-    // renders: iter 2 of vary-params-base-dynamic now regens T2 directly
-    // instead of replaying iter 1's T1. Workers also can't reliably finish
-    // \`waitUntil\` background work across isolated requests, so synchronous
-    // regen is more reliable than stale-while-revalidate here.
+    // Time-based staleness (narrow — only for aggressive \`cacheLife\`): return
+    // undefined when the user explicitly requested small revalidate (≤10s) and
+    // the entry is past that window. Forces Next's use-cache wrapper onto the
+    // MISS branch so the next request regenerates synchronously instead of
+    // serving stale + background-revalidating (which workerd can't reliably
+    // complete across request isolates). Fires ONLY for small revalidate
+    // values so default \`'use cache'\` (rev≈900s) — where stale-while-
+    // revalidate is the expected semantic — stays on the SWR path. An
+    // unbounded fire regressed \`use-cache-route-handler-only\` by triggering
+    // a prospective static re-render that flagged \`Date.now()\` as dynamic
+    // (CI run 24740646737 after a broad rev-check). Vanilla gets sync regen
+    // for runtime PPR prerenders via \`workStore.isStaticGeneration=true\`
+    // (\`supportsDynamicResponse: false\` in base-server's renderHTML path);
+    // our adapter can't replicate that renderOpts override without breaking
+    // the 2-phase prerender cache-warming flow.
+    //
+    // Fixes segment-cache/vary-params-base-dynamic "keeps dynamic segment
+    // params valid before and after time-based revalidation" (page uses
+    // \`cacheLife({stale:0, revalidate:1, expire:60})\` + \`marker = Date.now()\` —
+    // iter 2 must emit a fresh marker).
     if (
       typeof entry.revalidate === "number" &&
       entry.revalidate >= 0 &&
+      entry.revalidate <= 10 &&
       Date.now() > entry.timestamp + entry.revalidate * 1000
     ) {
       return undefined;
