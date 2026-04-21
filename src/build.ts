@@ -146,7 +146,11 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
 
   // Step 3b: Collect prerender entries for ISR cache seeding.
   // Each prerender with a fallback file gets seeded into the cache at startup.
-  const prerenderEntries = await collectPrerenderEntries(ctx.outputs);
+  const fallbackShellRoutes = await collectFallbackShellRoutes(ctx.distDir);
+  const prerenderEntries = await collectPrerenderEntries(
+    ctx.outputs,
+    fallbackShellRoutes,
+  );
   if (prerenderEntries.length > 0) {
     console.log(`  [Creek Adapter] ${prerenderEntries.length} prerender entries for cache seeding`);
   }
@@ -156,7 +160,10 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // requests matching that shell — mirrors Next.js's request-scoped RDC and
   // keeps e.g. /with-suspense/* build-time values out of /without-suspense/*
   // requests that expect fresh runtime renders.
-  const composableCacheSeedsByShell = await collectComposableCacheSeeds(ctx.outputs);
+  const composableCacheSeedsByShell = await collectComposableCacheSeeds(
+    ctx.outputs,
+    fallbackShellRoutes,
+  );
   const composableCacheSeedEntries = Array.from(composableCacheSeedsByShell.entries());
   const composableCacheSeedCount = composableCacheSeedEntries.reduce(
     (n, [, seeds]) => n + seeds.length,
@@ -910,6 +917,7 @@ export interface PrerenderEntry {
   pathname: string;
   html: string;
   postponedState?: string;
+  allowsFallbackShellResume?: boolean;
   initialRevalidate?: number | false;
   initialStatus?: number;
   initialHeaders?: Record<string, string | string[]>;
@@ -929,12 +937,44 @@ export interface PrerenderEntry {
   metaHeaders?: Record<string, string | string[]>;
 }
 
+async function collectFallbackShellRoutes(
+  distDir: string,
+): Promise<Set<string> | null> {
+  try {
+    const raw = await fs.readFile(
+      path.join(distDir, "prerender-manifest.json"),
+      "utf-8",
+    );
+    const manifest = JSON.parse(raw);
+    const dynamicRoutes =
+      manifest?.dynamicRoutes && typeof manifest.dynamicRoutes === "object"
+        ? manifest.dynamicRoutes
+        : {};
+    const out = new Set<string>();
+    for (const [pathname, entry] of Object.entries<any>(dynamicRoutes)) {
+      if (
+        typeof pathname === "string" &&
+        typeof entry?.fallback === "string" &&
+        entry.fallback.length > 0
+      ) {
+        out.add(pathname);
+      }
+    }
+    return out;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Collect prerender entries from build outputs for App Router PPR/cache seeding.
  * Pages Router prerenders are served from assets and don't need to be embedded
  * in the worker bundle.
  */
-async function collectPrerenderEntries(outputs: BuildContext["outputs"]): Promise<PrerenderEntry[]> {
+async function collectPrerenderEntries(
+  outputs: BuildContext["outputs"],
+  fallbackShellRoutes: Set<string> | null,
+): Promise<PrerenderEntry[]> {
   const entries: PrerenderEntry[] = [];
   // The Next adapter emits one \`prerenders\` entry per output file — including
   // \`.rsc\` sidecars and \`.segments/*.segment.rsc\` fragments. Those aren't
@@ -967,6 +1007,9 @@ async function collectPrerenderEntries(outputs: BuildContext["outputs"]): Promis
         pathname: prerender.pathname,
         html: "",
         postponedState: fallback.postponedState,
+        allowsFallbackShellResume: fallbackShellRoutes
+          ? fallbackShellRoutes.has(prerender.pathname)
+          : undefined,
         initialRevalidate: fallback.initialRevalidate,
         initialStatus: fallback.initialStatus,
         initialHeaders: fallback.initialHeaders,
@@ -1020,7 +1063,8 @@ export interface ComposableCacheSeed {
  * semantically identical.
  */
 async function collectComposableCacheSeeds(
-  outputs: BuildContext["outputs"]
+  outputs: BuildContext["outputs"],
+  fallbackShellRoutes: Set<string> | null,
 ): Promise<Map<string, ComposableCacheSeed[]>> {
   const zlib = await import("node:zlib");
   // Map bracket-form pathname → its cache entries. Gating by shell prevents
@@ -1029,6 +1073,13 @@ async function collectComposableCacheSeeds(
   // leaking into \`/without-suspense/*\` where the test expects "runtime").
   const byShell = new Map<string, ComposableCacheSeed[]>();
   for (const prerender of outputs.prerenders) {
+    if (
+      prerender.pathname.includes("[") &&
+      fallbackShellRoutes &&
+      !fallbackShellRoutes.has(prerender.pathname)
+    ) {
+      continue;
+    }
     const postponed = prerender.fallback?.postponedState;
     if (typeof postponed !== "string" || postponed.length === 0) continue;
     const m = postponed.match(/^(\d+):/);

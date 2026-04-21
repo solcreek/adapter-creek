@@ -42,6 +42,7 @@ export interface WorkerEntryOptions {
     pathname: string;
     html: string;
     postponedState?: string;
+    allowsFallbackShellResume?: boolean;
     initialRevalidate?: number | false;
     initialStatus?: number;
     initialHeaders?: Record<string, string | string[]>;
@@ -1911,6 +1912,27 @@ class CreekComposableCacheHandler {
       }
     }
 
+    // Time-based staleness: return undefined when \`cacheLife.revalidate\` has
+    // elapsed so Next's use-cache wrapper takes the MISS branch (sync regen)
+    // instead of serving-stale + async bg-revalidate. Vanilla gets sync regen
+    // for runtime PPR prerenders because its \`workStore.isStaticGeneration\`
+    // is true in that context (\`supportsDynamicResponse: false\` via
+    // base-server's renderHTML path); our adapter can't replicate that
+    // renderOpts override safely — doing so at the rm.render layer breaks
+    // cache-warming in the 2-phase prerender flow. Wiring the staleness cut
+    // through the cache handler gets the same behaviour with one-phase
+    // renders: iter 2 of vary-params-base-dynamic now regens T2 directly
+    // instead of replaying iter 1's T1. Workers also can't reliably finish
+    // \`waitUntil\` background work across isolated requests, so synchronous
+    // regen is more reliable than stale-while-revalidate here.
+    if (
+      typeof entry.revalidate === "number" &&
+      entry.revalidate >= 0 &&
+      Date.now() > entry.timestamp + entry.revalidate * 1000
+    ) {
+      return undefined;
+    }
+
     // The composable cache contract says \`value\` is a fresh ReadableStream.
     // We stored bytes — wrap them in a new stream every read so multiple
     // consumers can read the same entry without exhausting it.
@@ -2100,8 +2122,11 @@ function __creekSeedsForPathname(pathname) {
 }
 
 // PPR fallback-shell resume: map bracket-form shell pathname → postponedState
-// string. At request time, any path whose concrete pathname matches a shell's
-// bracket pattern gets the shell's postponedState injected into its
+// string. Only shells whose prerender-manifest entry carries a non-null
+// \`fallback\` are resumable; other PPR dynamic routes are blocking renders
+// despite still carrying postponed metadata in their \`.meta\` sidecar.
+// At request time, any path whose concrete pathname matches a resumable
+// shell's bracket pattern gets the shell's postponedState injected into its
 // requestMeta as \`postponed\`. Next.js's app-page template reads that and
 // resumes the render from the pre-captured prelude + RDC instead of running
 // cached functions from scratch (see
@@ -2110,12 +2135,15 @@ function __creekSeedsForPathname(pathname) {
 // fallback shell resume re-renders every \`'use cache'\` function at runtime,
 // producing hydration mismatches between the shell HTML (buildtime values)
 // and the RSC stream (fresh runtime values).
-// Fixes fallback-shells hydration-errors test and unblocks future PPR work.
+// Restricting this to manifest-backed fallback shells avoids incorrectly
+// resuming blocking PPR routes such as fallback-shells' \`without-suspense\`
+// and \`without-io\` cases.
 const __CREEK_POSTPONED_BY_SHELL = (() => {
   const out = [];
   for (const entry of __PRERENDER_ENTRIES) {
     if (typeof entry.postponedState !== "string" || entry.postponedState.length === 0) continue;
     if (!entry.pathname.includes("[")) continue; // concrete prerenders use their own URL directly
+    if (entry.allowsFallbackShellResume === false) continue;
     let re = "";
     let i = 0;
     while (i < entry.pathname.length) {
