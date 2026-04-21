@@ -1517,9 +1517,16 @@ async function __creekSeededAppPageEntry(key, ctx) {
   // \`/\` where a query-param prefetch asserts that the freshly-rendered RSC,
   // not the stale seeded one, determines the accordion visibility).
   if (!seed.pprHeaders) return null;
-  const hasRevalidate = typeof seed.initialRevalidate === "number" && seed.initialRevalidate > 0;
-  const hasFullyStaticPprOutput = !seed.postponedState;
-  if (!hasRevalidate && !hasFullyStaticPprOutput) return null;
+  // PPR-chain seeds always produce a valid cache entry: either a fully
+  // static prerender (no postponed), or a static shell with a
+  // \`postponedState\` that Next's app-page template uses to resume
+  // rendering. Previously this function returned null for the postponed
+  // case, which made Next fall back to a fresh render — but PPR routes
+  // with \`cacheComponents: true\` trip the "encountered uncached or
+  // runtime data during the initial render" guard because they were
+  // only designed to be resumable, not re-rendered from scratch.
+  // Fixes concurrent-navigations/mismatching-prefetch (and generally
+  // any PPR-chain concrete param page like /dynamic-page/[a|b]).
 
   const headers = seed.initialHeaders && typeof seed.initialHeaders === "object"
     ? Object.assign({}, seed.initialHeaders)
@@ -1529,11 +1536,32 @@ async function __creekSeededAppPageEntry(key, ctx) {
     ? tagsHeader.split(",").map((t) => t.trim()).filter(Boolean)
     : [];
 
-  const rscData = !ctx.isFallback && (!ctx.isRoutePPREnabled || seed.postponedState == null)
-    ? await __creekFetchAssetBuffer(key + ".rsc")
-    : undefined;
-  if (!ctx.isFallback && (!ctx.isRoutePPREnabled || seed.postponedState == null) && !rscData) {
-    return null;
+  // Populate \`rscData\` for the cache entry. Next's app-page template
+  // serves this for RSC requests (prefetch + RSC navigation).
+  //   - Non-PPR / fully-static PPR : the \`.rsc\` sibling holds the full
+  //                                  flight payload.
+  //   - PPR with postponed state   : there is no standalone \`.rsc\` file
+  //                                  (build writes segments only). Use
+  //                                  \`.segments/_full.segment.rsc\` which
+  //                                  is the same payload expressed as a
+  //                                  single \`_full\` segment.
+  //                                  Without this, Next's app-page
+  //                                  template's RSC branch
+  //                                  (app-page.ts:1683-1706) returns 404
+  //                                  when cacheComponents is on because
+  //                                  \`html\` is a string (lacks
+  //                                  \`contentType\`), failing the
+  //                                  \`html.contentType === text/x-component\`
+  //                                  check.
+  let rscData;
+  if (!ctx.isFallback) {
+    rscData = await __creekFetchAssetBuffer(key + ".rsc");
+    if (!rscData && ctx.isRoutePPREnabled && typeof seed.postponedState === "string") {
+      rscData = await __creekFetchAssetBuffer(key + ".segments/_full.segment.rsc");
+    }
+    if (!rscData && (!ctx.isRoutePPREnabled || seed.postponedState == null)) {
+      return null;
+    }
   }
 
   // HTML is never inlined in the bundle — fetch from the assets bucket.
