@@ -4059,11 +4059,25 @@ async function __handleRequestInner(request, env, ctx) {
           const isAppRSC =
             request.headers.has("rsc") ||
             request.headers.has("next-router-state-tree");
-          if (isAppRSC && !cleanHeaders.has("x-middleware-rewrite")) {
+          if (isAppRSC) {
             const rewriteUrlObj = new URL(result.externalRewrite.toString());
             const rewriteRelative =
               rewriteUrlObj.pathname + (rewriteUrlObj.search || "");
-            cleanHeaders.set("x-middleware-rewrite", rewriteRelative);
+            if (!cleanHeaders.has("x-middleware-rewrite")) {
+              cleanHeaders.set("x-middleware-rewrite", rewriteRelative);
+            }
+            // \`x-nextjs-rewritten-path\`/\`-query\` are the SEGMENT-CACHE keys —
+            // the client router uses them to cache prefetched data under the
+            // rewritten URL, not the original. Upstream handlers inside the
+            // self-fetch don't emit these (they only see the already-rewritten
+            // URL), so we always surface them here based on origin vs
+            // rewrite-target deltas. Required for segment-cache/search-params
+            // tests: "stores prefetched data by its rewritten search params"
+            // (two links rewriting to the same target must dedupe under the
+            // rewritten key) and "handles rewrites to the same page but with
+            // different search params" (prefetch response keyed by
+            // \`?greeting=hello\` so subsequent click sees the cached dynamic
+            // greeting render).
             const origSearch = url.search || "";
             const newSearch = rewriteUrlObj.search || "";
             if (origSearch !== newSearch && !cleanHeaders.has("x-nextjs-rewritten-query")) {
@@ -7162,6 +7176,38 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     // supplied one.
     if (routeResult?.mwRewrite && !h.has("x-nextjs-rewrite")) {
       h.set("x-nextjs-rewrite", routeResult.mwRewrite);
+    }
+    // App Router segment-cache keys: when middleware rewrote this request,
+    // the client router caches the response under the REWRITTEN URL so a
+    // subsequent prefetch of a different source that rewrites to the same
+    // target hits cache. Vanilla Next surfaces the rewritten path/query via
+    // \`x-nextjs-rewritten-path\` / \`x-nextjs-rewritten-query\` on every
+    // rewrite response (upstream commit "[Segment Cache] Fix: Key by
+    // rewritten search" #81986). Without these, our adapter's
+    // \`/search-params-with-greeting\` prefetch was keyed by the request URL
+    // — segment-cache would never dedupe \`?searchParam=rewritesTo…\` and
+    // \`?searchParam=alsoRewrites…\` into the same rewritten target, and the
+    // greeting prefetch wouldn't cache the dynamic render by
+    // \`?greeting=hello\`.
+    if (routeResult?.mwRewrite) {
+      try {
+        const rewriteUrl = routeResult.mwRewrite.startsWith("/")
+          ? new URL(routeResult.mwRewrite, "http://creek.local")
+          : new URL(routeResult.mwRewrite);
+        const rwPath = rewriteUrl.pathname;
+        const rwQuery = rewriteUrl.search.startsWith("?")
+          ? rewriteUrl.search.slice(1)
+          : rewriteUrl.search;
+        if (rwPath && rwPath !== url.pathname && !h.has("x-nextjs-rewritten-path")) {
+          h.set("x-nextjs-rewritten-path", rwPath);
+        }
+        const origQuery = url.search.startsWith("?")
+          ? url.search.slice(1)
+          : url.search;
+        if (rwQuery && rwQuery !== origQuery && !h.has("x-nextjs-rewritten-query")) {
+          h.set("x-nextjs-rewritten-query", rwQuery);
+        }
+      } catch {}
     }
     // Drop Content-Length for HTML responses: the quirks-mode rewriter and
     // data-dpl-id injector in \`__rewriteFirstChunk\` can expand the first
