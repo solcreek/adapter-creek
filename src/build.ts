@@ -432,7 +432,282 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     hasPrerender: ctx.outputs.prerenders.length > 0,
   });
 
+  // Phase 2a (experimental, opt-in via \`CREEK_MULTI_WORKER=1\`): emit a
+  // 3-worker output that reuses the single-worker bundle as the
+  // node-runtime worker. The dispatcher forwards unconditionally to it
+  // via a service binding. Phase 2b will carve middleware + routing
+  // into the dispatcher and Phase 2c produces a proper edge-runtime
+  // bundle. Staying opt-in means enterprise customers get multi-runtime
+  // isolation + fluid-compute-ready topology, while hobbyist tiers keep
+  // the lean single-worker path.
+  if (process.env.CREEK_MULTI_WORKER === "1") {
+    await emitMultiWorker(ctx, outputDir, serverDir);
+  }
+
   console.log(`  [Creek Adapter] Output ready: ${OUTPUT_DIR}/`);
+}
+
+/**
+ * Count handlers by runtime so we know whether multi-worker emit makes
+ * sense. Returns \`{ nodejs, edge }\` populated from every handler-bearing
+ * output bucket. Middleware is separate (dispatcher responsibility) and
+ * isn't counted here.
+ */
+interface RuntimeHandlerCounts {
+  nodejs: number;
+  edge: number;
+}
+
+function classifyHandlersByRuntime(
+  outputs: BuildContext["outputs"],
+): RuntimeHandlerCounts {
+  const counts: RuntimeHandlerCounts = { nodejs: 0, edge: 0 };
+  for (const bucket of [outputs.appPages, outputs.appRoutes, outputs.pages, outputs.pagesApi]) {
+    for (const h of bucket) {
+      if (h.runtime === "edge") counts.edge += 1;
+      else counts.nodejs += 1;
+    }
+  }
+  return counts;
+}
+
+/**
+ * Build a pathname → runtime-label mapping the dispatcher uses to pick
+ * NODE_WORKER vs EDGE_WORKER. Concrete pathnames (\`/foo\`, \`/about\`) are
+ * kept as literal keys; bracket pathnames (\`/[slug]/cache\`) get a
+ * generated regex string so the dispatcher can \`new RegExp(pattern)\` at
+ * request time. Order: concrete entries first, then bracket patterns in
+ * descending specificity (longer pathname first, catch-all last).
+ */
+interface RouteRuntimeEntry {
+  /** Literal pathname when no brackets; otherwise undefined. */
+  pathname?: string;
+  /** Source string for a RegExp built at worker init. Mutually exclusive with \`pathname\`. */
+  pattern?: string;
+  /** "nodejs" or "edge". */
+  runtime: "nodejs" | "edge";
+}
+
+function buildRouteRuntimeMap(
+  outputs: BuildContext["outputs"],
+): RouteRuntimeEntry[] {
+  const literals: RouteRuntimeEntry[] = [];
+  const patterns: RouteRuntimeEntry[] = [];
+
+  const pushHandler = (p: string, runtime: "nodejs" | "edge") => {
+    if (p.includes("[")) {
+      patterns.push({ pattern: bracketPathToRegexSource(p), runtime });
+    } else {
+      literals.push({ pathname: p, runtime });
+    }
+  };
+
+  for (const bucket of [
+    outputs.appPages,
+    outputs.appRoutes,
+    outputs.pages,
+    outputs.pagesApi,
+  ]) {
+    for (const h of bucket) {
+      const runtime = h.runtime === "edge" ? "edge" : "nodejs";
+      pushHandler(h.pathname, runtime);
+    }
+  }
+
+  // Patterns with more path segments match first so \`/users/[id]\` beats
+  // \`/[...catchall]\`. Same heuristic the runtime routing layer uses.
+  patterns.sort((a, b) => {
+    const as = (a.pattern ?? "").split("/").length;
+    const bs = (b.pattern ?? "").split("/").length;
+    return bs - as;
+  });
+
+  return [...literals, ...patterns];
+}
+
+/** Convert \`/[slug]/cache\` → \`^/([^/]+)/cache$\` (RegExp source string). */
+function bracketPathToRegexSource(pathname: string): string {
+  let re = "";
+  let i = 0;
+  while (i < pathname.length) {
+    const ch = pathname[i];
+    if (ch === "[") {
+      const end = pathname.indexOf("]", i);
+      if (end === -1) {
+        re += "\\[";
+        i += 1;
+        continue;
+      }
+      const inner = pathname.slice(i + 1, end);
+      if (inner.startsWith("...")) {
+        re += "(.+)";
+      } else if (inner.startsWith("[...") && inner.endsWith("]")) {
+        re += "(.*)";
+      } else {
+        re += "([^/]+)";
+      }
+      i = end + 1;
+      continue;
+    }
+    if (/[.*+?^${}()|\\]/.test(ch)) re += "\\" + ch;
+    else re += ch;
+    i += 1;
+  }
+  return "^" + re + "$";
+}
+
+/**
+ * Emit the 3-worker multi-runtime layout: a dispatcher + node-runtime +
+ * edge-runtime. Phase 2a reuses the single-worker bundle as the
+ * node-runtime worker's \`worker.js\` — the dispatcher just forwards
+ * every request via a service binding. This validates the real
+ * end-to-end plumbing (service binding preserves body + headers +
+ * streaming for genuine Next.js responses) before Phase 2b moves
+ * middleware/routing up into the dispatcher.
+ *
+ * Opt-in via \`CREEK_MULTI_WORKER=1\`. The single-worker bundle in
+ * \`server/\` stays untouched so existing deploys are unaffected.
+ */
+async function emitMultiWorker(
+  ctx: BuildContext,
+  outputDir: string,
+  serverDir: string,
+): Promise<void> {
+  const runtimes = classifyHandlersByRuntime(ctx.outputs);
+  const routeRuntimeMap = buildRouteRuntimeMap(ctx.outputs);
+  console.log(
+    `  [Creek Adapter] Multi-worker build: nodejs=${runtimes.nodejs} edge=${runtimes.edge} (routeRuntimeMap entries: ${routeRuntimeMap.length})`,
+  );
+
+  const dispatcherDir = path.join(outputDir, "dispatcher");
+  const nodeDir = path.join(outputDir, "node-runtime");
+  const edgeDir = path.join(outputDir, "edge-runtime");
+  for (const d of [dispatcherDir, nodeDir, edgeDir]) {
+    await fs.mkdir(d, { recursive: true });
+  }
+
+  // --- node-runtime worker = existing single-worker bundle (Phase 2a) ---
+  //
+  // Copy server/worker.js + server/wrangler.toml into node-runtime/ so
+  // the real Next.js handler runs there. In Phase 2b this worker will
+  // receive pre-routed, pre-middleware requests from the dispatcher via
+  // x-creek-* headers and skip its own middleware/resolveRoutes.
+  const singleWorkerJs = path.join(serverDir, "worker.js");
+  const nodeWorkerJs = path.join(nodeDir, "worker.js");
+  await fs.copyFile(singleWorkerJs, nodeWorkerJs);
+
+  // Mirror the server/wrangler.toml into node-runtime/ but rename
+  // \`name\` so the service binding target matches (\`creek-node-runtime\`)
+  // and bump the \`assets.directory\` so it still resolves to the shared
+  // \`../assets/\`.
+  const singleWranglerToml = await fs.readFile(
+    path.join(serverDir, "wrangler.toml"),
+    "utf-8",
+  );
+  const nodeWranglerToml = singleWranglerToml.replace(
+    /name = "creek"/,
+    'name = "creek-node-runtime"',
+  );
+  await fs.writeFile(path.join(nodeDir, "wrangler.toml"), nodeWranglerToml);
+
+  // --- dispatcher worker: thin forwarder (Phase 2a) ---
+  //
+  // Unconditional forward to NODE_WORKER until Phase 2b splits by
+  // runtime label. The \`x-creek-from\` header gives us a probe for
+  // ensuring every request passed through the dispatcher.
+  // Build-time map embedded as a JS constant so the dispatcher can pick
+  // NODE_WORKER vs EDGE_WORKER without re-parsing routes-manifest.json.
+  // Phase 2b step 1: the map is emitted and compiled into regex at worker
+  // init but not yet used for dispatch — that lands in the next commit
+  // once edge-runtime carries a real bundle.
+  const routeRuntimeMapLiteral = JSON.stringify(routeRuntimeMap);
+
+  const dispatcherSource = [
+    "// Creek adapter — dispatcher worker (Phase 2b step 3).",
+    "// Picks NODE_WORKER or EDGE_WORKER based on the build-time",
+    "// route→runtime map. Unknown pathnames (no handler match) fall",
+    "// through to NODE_WORKER as a conservative default — matches the",
+    "// single-worker behaviour where every unclaimed request goes to",
+    "// the one bundle. Edge bundle split follows in Phase 2c.",
+    "",
+    "const RAW_ROUTE_RUNTIME_MAP = " + routeRuntimeMapLiteral + ";",
+    "const ROUTE_RUNTIME_LITERALS = new Map();",
+    "const ROUTE_RUNTIME_PATTERNS = [];",
+    "for (const entry of RAW_ROUTE_RUNTIME_MAP) {",
+    "  if (typeof entry.pathname === \"string\") {",
+    "    ROUTE_RUNTIME_LITERALS.set(entry.pathname, entry.runtime);",
+    "  } else if (typeof entry.pattern === \"string\") {",
+    "    try { ROUTE_RUNTIME_PATTERNS.push([new RegExp(entry.pattern), entry.runtime]); } catch {}",
+    "  }",
+    "}",
+    "",
+    "function pickRuntimeForPathname(pathname) {",
+    "  const literal = ROUTE_RUNTIME_LITERALS.get(pathname);",
+    "  if (literal) return literal;",
+    "  for (const [re, rt] of ROUTE_RUNTIME_PATTERNS) {",
+    "    if (re.test(pathname)) return rt;",
+    "  }",
+    "  return \"nodejs\";",
+    "}",
+    "",
+    "export default {",
+    "  async fetch(request, env, ctx) {",
+    "    const url = new URL(request.url);",
+    "    const runtime = pickRuntimeForPathname(url.pathname);",
+    "    const target = runtime === \"edge\" ? env.EDGE_WORKER : env.NODE_WORKER;",
+    "    const resp = await target.fetch(request);",
+    "    const headers = new Headers(resp.headers);",
+    '    headers.set("x-creek-from", "dispatcher");',
+    '    headers.set("x-creek-route-runtime", runtime);',
+    "    return new Response(resp.body, {",
+    "      status: resp.status,",
+    "      statusText: resp.statusText,",
+    "      headers,",
+    "    });",
+    "  },",
+    "};",
+    "",
+  ].join("\n");
+  await fs.writeFile(path.join(dispatcherDir, "worker.js"), dispatcherSource);
+
+  await fs.writeFile(
+    path.join(dispatcherDir, "wrangler.toml"),
+    [
+      "# Generated by adapter-creek (multi-worker, Phase 2a).",
+      'name = "creek-dispatcher"',
+      'main = "worker.js"',
+      'compatibility_date = "2026-03-23"',
+      'compatibility_flags = ["nodejs_compat"]',
+      "",
+      "[[services]]",
+      'binding = "NODE_WORKER"',
+      'service = "creek-node-runtime"',
+      "",
+      "[[services]]",
+      'binding = "EDGE_WORKER"',
+      'service = "creek-edge-runtime"',
+      "",
+    ].join("\n"),
+  );
+
+  // --- edge-runtime worker = same bundle as node-runtime (Phase 2b) ---
+  //
+  // Step 2: give edge-runtime the full adapter bundle so it can serve a
+  // request identically to node-runtime once the dispatcher starts
+  // routing edge handlers there. Bundle optimisation (stripping nodejs-
+  // only handler imports) lands in Phase 2c — for now we prioritise
+  // functional correctness of the dispatch topology over bundle size.
+  const edgeWorkerJs = path.join(edgeDir, "worker.js");
+  await fs.copyFile(singleWorkerJs, edgeWorkerJs);
+  const edgeWranglerToml = singleWranglerToml.replace(
+    /name = "creek"/,
+    'name = "creek-edge-runtime"',
+  );
+  await fs.writeFile(path.join(edgeDir, "wrangler.toml"), edgeWranglerToml);
+
+  console.log(
+    `  [Creek Adapter] Multi-worker emitted: dispatcher + node-runtime + edge-runtime`,
+  );
 }
 
 // True for static-file entries that represent a pre-rendered HTML page

@@ -1,57 +1,52 @@
 {
   "version": 2,
   "_comment": [
-    "Adapter-creek deploy-test exclusions. Merged at runtime with Next.js's",
-    "canonical test/deploy-tests-manifest.json via",
-    "NEXT_EXTERNAL_TESTS_FILTERS in .github/workflows/test-e2e-deploy.yml.",
-    "Exclusions here are only for tests that fundamentally do not apply to",
-    "the Cloudflare Workers (workerd) deployment model — native addons,",
-    "multi-worker forwarding, or other Node-only assumptions. Regressions",
-    "and flakey tests are NOT listed here."
+    "Adapter-creek deploy-test exclusions. Merged with Next.js's canonical",
+    "test/deploy-tests-manifest.json via NEXT_EXTERNAL_TESTS_FILTERS in",
+    ".github/workflows/test-e2e-deploy.yml.",
+    "",
+    "Only for tests that fundamentally do not apply to the Cloudflare",
+    "Workers (workerd) deployment model:",
+    "  - `suites.*.failed` — individual subtests whose assertions check a",
+    "    specific Node-runtime identity or hit a workerd/miniflare HTTP",
+    "    transport quirk the adapter can't paper over.",
+    "  - `rules.exclude` — whole test files whose `next build` fails on",
+    "    workerd because the fixture requires a native .node addon or a",
+    "    bundler feature that doesn't work in our pipeline.",
+    "",
+    "Regressions and flakey tests are NOT listed here. If a test starts",
+    "failing for a reason other than the ones above, fix the adapter."
   ],
   "suites": {
-    "test/e2e/app-dir/actions/app-action.test.ts": {
-      "failed": [
-        "app-dir action handling should forward action request to a worker that contains the action handler (node)",
-        "app-dir action handling should forward action request to a worker that contains the action handler (edge)",
-        "app-dir action handling should not error when a forwarded action triggers a redirect (node)",
-        "app-dir action handling should not error when a forwarded action triggers a redirect (edge)"
-      ],
-      "_note": "Multi-worker forwarding — relies on deploying the same app to two different workers (one with the action handler, one without) so the request-receiving worker can forward a serialized Next-Action to the handler worker over a separate fetch. Creek deploys each app as a single worker; the fixture's two /delayed-action/(node|edge) routes collapse into the same isolate and the 'forwarded' request never carries a valid Next-Action body. Skipping rather than red-herring debugging a model we don't support."
-    },
-    "test/e2e/app-dir/actions/app-action-node-middleware.test.ts": {
-      "failed": [
-        "app-dir action handling should forward action request to a worker that contains the action handler (node)",
-        "app-dir action handling should forward action request to a worker that contains the action handler (edge)",
-        "app-dir action handling should not error when a forwarded action triggers a redirect (node)",
-        "app-dir action handling should not error when a forwarded action triggers a redirect (edge)"
-      ],
-      "_note": "This file is just `require('./app-action.test')` with TEST_NODE_MIDDLEWARE=true — it re-runs the entire app-action suite under a different file path, so the same multi-worker tests re-fail here. Mirror the exclusions."
-    },
     "test/e2e/app-dir/actions-streaming/actions-streaming.test.ts": {
       "failed": [
         "actions-streaming actions returning a ReadableStream should properly stream the response without buffering"
       ],
-      "_note": "The streaming itself works — the `<h3>Received N chunks</h3>` element renders progressively and the response isn't buffered to EOF (our Content-Encoding: identity fix landed in 221db12). What fails is the exact equality `'Received 50 chunks'` at the end of the test. The fixture's API route emits 50 × 91-byte text writes via `controller.enqueue()`; workerd's HTTP chunked-transfer serialization splits each 91-byte payload into two (28 + 63) wire chunks — verified by `nc`-ing the raw response — and the server-action path's `fetch('/readable-stream/api')` then splits each chunk further during read-back, so React's RSC binary framer emits ~149 `2:bLEN,DATA` frames and the browser-side reconstructed ReadableStream yields ~149 reads instead of 50. This is a workerd HTTP transport quirk, not an adapter defect. Fixed in 221db12 (streaming path); skipping the 50-exact assertion pending a workerd-side guarantee."
+      "_note": "Progressive streaming works end-to-end (our Content-Encoding: identity fix landed in 221db12). The exact-equality assertion `'Received 50 chunks'` fails because workerd's HTTP chunked-transfer splits each 91-byte payload into two wire chunks, inflating React's RSC binary framer to ~149 frames — a workerd transport quirk, not an adapter defect."
     },
     "test/e2e/app-dir/use-server-inserted-html/use-server-inserted-html.test.ts": {
       "failed": [
         "use-server-inserted-html should render css-in-js suspense boundary correctly"
       ],
-      "_note": "All three markers (`$test-fallback-sentinel`, suspense data chunk, `$RC=function`) ARE present in the response — the adapter renders the page correctly with progressive streaming and the other two sub-tests (`should render initial styles of css-in-js in nodejs/edge SSR correctly`) pass. What fails is the EXACT ORDER assertion `['fallback', 'data', 'refresh-script']`: Miniflare's HTTP proxy auto-compresses text/html responses to EOF-gzipped single chunks, collapsing all three markers into one arrival. Node's `for await (const chunk of response.body)` then iterates a single decompressed chunk and the test's in-chunk check order (`data` → `refresh-script` → `fallback`) pushes the markers as `['data', 'refresh-script', 'fallback']` (backwards). Verified a local `Content-Encoding: identity` override + `Cache-Control: no-transform` both fail to disable miniflare's compression pass. In production CF Workers the edge compresses at byte-stream granularity (chunks preserved), so this is a dev-environment (miniflare) artefact, not an adapter defect. The other three server-inserted-html assertions (basic styled-jsx/styled-components SSR, both node + edge variants) pass."
+      "_note": "Response contains all three markers in the right order; the test's EXACT ORDER assertion fails because miniflare's HTTP proxy auto-gzips text/html responses to EOF and Node's async iterator sees one collapsed chunk. Production CF Workers compresses at byte-stream granularity so this is a dev-env (miniflare) artefact. Other 2 subtests pass."
     },
-    "_removed-skips-to-face-reality": "2026-04-21: we previously skipped the 6 cache-components-allow-otel-spans + fallback-shells subtests under this block, masking real adapter bugs. Removed to surface them as genuine CI failures. The cache-components-allow-otel-spans /novel/cache 500 is adapter-specific (see memory project_otel_investigation.md). The 5 fallback-shells subtests also fail on vanilla at pinned canary 16.3.0-canary.2, but they're in-scope to fix as part of partial-fallback route-shell upgrading (PR #89063 infra)."
+    "test/e2e/undici-fetch/index.test.ts": {
+      "failed": [
+        "undici fetch undici global Headers should return true when undici is used",
+        "undici fetch undici global Request should return true when undici is used",
+        "undici fetch undici global Response should return true when undici is used"
+      ],
+      "_note": "Runtime-identity probe: expects `globalThis.Headers/Request/Response` to be undici's implementation. workerd ships its own spec-compliant WHATWG classes — behavioral parity is fine, identity isn't. The 4th subtest (`global fetch should return true`) passes."
+    }
   },
   "rules": {
     "include": [],
     "exclude": [
       "test/e2e/prerender-native-module.test.ts",
-      "test/e2e/async-modules/index.test.ts",
       "test/e2e/app-dir/turbopack-reports/turbopack-reports.test.ts",
       "test/e2e/app-dir/scss/with-styled-jsx/with-styled-jsx.test.ts",
-      "test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts",
-      "test/e2e/undici-fetch/index.test.ts"
+      "test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts"
     ],
-    "_exclude_note": "All skips cover fixtures where \\`next build\\` itself fails before a request can be served (\\`Custom deploy script failed: undefined (1)\\` in harness), plus runtime-identity tests that assert \\`undici\\` is the fetch/Headers/Response implementation — CF Workers ships its own WHATWG implementation, not undici, so the tests are checking for a specific Node behavior that doesn't apply here. prerender-native-module + turbopack-reports require native .node addons (sqlite3/prerender's C++ binding); scss/with-styled-jsx pulls in sass / sass-embedded, both of which our CSS pipeline can't process through the adapter bundling path; next-dist-client-esm-import depends on a \\`file:\\`/\\`link:\\` workspace package that our pnpm install in the harness doesn't resolve; async-modules exercises top-level-await inside Pages Router pages, and workerd's host-initiated module-evaluation Promise throws \\`incompatible receiver\\` when awaited from adapter-owned code (static-import, Promise.resolve wrapping, and async-IIFE wrapping all failed) — revisit when the workerd side lands. undici-fetch checks \\`response.body instanceof ReadableStream\\` (from node:stream/web) and \\`(new Headers())[Symbol.iterator].name === 'entries'\\` — both assertions are implementation-detail probes that workerd's spec-compliant replacements legitimately fail; no functional gap."
+    "_exclude_note": "All four fixtures fail during `next build` on workerd — the harness exits with `Custom deploy script failed: undefined (1)` before any request runs. prerender-native-module + turbopack-reports require native .node addons (sqlite3 / prerender's C++ binding); workerd has no loader for those. scss/with-styled-jsx pulls in sass / sass-embedded which our CSS bundler can't process. next-dist-client-esm-import depends on a `file:`/`link:` workspace package our pnpm install in the harness doesn't resolve. Nothing actionable at the adapter level."
   }
 }
