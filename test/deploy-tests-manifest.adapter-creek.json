@@ -42,9 +42,8 @@
   "rules": {
     "include": [],
     "exclude": [
-      "test/e2e/app-dir/scss/with-styled-jsx/with-styled-jsx.test.ts",
       "test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts"
     ],
-    "_exclude_note": "Both fixtures fail during `next build` for reasons outside the adapter's reach. scss/with-styled-jsx pulls in sass / sass-embedded which our CSS bundler can't process. next-dist-client-esm-import hits a Turbopack regression at the pinned canary: JSX in a workspace-pkg `.js` file fails to parse (webpack builds the same fixture cleanly; vanilla `next build` fails the same way without our adapter). Nothing actionable at the adapter level."
+    "_exclude_note": "Turbopack regression at the pinned canary: JSX inside a workspace-pkg `.js` file fails to parse. Webpack builds the same fixture cleanly; vanilla `next build` (default Turbopack) fails identically without our adapter. Nothing actionable at the adapter level — will clear when the upstream canary lands the turbopack-side fix."
   }
 }

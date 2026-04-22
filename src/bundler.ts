@@ -183,12 +183,34 @@ async function patchNodeExternalRequireConditions(distDir: string): Promise<void
     ...builtinModules.map((name) => `node:${name}`),
   ]);
 
-  let entries: string[];
-  try {
-    entries = await fs.readdir(serverChunksDir);
-  } catch {
-    return;
-  }
+  // Collect every chunk that may contain Turbopack's external-require
+  // registration pattern. Originally this patcher only looked at
+  // `[externals]*.js` files in `server/chunks/` — but Turbopack also emits
+  // the same `.x("pkg", () => require("pkg"))` registrations inside
+  // `server/chunks/ssr/[root-of-the-server]__*.js` for packages that the
+  // main chunk lazy-loads (e.g. `styled-jsx/style.js` for SSR of apps that
+  // use styled-jsx). wrangler's esbuild then fails with
+  // `Could not resolve "styled-jsx/style.js"` because pnpm doesn't hoist
+  // those indirect deps to the top level. Resolving via `projectRequire`
+  // (which walks into `.pnpm/` correctly) and rewriting the require() to
+  // an absolute path unblocks the bundle.
+  const chunkFiles: string[] = [];
+  const collectFromDir = async (dir: string) => {
+    let entries: string[];
+    try {
+      entries = await fs.readdir(dir);
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (!entry.endsWith(".js")) continue;
+      chunkFiles.push(path.join(dir, entry));
+    }
+  };
+  await collectFromDir(serverChunksDir);
+  await collectFromDir(path.join(serverChunksDir, "ssr"));
+
+  if (chunkFiles.length === 0) return;
 
   const externalRequirePattern =
     /(\w+\.x\(\s*(["'])([^"']+)\2\s*,\s*\(\)\s*=>\s*)require\(\s*(["'])\3\4\s*\)(\s*\))/g;
@@ -203,10 +225,7 @@ async function patchNodeExternalRequireConditions(distDir: string): Promise<void
     return parts.join("/");
   };
 
-  for (const entry of entries) {
-    if (!entry.startsWith("[externals]") || !entry.endsWith(".js")) continue;
-
-    const filePath = path.join(serverChunksDir, entry);
+  for (const filePath of chunkFiles) {
     let code: string;
     try {
       code = await fs.readFile(filePath, "utf-8");
