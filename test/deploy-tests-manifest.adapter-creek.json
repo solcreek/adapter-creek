@@ -17,16 +17,7 @@
     "Regressions and flakey tests are NOT listed here. If a test starts",
     "failing for a reason other than the ones above, fix the adapter."
   ],
-  "suites": {
-    "test/e2e/undici-fetch/index.test.ts": {
-      "failed": [
-        "undici fetch undici global Headers should return true when undici is used",
-        "undici fetch undici global Request should return true when undici is used",
-        "undici fetch undici global Response should return true when undici is used"
-      ],
-      "_note": "Runtime-identity probe: expects `globalThis.Headers/Request/Response` to be undici's implementation. workerd ships its own spec-compliant WHATWG classes — behavioral parity is fine, identity isn't. The 4th subtest (`global fetch should return true`) passes."
-    }
-  },
+  "suites": {},
   "rules": {
     "include": [],
     "exclude": [

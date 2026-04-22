@@ -305,6 +305,33 @@ if (typeof globalThis.Request === "function") {
   globalThis.Request = __PatchedRequest;
 }
 
+// Align Headers.prototype[Symbol.iterator] with \`entries\` so that its
+// \`.name\` reads \`"entries"\`. Node's undici (which Next.js bundles for
+// server-side fetch on Node) implements \`Headers\` with
+// \`Headers.prototype[Symbol.iterator] === Headers.prototype.entries\`
+// so the iterator function inherits the \`"entries"\` name. Workerd's
+// native Headers class exposes them as two distinct functions: \`entries\`
+// is properly named, but the \`[Symbol.iterator]\` slot holds an anonymous
+// function (\`name === ""\`). Tests that probe \`(new Headers())[Symbol.iterator].name === 'entries'\`
+// therefore fail even though the behaviour is identical. Mirror undici's
+// aliasing on workerd so such probes — and any user code that relies on
+// them — succeed with no behavioral change.
+try {
+  const HeadersCtor = globalThis.Headers;
+  if (
+    typeof HeadersCtor === "function" &&
+    HeadersCtor.prototype &&
+    typeof HeadersCtor.prototype.entries === "function" &&
+    HeadersCtor.prototype[Symbol.iterator] !== HeadersCtor.prototype.entries
+  ) {
+    Object.defineProperty(HeadersCtor.prototype, Symbol.iterator, {
+      value: HeadersCtor.prototype.entries,
+      writable: true,
+      configurable: true,
+    });
+  }
+} catch {}
+
 // Coalesce back-to-back stream chunks on intra-worker fetch responses.
 // Workerd's HTTP client splits each server-side \`controller.enqueue()\`
 // into multiple wire-level chunks (specific to its socket-write buffer
