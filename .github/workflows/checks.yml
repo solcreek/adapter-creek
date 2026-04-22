@@ -1,0 +1,35 @@
+name: checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel older runs on the same branch / PR when a new commit lands —
+# there's no value in finishing the previous check against code that's
+# already been superseded.
+concurrency:
+  group: checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: ${{ matrix.script }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        # Each entry becomes a separate status check on the PR. We don't
+        # have lint/prettier scripts yet; add them here when they exist.
+        script:
+          - typecheck
+          - test
+          - build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/install-dependencies
+
+      - name: pnpm ${{ matrix.script }}
+        run: pnpm ${{ matrix.script }}

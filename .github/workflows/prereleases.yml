@@ -1,0 +1,35 @@
+name: prereleases
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# One prerelease per ref is enough — cancel older runs.
+concurrency:
+  group: prereleases-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    name: pkg-pr-new
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Match opennextjs-cloudflare: skip when a fork runs this workflow.
+    # pkg-pr-new still works on forks but publishes to a different namespace;
+    # restricting to our org keeps the published-snapshot URL predictable.
+    if: github.repository_owner == 'solcreek'
+    permissions:
+      # pkg-pr-new posts a PR comment with an `npm install` URL — needs
+      # pull-request write to do so.
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/install-dependencies
+
+      - name: Build
+        run: pnpm build
+
+      - name: Publish snapshot
+        run: pnpm dlx pkg-pr-new publish

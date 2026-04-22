@@ -1,0 +1,33 @@
+name: Install dependencies
+description: |
+  Shared bootstrap for every workflow: set up pnpm + Node + a lockfile-frozen
+  install. Matches the opennextjs-cloudflare composite action's shape so this
+  repo's CI stays easy to port to their infra if we ever consolidate.
+
+runs:
+  using: composite
+  steps:
+    - name: Install pnpm
+      uses: pnpm/action-setup@v4
+      with:
+        version: 10.33.0
+        run_install: false
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+        cache: pnpm
+
+    - name: Enable Node compile cache
+      shell: bash
+      run: |
+        # Node 22+ caches compiled modules across invocations when this env
+        # var points at a writable directory — shaves seconds off every
+        # `tsc`, `vitest`, and script bootstrap inside the job.
+        echo "NODE_COMPILE_CACHE=$HOME/.node_compile_cache" >> "$GITHUB_ENV"
+        mkdir -p "$HOME/.node_compile_cache"
+
+    - name: Install
+      shell: bash
+      run: pnpm install --frozen-lockfile
