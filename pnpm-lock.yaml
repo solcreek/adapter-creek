@@ -14,9 +14,6 @@ importers:
       '@node-rs/xxhash':
         specifier: ^1.7.6
         version: 1.7.6
-      miniflare:
-        specifier: ^4.20260410.0
-        version: 4.20260410.0
       sql.js:
         specifier: ^1.14.1
         version: 1.14.1
@@ -27,6 +24,9 @@ importers:
       '@types/node':
         specifier: ^22.13.10
         version: 22.19.17
+      miniflare:
+        specifier: ^4.20260410.0
+        version: 4.20260410.0
       next:
         specifier: 16.2.3
         version: 16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
