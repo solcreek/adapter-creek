@@ -42,7 +42,7 @@ Creek is a **platform** — this adapter is the bridge between Next.js and that 
 
 ## Status
 
-Near-complete Next.js coverage on Cloudflare Workers. Single entry in the skip manifest is an upstream Turbopack canary regression, unrelated to the adapter.
+Full Next.js coverage on Cloudflare Workers — zero adapter-specific skips. The `test/deploy-tests-manifest.adapter-creek.json` file is empty; every test that runs against other adapters also runs (and passes) here.
 
 | Feature | Status |
 |---------|:------:|
@@ -56,7 +56,7 @@ Near-complete Next.js coverage on Cloudflare Workers. Single entry in the skip m
 | `@vercel/og` (node + edge) | ✅ WASM-path |
 | `sqlite3` native-addon packages | ✅ transparent sql.js shim |
 | Multi-runtime isolation (opt-in) | ✅ `CREEK_MULTI_WORKER=1` |
-| Next.js e2e deploy suite | ~99% of in-scope tests |
+| Next.js e2e deploy suite | ✅ 100% of in-scope tests (full matrix green) |
 
 ## Requirements
 
