@@ -1,28 +1,12 @@
 {
   "version": 2,
-  "_comment": [
-    "Adapter-creek deploy-test exclusions. Merged with Next.js's canonical",
-    "test/deploy-tests-manifest.json via NEXT_EXTERNAL_TESTS_FILTERS in",
-    ".github/workflows/test-e2e-deploy.yml.",
-    "",
-    "Only for tests that fundamentally do not apply to the Cloudflare",
-    "Workers (workerd) deployment model:",
-    "  - `suites.*.failed` — individual subtests whose assertions check a",
-    "    specific Node-runtime identity or hit a workerd/miniflare HTTP",
-    "    transport quirk the adapter can't paper over.",
-    "  - `rules.exclude` — whole test files whose `next build` fails on",
-    "    workerd because the fixture requires a native .node addon or a",
-    "    bundler feature that doesn't work in our pipeline.",
-    "",
-    "Regressions and flakey tests are NOT listed here. If a test starts",
-    "failing for a reason other than the ones above, fix the adapter."
-  ],
+  "_comment": "Adapter-creek deploy-test exclusions. Merged with Next.js's canonical test/deploy-tests-manifest.json via NEXT_EXTERNAL_TESTS_FILTERS. Only for tests that can't run on this adapter — never for regressions or flakes.",
   "suites": {},
   "rules": {
     "include": [],
     "exclude": [
       "test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts"
     ],
-    "_exclude_note": "Turbopack regression at the pinned canary: JSX inside a workspace-pkg `.js` file fails to parse. Webpack builds the same fixture cleanly; vanilla `next build` (default Turbopack) fails identically without our adapter. Nothing actionable at the adapter level — will clear when the upstream canary lands the turbopack-side fix."
+    "_exclude_note": "Upstream Turbopack regression at the pinned canary: JSX inside a workspace-pkg `.js` file fails to parse. Vanilla `next build` fails identically; webpack builds it cleanly. Clears when the canary lands the fix."
   }
 }
