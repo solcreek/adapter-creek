@@ -104,8 +104,26 @@ const mf = new Miniflare({
     },
     {
       name: "edge-runtime",
-      modules: true,
-      scriptPath: edgeScript,
+      // Phase 2b step 2: edge-runtime carries the full adapter bundle
+      // (same file as node-runtime), so it needs the same module
+      // loading workaround and the same bindings. Phase 2c will emit a
+      // trimmed edge-only bundle here.
+      modules: [{ type: "ESModule", path: edgeScript }],
+      compatibilityDate: "2026-03-23",
+      compatibilityFlags: ["nodejs_compat"],
+      assets: {
+        directory: nodeAssetsDir,
+        binding: "ASSETS",
+        routerConfig: {
+          invoke_user_worker_ahead_of_assets: true,
+          has_user_worker: true,
+        },
+      },
+      durableObjects: {
+        NEXT_CACHE_DO_QUEUE: { className: "DOQueueHandler", useSQLite: true },
+        NEXT_TAG_CACHE_DO_SHARDED: { className: "DOShardedTagCache", useSQLite: true },
+        NEXT_CACHE_DO_BUCKET_PURGE: { className: "BucketCachePurge", useSQLite: true },
+      },
     },
   ],
 });
