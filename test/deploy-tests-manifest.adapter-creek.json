@@ -18,12 +18,6 @@
     "failing for a reason other than the ones above, fix the adapter."
   ],
   "suites": {
-    "test/e2e/app-dir/actions-streaming/actions-streaming.test.ts": {
-      "failed": [
-        "actions-streaming actions returning a ReadableStream should properly stream the response without buffering"
-      ],
-      "_note": "Progressive streaming works end-to-end (our Content-Encoding: identity fix landed in 221db12). The exact-equality assertion `'Received 50 chunks'` fails because workerd's HTTP chunked-transfer splits each 91-byte payload into two wire chunks, inflating React's RSC binary framer to ~149 frames — a workerd transport quirk, not an adapter defect."
-    },
     "test/e2e/undici-fetch/index.test.ts": {
       "failed": [
         "undici fetch undici global Headers should return true when undici is used",

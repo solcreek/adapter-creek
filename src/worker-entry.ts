@@ -305,6 +305,92 @@ if (typeof globalThis.Request === "function") {
   globalThis.Request = __PatchedRequest;
 }
 
+// Coalesce back-to-back stream chunks on intra-worker fetch responses.
+// Workerd's HTTP client splits each server-side \`controller.enqueue()\`
+// into multiple wire-level chunks (specific to its socket-write buffer
+// layout — empirically one 91-byte enqueue lands as 28 + 63 bytes).
+// When a server action then does \`await fetch(selfUrl)\` and returns
+// \`response.body\`, React's RSC serializer reads every split as an
+// independent chunk and emits an RSC frame per chunk, so the client
+// observes ~2× the intended chunk count (actions-streaming test:
+// 99 received vs 50 expected).
+//
+// Fix: override \`globalThis.fetch\` so that, for responses from fetches
+// inside this worker, we pipe \`response.body\` through a TransformStream
+// that concats chunks arriving within a short idle window (10ms).
+// Back-to-back splits (zero delay) merge back into the original
+// write size; genuine 100ms-spaced streaming chunks flush separately.
+// No effect on external fetches — those go to real services whose
+// chunk shapes aren't our problem.
+if (typeof globalThis.fetch === "function") {
+  const __origFetch = globalThis.fetch.bind(globalThis);
+  const COALESCE_IDLE_MS = 10;
+  const __createCoalescer = () => {
+    let buffer = null;
+    let flushTimer = null;
+    let pendingController = null;
+    const flush = () => {
+      flushTimer = null;
+      if (buffer !== null && pendingController) {
+        pendingController.enqueue(buffer);
+        buffer = null;
+      }
+    };
+    return new TransformStream({
+      transform(chunk, controller) {
+        pendingController = controller;
+        if (buffer === null) {
+          buffer = chunk;
+        } else {
+          const merged = new Uint8Array(buffer.length + chunk.length);
+          merged.set(buffer, 0);
+          merged.set(chunk, buffer.length);
+          buffer = merged;
+        }
+        if (flushTimer !== null) clearTimeout(flushTimer);
+        flushTimer = setTimeout(flush, COALESCE_IDLE_MS);
+      },
+      flush(controller) {
+        if (flushTimer !== null) {
+          clearTimeout(flushTimer);
+          flushTimer = null;
+        }
+        if (buffer !== null) {
+          controller.enqueue(buffer);
+          buffer = null;
+        }
+      },
+    });
+  };
+  globalThis.fetch = async function coalescingFetch(input, init) {
+    const res = await __origFetch(input, init);
+    if (!res.body) return res;
+    // Only coalesce for same-origin fetches. External services supply
+    // responses whose chunk shape we should pass through untouched.
+    let target;
+    try {
+      if (typeof input === "string") target = new URL(input);
+      else if (input instanceof URL) target = input;
+      else if (input && typeof input.url === "string") target = new URL(input.url);
+    } catch {}
+    let sameOrigin = false;
+    try {
+      const selfOrigin = (globalThis.self && globalThis.self.location && globalThis.self.location.origin) || null;
+      if (selfOrigin && target && target.origin === selfOrigin) sameOrigin = true;
+      // Also treat loopback as self-origin — \`fetch("http://127.0.0.1:PORT/...")\`
+      // from a server action inside the same miniflare process.
+      if (target && (target.hostname === "127.0.0.1" || target.hostname === "localhost")) sameOrigin = true;
+    } catch {}
+    if (!sameOrigin) return res;
+    const coalesced = res.body.pipeThrough(__createCoalescer());
+    return new Response(coalesced, {
+      status: res.status,
+      statusText: res.statusText,
+      headers: res.headers,
+    });
+  };
+}
+
 // Patch \`WebAssembly.instantiate\` so libraries that do
 // \`WebAssembly.instantiate(fs.readFileSync("X.wasm"))\` at module load
 // (e.g. \`@vercel/og\` node-runtime loading resvg/yoga wasm) can run on
@@ -5782,19 +5868,19 @@ async function __handleRequestInner(request, env, ctx) {
       }
     }
   } catch {}
-  // Pin Content-Encoding to identity on streaming text/html responses that
-  // don't already declare an encoding. Miniflare's edge simulator looks at
-  // the Content-Type header and, for types in Cloudflare FL's compress
-  // list (text/html, text/css, application/json, etc.), re-encodes the
-  // body with gzip when the client sent Accept-Encoding: gzip — collapsing
+  // Pin Content-Encoding to identity on responses whose content-type
+  // Cloudflare FL would otherwise compress. Miniflare's edge simulator
+  // calls isCompressedByCloudflareFL(contentType) and, when the client
+  // sent Accept-Encoding: gzip, bulk-encodes the body — collapsing
   // streamed chunk boundaries into a single decompressed chunk on the
-  // client side. Its gate logic in ensureAcceptableEncoding() is:
+  // Node-fetch side. Its gate logic in ensureAcceptableEncoding():
   //   if (contentEncoding !== null && contentEncoding !== "gzip" && contentEncoding !== "br") return response;
-  // so an explicit "identity" bypasses the transform. Real CF edge re-reads
-  // Accept-Encoding and re-compresses the bytes on the fly at the edge, so
-  // this label doesn't cost us production bandwidth — it only prevents
-  // miniflare's bulk-encode from breaking tests that assert progressive-
-  // chunk arrival (e.g. use-server-inserted-html).
+  // so an explicit "identity" bypasses the transform. Real CF edge
+  // re-reads Accept-Encoding and re-compresses the bytes on the fly at
+  // the edge, so this label doesn't cost us production bandwidth — it
+  // only prevents miniflare's bulk-encode from breaking tests that
+  // assert progressive-chunk arrival (use-server-inserted-html,
+  // actions-streaming).
   try {
     if (
       response &&
@@ -5802,8 +5888,21 @@ async function __handleRequestInner(request, env, ctx) {
       !response.headers.has("content-encoding") &&
       response.body !== null
     ) {
-      const ct = response.headers.get("content-type") ?? "";
-      if (ct.startsWith("text/html")) {
+      const ct = (response.headers.get("content-type") ?? "").toLowerCase();
+      // Subset of Cloudflare FL's compress-by-default list that Next.js
+      // routes commonly produce. Other FL-compressed types (fonts, XML,
+      // etc.) aren't typically streamed, so their gzip collapse is
+      // invisible to tests.
+      const streamedTypes = [
+        "text/html",
+        "text/plain",
+        "text/css",
+        "text/javascript",
+        "application/javascript",
+        "application/json",
+        "text/x-component", // Next.js RSC payload content-type
+      ];
+      if (streamedTypes.some((t) => ct.startsWith(t))) {
         const headers = new Headers(response.headers);
         headers.set("content-encoding", "identity");
         return new Response(response.body, {
