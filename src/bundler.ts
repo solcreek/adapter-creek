@@ -183,32 +183,27 @@ async function patchNodeExternalRequireConditions(distDir: string): Promise<void
     ...builtinModules.map((name) => `node:${name}`),
   ]);
 
-  // Collect every chunk that may contain Turbopack's external-require
-  // registration pattern. Originally this patcher only looked at
-  // `[externals]*.js` files in `server/chunks/` — but Turbopack also emits
-  // the same `.x("pkg", () => require("pkg"))` registrations inside
-  // `server/chunks/ssr/[root-of-the-server]__*.js` for packages that the
-  // main chunk lazy-loads (e.g. `styled-jsx/style.js` for SSR of apps that
-  // use styled-jsx). wrangler's esbuild then fails with
-  // `Could not resolve "styled-jsx/style.js"` because pnpm doesn't hoist
-  // those indirect deps to the top level. Resolving via `projectRequire`
-  // (which walks into `.pnpm/` correctly) and rewriting the require() to
-  // an absolute path unblocks the bundle.
+  // Narrow scope: only `[externals]*.js` files in `server/chunks/`.
+  // Those are Turbopack's dedicated external-require-registration bundles,
+  // which contain nothing but `.x("pkg", () => require("pkg"))` lines —
+  // rewriting require() to an absolute path there has no module-identity
+  // risk. We tried extending this to `server/chunks/ssr/*.js` to fix the
+  // styled-jsx-subpath case, but those chunks contain real SSR render
+  // code whose require() calls participate in Turbopack's module graph
+  // (same package resolved two ways = two React instances). The
+  // styled-jsx case is now handled via wrangler `alias` entries instead —
+  // see collectSsrLazyRequireAliases() + the wranglerConfig assembly.
+  let entries: string[];
+  try {
+    entries = await fs.readdir(serverChunksDir);
+  } catch {
+    return;
+  }
   const chunkFiles: string[] = [];
-  const collectFromDir = async (dir: string) => {
-    let entries: string[];
-    try {
-      entries = await fs.readdir(dir);
-    } catch {
-      return;
-    }
-    for (const entry of entries) {
-      if (!entry.endsWith(".js")) continue;
-      chunkFiles.push(path.join(dir, entry));
-    }
-  };
-  await collectFromDir(serverChunksDir);
-  await collectFromDir(path.join(serverChunksDir, "ssr"));
+  for (const entry of entries) {
+    if (!entry.startsWith("[externals]") || !entry.endsWith(".js")) continue;
+    chunkFiles.push(path.join(serverChunksDir, entry));
+  }
 
   if (chunkFiles.length === 0) return;
 
@@ -270,6 +265,101 @@ async function patchNodeExternalRequireConditions(distDir: string): Promise<void
       await fs.writeFile(filePath, patched);
     }
   }
+}
+
+/**
+ * Collect `.x("pkg", () => require("pkg"))` lazy-require specifiers out of
+ * `server/chunks/ssr/*.js` and return a map of specifiers → absolute paths
+ * that wrangler's esbuild should alias.
+ *
+ * Why this exists: Turbopack emits those registrations for SSR chunks when
+ * a transitive (indirect) dep like `styled-jsx/style.js` is needed. In
+ * pnpm projects the package lives at `.pnpm/styled-jsx@X/node_modules/...`
+ * and isn't hoisted to a top-level `node_modules/`. esbuild's walker
+ * therefore fails with `Could not resolve "styled-jsx/style.js"`.
+ *
+ * The previous attempt was to rewrite `require("pkg")` inline to an
+ * absolute path, mirroring what we do for `[externals]*.js` chunks — but
+ * `ssr/*.js` chunks also contain real SSR render code whose require()
+ * calls participate in Turbopack's module graph. Absolute-path rewrites
+ * there risk creating two module instances of the same package (once via
+ * Turbopack, once via our rewrite), which silently breaks React etc.
+ * and surfaced as "uncached or runtime data" prerender failures in
+ * `resume-data-cache` on Linux CI only.
+ *
+ * Returning an alias map instead keeps all source untouched. esbuild's
+ * alias is a global resolver override, so every reference to the same
+ * specifier goes through the same absolute path — module identity stays
+ * intact.
+ */
+async function collectSsrLazyRequireAliases(
+  distDir: string,
+): Promise<Record<string, string>> {
+  const ssrDir = path.join(distDir, "server", "chunks", "ssr");
+  const projectRoot = path.dirname(distDir);
+  const projectRequire = createRequire(path.join(projectRoot, "package.json"));
+  const builtins = new Set([
+    ...builtinModules,
+    ...builtinModules.map((name) => `node:${name}`),
+  ]);
+
+  let entries: string[];
+  try {
+    entries = await fs.readdir(ssrDir);
+  } catch {
+    return {};
+  }
+
+  // Same regex as the [externals] patcher: `.x("X", () => require("X"))`
+  // where the two strings are identical.
+  const lazyRequirePattern =
+    /\w+\.x\(\s*(["'])([^"']+)\1\s*,\s*\(\)\s*=>\s*require\(\s*(["'])\2\3\s*\)\s*\)/g;
+
+  const seen = new Set<string>();
+  const aliasMap: Record<string, string> = {};
+
+  for (const entry of entries) {
+    if (!entry.endsWith(".js")) continue;
+    const filePath = path.join(ssrDir, entry);
+    let code: string;
+    try {
+      code = await fs.readFile(filePath, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!code.includes(".x(") || !code.includes("require(")) continue;
+
+    let m: RegExpExecArray | null;
+    while ((m = lazyRequirePattern.exec(code)) !== null) {
+      const specifier = m[2];
+      if (!specifier || seen.has(specifier)) continue;
+      seen.add(specifier);
+
+      if (
+        specifier.startsWith(".") ||
+        specifier.startsWith("/") ||
+        builtins.has(specifier) ||
+        specifier === "next" ||
+        specifier.startsWith("next/") ||
+        specifier.startsWith("@next/")
+      ) {
+        continue;
+      }
+
+      let resolved: string | null = null;
+      try {
+        resolved = projectRequire.resolve(specifier);
+      } catch {
+        // no-op — specifier will fail esbuild too, nothing we can fix
+        continue;
+      }
+      if (!resolved || resolved.endsWith(".node")) continue;
+
+      aliasMap[specifier] = resolved;
+    }
+  }
+
+  return aliasMap;
 }
 
 async function patchAppPageManifestSingletons(distDir: string): Promise<void> {
@@ -529,6 +619,7 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   await patchTurbopackRuntime(opts.distDir);
   await patchNodeExternalRequireConditions(opts.distDir);
   await patchAppPageManifestSingletons(opts.distDir);
+  const ssrLazyRequireAliases = await collectSsrLazyRequireAliases(opts.distDir);
 
   // Write the generated worker entry
   const entryPath = path.join(opts.outputDir, "__entry.mjs");
@@ -565,7 +656,12 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     },
     // Mark optional/unavailable deps as external to prevent build errors.
     // These are caught at runtime and handled gracefully.
+    //
+    // `ssrLazyRequireAliases` is spread FIRST so static entries below take
+    // precedence if they collide — our shims (fs, vm, critters, etc.)
+    // always win over a happenstance SSR lazy-require of the same name.
     alias: {
+      ...ssrLazyRequireAliases,
       "@opentelemetry/api": path.join(adapterDir, "src", "shims", "opentelemetry.js"),
       // fs shim — intercept both bare and node: prefixed imports.
       // Turbopack runtime uses require("fs") which wrangler must redirect
