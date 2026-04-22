@@ -1,12 +1,9 @@
 {
   "version": 2,
-  "_comment": "Adapter-creek deploy-test exclusions. Merged with Next.js's canonical test/deploy-tests-manifest.json via NEXT_EXTERNAL_TESTS_FILTERS. Only for tests that can't run on this adapter — never for regressions or flakes.",
+  "_comment": "Adapter-creek deploy-test exclusions. Merged with Next.js's canonical test/deploy-tests-manifest.json via NEXT_EXTERNAL_TESTS_FILTERS. Empty right now — there are no remaining cases that can't run on this adapter.",
   "suites": {},
   "rules": {
     "include": [],
-    "exclude": [
-      "test/e2e/app-dir/next-dist-client-esm-import/next-dist-client-esm-import.test.ts"
-    ],
-    "_exclude_note": "Upstream Turbopack regression at the pinned canary: JSX inside a workspace-pkg `.js` file fails to parse. Vanilla `next build` fails identically; webpack builds it cleanly. Clears when the canary lands the fix."
+    "exclude": []
   }
 }
