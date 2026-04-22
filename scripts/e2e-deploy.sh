@@ -173,7 +173,21 @@ HEALTHCHECK_PATH="${BASE_PATH}/_next/static/${BUILD_ID}/_buildManifest.js"
 # speed, but that hid streaming/HTTP-edge-case bugs that surface under
 # workerd — swapping here keeps dev/prod behavior consistent.
 ADAPTER_OUTPUT=".creek/adapter-output"
-WORKER_SERVER="${ADAPTER_DIR}/scripts/worker-dev-server-miniflare.mjs"
+
+# CREEK_MULTI_WORKER=1 switches to the 3-worker topology emitted when the
+# build ran with the same flag. The launcher hosts dispatcher +
+# node-runtime + edge-runtime in one miniflare process and wires service
+# bindings between them. Same --worker/--assets/--port CLI as the
+# single-worker launcher — we just point --worker at dispatcher/worker.js
+# and the launcher derives the sibling runtimes.
+if [ "${CREEK_MULTI_WORKER:-}" = "1" ]; then
+  WORKER_SERVER="${ADAPTER_DIR}/scripts/multi-worker-dev.mjs"
+  WORKER_SCRIPT="${ADAPTER_OUTPUT}/dispatcher/worker.js"
+  log "Multi-worker mode: launching dispatcher + node-runtime + edge-runtime"
+else
+  WORKER_SERVER="${ADAPTER_DIR}/scripts/worker-dev-server-miniflare.mjs"
+  WORKER_SCRIPT="${ADAPTER_OUTPUT}/server/worker.js"
+fi
 
 # PORT was pre-allocated before build (see top of script).
 log "Starting local server on port ${PORT}..."
@@ -185,14 +199,14 @@ log "Starting local server on port ${PORT}..."
 if command -v setsid >/dev/null 2>&1; then
   # setsid creates new process group, leader is the node process
   setsid node "${WORKER_SERVER}" \
-    --worker "${ADAPTER_OUTPUT}/server/worker.js" \
+    --worker "${WORKER_SCRIPT}" \
     --assets "${ADAPTER_OUTPUT}/assets" \
     --port "${PORT}" > .adapter-server.log 2>&1 &
   SERVER_PID=$!
 else
   # Fallback for macOS which doesn't have setsid - use bash to create process group
   (exec node "${WORKER_SERVER}" \
-    --worker "${ADAPTER_OUTPUT}/server/worker.js" \
+    --worker "${WORKER_SCRIPT}" \
     --assets "${ADAPTER_OUTPUT}/assets" \
     --port "${PORT}" > .adapter-server.log 2>&1) &
   SERVER_PID=$!
