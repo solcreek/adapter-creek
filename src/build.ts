@@ -472,6 +472,91 @@ function classifyHandlersByRuntime(
 }
 
 /**
+ * Build a pathname → runtime-label mapping the dispatcher uses to pick
+ * NODE_WORKER vs EDGE_WORKER. Concrete pathnames (\`/foo\`, \`/about\`) are
+ * kept as literal keys; bracket pathnames (\`/[slug]/cache\`) get a
+ * generated regex string so the dispatcher can \`new RegExp(pattern)\` at
+ * request time. Order: concrete entries first, then bracket patterns in
+ * descending specificity (longer pathname first, catch-all last).
+ */
+interface RouteRuntimeEntry {
+  /** Literal pathname when no brackets; otherwise undefined. */
+  pathname?: string;
+  /** Source string for a RegExp built at worker init. Mutually exclusive with \`pathname\`. */
+  pattern?: string;
+  /** "nodejs" or "edge". */
+  runtime: "nodejs" | "edge";
+}
+
+function buildRouteRuntimeMap(
+  outputs: BuildContext["outputs"],
+): RouteRuntimeEntry[] {
+  const literals: RouteRuntimeEntry[] = [];
+  const patterns: RouteRuntimeEntry[] = [];
+
+  const pushHandler = (p: string, runtime: "nodejs" | "edge") => {
+    if (p.includes("[")) {
+      patterns.push({ pattern: bracketPathToRegexSource(p), runtime });
+    } else {
+      literals.push({ pathname: p, runtime });
+    }
+  };
+
+  for (const bucket of [
+    outputs.appPages,
+    outputs.appRoutes,
+    outputs.pages,
+    outputs.pagesApi,
+  ]) {
+    for (const h of bucket) {
+      const runtime = h.runtime === "edge" ? "edge" : "nodejs";
+      pushHandler(h.pathname, runtime);
+    }
+  }
+
+  // Patterns with more path segments match first so \`/users/[id]\` beats
+  // \`/[...catchall]\`. Same heuristic the runtime routing layer uses.
+  patterns.sort((a, b) => {
+    const as = (a.pattern ?? "").split("/").length;
+    const bs = (b.pattern ?? "").split("/").length;
+    return bs - as;
+  });
+
+  return [...literals, ...patterns];
+}
+
+/** Convert \`/[slug]/cache\` → \`^/([^/]+)/cache$\` (RegExp source string). */
+function bracketPathToRegexSource(pathname: string): string {
+  let re = "";
+  let i = 0;
+  while (i < pathname.length) {
+    const ch = pathname[i];
+    if (ch === "[") {
+      const end = pathname.indexOf("]", i);
+      if (end === -1) {
+        re += "\\[";
+        i += 1;
+        continue;
+      }
+      const inner = pathname.slice(i + 1, end);
+      if (inner.startsWith("...")) {
+        re += "(.+)";
+      } else if (inner.startsWith("[...") && inner.endsWith("]")) {
+        re += "(.*)";
+      } else {
+        re += "([^/]+)";
+      }
+      i = end + 1;
+      continue;
+    }
+    if (/[.*+?^${}()|\\]/.test(ch)) re += "\\" + ch;
+    else re += ch;
+    i += 1;
+  }
+  return "^" + re + "$";
+}
+
+/**
  * Emit the 3-worker multi-runtime layout: a dispatcher + node-runtime +
  * edge-runtime. Phase 2a reuses the single-worker bundle as the
  * node-runtime worker's \`worker.js\` — the dispatcher just forwards
@@ -489,8 +574,9 @@ async function emitMultiWorker(
   serverDir: string,
 ): Promise<void> {
   const runtimes = classifyHandlersByRuntime(ctx.outputs);
+  const routeRuntimeMap = buildRouteRuntimeMap(ctx.outputs);
   console.log(
-    `  [Creek Adapter] Multi-worker build: nodejs=${runtimes.nodejs} edge=${runtimes.edge}`,
+    `  [Creek Adapter] Multi-worker build: nodejs=${runtimes.nodejs} edge=${runtimes.edge} (routeRuntimeMap entries: ${routeRuntimeMap.length})`,
   );
 
   const dispatcherDir = path.join(outputDir, "dispatcher");
@@ -529,17 +615,53 @@ async function emitMultiWorker(
   // Unconditional forward to NODE_WORKER until Phase 2b splits by
   // runtime label. The \`x-creek-from\` header gives us a probe for
   // ensuring every request passed through the dispatcher.
+  // Build-time map embedded as a JS constant so the dispatcher can pick
+  // NODE_WORKER vs EDGE_WORKER without re-parsing routes-manifest.json.
+  // Phase 2b step 1: the map is emitted and compiled into regex at worker
+  // init but not yet used for dispatch — that lands in the next commit
+  // once edge-runtime carries a real bundle.
+  const routeRuntimeMapLiteral = JSON.stringify(routeRuntimeMap);
+
   const dispatcherSource = [
-    "// Creek adapter — dispatcher worker (Phase 2a).",
-    "// Forwards every request to NODE_WORKER via service binding. Phase",
-    "// 2b replaces this with middleware execution + @next/routing resolve",
-    "// + runtime-label dispatch (nodejs → NODE_WORKER, edge → EDGE_WORKER).",
+    "// Creek adapter — dispatcher worker (Phase 2b step 1).",
+    "// Emits the build-time route→runtime map (unused until step 3);",
+    "// still forwards every request to NODE_WORKER to preserve Phase 2a",
+    "// behaviour. Step 2 makes edge-runtime a real bundle; step 3 flips",
+    "// the dispatch branch so edge routes land in EDGE_WORKER.",
+    "",
+    "const RAW_ROUTE_RUNTIME_MAP = " + routeRuntimeMapLiteral + ";",
+    "const ROUTE_RUNTIME_LITERALS = new Map();",
+    "const ROUTE_RUNTIME_PATTERNS = [];",
+    "for (const entry of RAW_ROUTE_RUNTIME_MAP) {",
+    "  if (typeof entry.pathname === \"string\") {",
+    "    ROUTE_RUNTIME_LITERALS.set(entry.pathname, entry.runtime);",
+    "  } else if (typeof entry.pattern === \"string\") {",
+    "    try { ROUTE_RUNTIME_PATTERNS.push([new RegExp(entry.pattern), entry.runtime]); } catch {}",
+    "  }",
+    "}",
+    "",
+    "function pickRuntimeForPathname(pathname) {",
+    "  const literal = ROUTE_RUNTIME_LITERALS.get(pathname);",
+    "  if (literal) return literal;",
+    "  for (const [re, rt] of ROUTE_RUNTIME_PATTERNS) {",
+    "    if (re.test(pathname)) return rt;",
+    "  }",
+    "  return \"nodejs\";",
+    "}",
+    "",
     "export default {",
     "  async fetch(request, env, ctx) {",
+    "    const url = new URL(request.url);",
+    "    // Selected eagerly so every response can carry the decision as",
+    "    // an \\`x-creek-route-runtime\\` hint (useful for debugging and",
+    "    // for step 3's dispatch branch).",
+    "    const runtime = pickRuntimeForPathname(url.pathname);",
+    "",
+    "    // Phase 2b step 1: unconditional forward to NODE_WORKER.",
     "    const resp = await env.NODE_WORKER.fetch(request);",
-    "    // Tag the response so callers can verify the dispatcher was on path.",
     "    const headers = new Headers(resp.headers);",
     '    headers.set("x-creek-from", "dispatcher");',
+    '    headers.set("x-creek-route-runtime", runtime);',
     "    return new Response(resp.body, {",
     "      status: resp.status,",
     "      statusText: resp.statusText,",
