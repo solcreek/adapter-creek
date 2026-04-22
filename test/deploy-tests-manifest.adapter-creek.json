@@ -10,24 +10,6 @@
     "and flakey tests are NOT listed here."
   ],
   "suites": {
-    "test/e2e/app-dir/actions/app-action.test.ts": {
-      "failed": [
-        "app-dir action handling should forward action request to a worker that contains the action handler (node)",
-        "app-dir action handling should forward action request to a worker that contains the action handler (edge)",
-        "app-dir action handling should not error when a forwarded action triggers a redirect (node)",
-        "app-dir action handling should not error when a forwarded action triggers a redirect (edge)"
-      ],
-      "_note": "Multi-worker forwarding — relies on deploying the same app to two different workers (one with the action handler, one without) so the request-receiving worker can forward a serialized Next-Action to the handler worker over a separate fetch. Creek deploys each app as a single worker; the fixture's two /delayed-action/(node|edge) routes collapse into the same isolate and the 'forwarded' request never carries a valid Next-Action body. Skipping rather than red-herring debugging a model we don't support."
-    },
-    "test/e2e/app-dir/actions/app-action-node-middleware.test.ts": {
-      "failed": [
-        "app-dir action handling should forward action request to a worker that contains the action handler (node)",
-        "app-dir action handling should forward action request to a worker that contains the action handler (edge)",
-        "app-dir action handling should not error when a forwarded action triggers a redirect (node)",
-        "app-dir action handling should not error when a forwarded action triggers a redirect (edge)"
-      ],
-      "_note": "This file is just `require('./app-action.test')` with TEST_NODE_MIDDLEWARE=true — it re-runs the entire app-action suite under a different file path, so the same multi-worker tests re-fail here. Mirror the exclusions."
-    },
     "test/e2e/app-dir/actions-streaming/actions-streaming.test.ts": {
       "failed": [
         "actions-streaming actions returning a ReadableStream should properly stream the response without buffering"
@@ -40,7 +22,7 @@
       ],
       "_note": "All three markers (`$test-fallback-sentinel`, suspense data chunk, `$RC=function`) ARE present in the response — the adapter renders the page correctly with progressive streaming and the other two sub-tests (`should render initial styles of css-in-js in nodejs/edge SSR correctly`) pass. What fails is the EXACT ORDER assertion `['fallback', 'data', 'refresh-script']`: Miniflare's HTTP proxy auto-compresses text/html responses to EOF-gzipped single chunks, collapsing all three markers into one arrival. Node's `for await (const chunk of response.body)` then iterates a single decompressed chunk and the test's in-chunk check order (`data` → `refresh-script` → `fallback`) pushes the markers as `['data', 'refresh-script', 'fallback']` (backwards). Verified a local `Content-Encoding: identity` override + `Cache-Control: no-transform` both fail to disable miniflare's compression pass. In production CF Workers the edge compresses at byte-stream granularity (chunks preserved), so this is a dev-environment (miniflare) artefact, not an adapter defect. The other three server-inserted-html assertions (basic styled-jsx/styled-components SSR, both node + edge variants) pass."
     },
-    "_removed-skips-to-face-reality": "2026-04-21: we previously skipped the 6 cache-components-allow-otel-spans + fallback-shells subtests under this block, masking real adapter bugs. Removed to surface them as genuine CI failures. The cache-components-allow-otel-spans /novel/cache 500 is adapter-specific (see memory project_otel_investigation.md). The 5 fallback-shells subtests also fail on vanilla at pinned canary 16.3.0-canary.2, but they're in-scope to fix as part of partial-fallback route-shell upgrading (PR #89063 infra)."
+    "_removed-skips-to-face-reality": "2026-04-21: we previously skipped the 6 cache-components-allow-otel-spans + fallback-shells subtests under this block, masking real adapter bugs. Removed to surface them as genuine CI failures. The cache-components-allow-otel-spans /novel/cache 500 is adapter-specific (see memory project_otel_investigation.md). The 5 fallback-shells subtests also fail on vanilla at pinned canary 16.3.0-canary.2, but they're in-scope to fix as part of partial-fallback route-shell upgrading (PR #89063 infra). 2026-04-21b: removed the 8 'forward action request' / 'forwarded action triggers a redirect' entries under app-action.test.ts + app-action-node-middleware.test.ts. Verified locally (macOS) that both single-worker AND multi-worker (CREEK_MULTI_WORKER=1) modes now pass these subtests — 70/0/8 in each case. Adapter fixes between 2026-04-18 (when the skips were added) and today likely closed the gap. If CI re-fails them we'll re-add with a more precise reason rather than the dated multi-worker rationale."
   },
   "rules": {
     "include": [],
