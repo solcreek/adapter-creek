@@ -1,0 +1,60 @@
+name: publish
+
+# Publish a release to npm whenever a `vX.Y.Z` tag is pushed.
+# Uses npm's OIDC trusted-publishing flow (no NPM_TOKEN secret needed)
+# — npm 11.5.1+ exchanges GitHub Actions' OIDC token for a publish
+# credential when `permissions.id-token: write` is granted. This requires
+# a one-time Trusted Publisher setup on npmjs.com:
+#   https://www.npmjs.com/package/@solcreek/adapter-creek/access
+#   → Trusted Publishers → Add publisher → GitHub Actions
+#   → Repository: solcreek/adapter-creek
+#   → Workflow filename: publish.yml
+#
+# Tag → release flow:
+#   git tag -a v0.2.0 -m "…"
+#   git push origin v0.2.0
+# Then this workflow fires, runs the build + tests, and publishes.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  id-token: write  # required for OIDC trusted publishing
+  contents: read
+
+jobs:
+  publish:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/install-dependencies
+        with:
+          # OIDC trusted publishing requires Node 24+ (npm 11.5.1+).
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify tag matches package.json version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "${TAG_VERSION}" != "${PKG_VERSION}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} (=${TAG_VERSION}) does not match package.json version ${PKG_VERSION}"
+            exit 1
+          fi
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test
+        run: pnpm test
+
+      # Use `npm publish` rather than `pnpm publish` — npm has the most
+      # mature OIDC trusted-publishing implementation, and pnpm just
+      # delegates to npm internally for the registry hit anyway.
+      - name: Publish
+        run: npm publish --access public --provenance

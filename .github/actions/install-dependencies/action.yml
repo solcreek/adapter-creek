@@ -1,8 +1,18 @@
 name: Install dependencies
 description: |
   Shared bootstrap for every workflow: set up pnpm + Node + a lockfile-frozen
-  install. Matches the opennextjs-cloudflare composite action's shape so this
-  repo's CI stays easy to port to their infra if we ever consolidate.
+  install. Inputs let publish-style workflows opt into a newer Node (OIDC
+  requires Node 24+) and a specific npm registry without duplicating setup.
+
+inputs:
+  node-version:
+    description: Node.js major version to set up
+    required: false
+    default: '22'
+  registry-url:
+    description: npm registry URL (set for publishing workflows)
+    required: false
+    default: ''
 
 runs:
   using: composite
@@ -16,8 +26,9 @@ runs:
     - name: Set up Node
       uses: actions/setup-node@v4
       with:
-        node-version: '22'
+        node-version: ${{ inputs.node-version }}
         cache: pnpm
+        registry-url: ${{ inputs.registry-url }}
 
     - name: Enable Node compile cache
       shell: bash
