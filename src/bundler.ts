@@ -11,7 +11,6 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { execSync } from "node:child_process";
-import { builtinModules, createRequire } from "node:module";
 
 export interface BundleOptions {
   workerSource: string;
@@ -46,33 +45,19 @@ async function patchTurbopackRuntime(distDir: string): Promise<void> {
     path.join(distDir, "server", "edge", "chunks"),
   ];
 
-  async function walkRuntimes(dir: string): Promise<void> {
-    let entries;
-    try {
-      entries = await fs.readdir(dir, { withFileTypes: true });
-    } catch {
-      return;
-    }
-
-    for (const entry of entries) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        await walkRuntimes(full);
-        continue;
-      }
-      if (!entry.name.endsWith(".js")) continue;
-      if (
-        entry.name.includes("[turbopack]_runtime") ||
-        (entry.name.startsWith("turbopack-") && entry.name.includes("edge-wrapper")) ||
-        entry.name.includes("edge-wrapper")
-      ) {
-        runtimePaths.push(full);
-      }
-    }
-  }
-
   for (const dir of searchDirs) {
-    await walkRuntimes(dir);
+    try {
+      const files = await fs.readdir(dir);
+      for (const f of files) {
+        if (f.endsWith(".js") && (
+          f.includes("[turbopack]_runtime") ||
+          // Edge Turbopack runtimes are in turbopack-..._edge-wrapper files
+          (f.startsWith("turbopack-") && f.includes("edge-wrapper"))
+        )) {
+          runtimePaths.push(path.join(dir, f));
+        }
+      }
+    } catch {}
   }
 
   if (runtimePaths.length === 0) return; // Not Turbopack
@@ -174,452 +159,12 @@ ${cases.join("\n")}
   }
 }
 
-async function patchNodeExternalRequireConditions(distDir: string): Promise<void> {
-  const serverChunksDir = path.join(distDir, "server", "chunks");
-  const projectRoot = path.dirname(distDir);
-  const projectRequire = createRequire(path.join(projectRoot, "package.json"));
-  const builtins = new Set([
-    ...builtinModules,
-    ...builtinModules.map((name) => `node:${name}`),
-  ]);
-
-  // Narrow scope: only `[externals]*.js` files in `server/chunks/`.
-  // Those are Turbopack's dedicated external-require-registration bundles,
-  // which contain nothing but `.x("pkg", () => require("pkg"))` lines —
-  // rewriting require() to an absolute path there has no module-identity
-  // risk. We tried extending this to `server/chunks/ssr/*.js` to fix the
-  // styled-jsx-subpath case, but those chunks contain real SSR render
-  // code whose require() calls participate in Turbopack's module graph
-  // (same package resolved two ways = two React instances). The
-  // styled-jsx case is now handled via wrangler `alias` entries instead —
-  // see collectSsrLazyRequireAliases() + the wranglerConfig assembly.
-  let entries: string[];
-  try {
-    entries = await fs.readdir(serverChunksDir);
-  } catch {
-    return;
-  }
-  const chunkFiles: string[] = [];
-  for (const entry of entries) {
-    if (!entry.startsWith("[externals]") || !entry.endsWith(".js")) continue;
-    chunkFiles.push(path.join(serverChunksDir, entry));
-  }
-
-  if (chunkFiles.length === 0) return;
-
-  const externalRequirePattern =
-    /(\w+\.x\(\s*(["'])([^"']+)\2\s*,\s*\(\)\s*=>\s*)require\(\s*(["'])\3\4\s*\)(\s*\))/g;
-  const stripTurbopackPackageAlias = (specifier: string): string | null => {
-    const parts = specifier.split("/");
-    const packageIndex = specifier.startsWith("@") ? 1 : 0;
-    const packageName = parts[packageIndex];
-    if (!packageName) return null;
-    const match = /^(.*)-[0-9a-f]{16}$/i.exec(packageName);
-    if (!match || !match[1]) return null;
-    parts[packageIndex] = match[1];
-    return parts.join("/");
-  };
-
-  for (const filePath of chunkFiles) {
-    let code: string;
-    try {
-      code = await fs.readFile(filePath, "utf-8");
-    } catch {
-      continue;
-    }
-    if (!code.includes(".x(") || !code.includes("require(")) continue;
-
-    const patched = code.replace(
-      externalRequirePattern,
-      (match, prefix: string, _quote: string, specifier: string, _requireQuote: string, suffix: string) => {
-        if (
-          specifier.startsWith(".") ||
-          specifier.startsWith("/") ||
-          builtins.has(specifier) ||
-          specifier === "next" ||
-          specifier.startsWith("next/") ||
-          specifier.startsWith("@next/")
-        ) {
-          return match;
-        }
-
-        let resolved: string;
-        try {
-          resolved = projectRequire.resolve(specifier);
-        } catch {
-          const unaliased = stripTurbopackPackageAlias(specifier);
-          if (!unaliased) return match;
-          try {
-            resolved = projectRequire.resolve(unaliased);
-          } catch {
-            return match;
-          }
-        }
-        if (resolved.endsWith(".node")) return match;
-
-        return `${prefix}require(${JSON.stringify(resolved)})${suffix}`;
-      },
-    );
-
-    if (patched !== code) {
-      await fs.writeFile(filePath, patched);
-    }
-  }
-}
-
-/**
- * Collect `.x("pkg", () => require("pkg"))` lazy-require specifiers out of
- * `server/chunks/ssr/*.js` and return a map of specifiers → absolute paths
- * that wrangler's esbuild should alias.
- *
- * Why this exists: Turbopack emits those registrations for SSR chunks when
- * a transitive (indirect) dep like `styled-jsx/style.js` is needed. In
- * pnpm projects the package lives at `.pnpm/styled-jsx@X/node_modules/...`
- * and isn't hoisted to a top-level `node_modules/`. esbuild's walker
- * therefore fails with `Could not resolve "styled-jsx/style.js"`.
- *
- * The previous attempt was to rewrite `require("pkg")` inline to an
- * absolute path, mirroring what we do for `[externals]*.js` chunks — but
- * `ssr/*.js` chunks also contain real SSR render code whose require()
- * calls participate in Turbopack's module graph. Absolute-path rewrites
- * there risk creating two module instances of the same package (once via
- * Turbopack, once via our rewrite), which silently breaks React etc.
- * and surfaced as "uncached or runtime data" prerender failures in
- * `resume-data-cache` on Linux CI only.
- *
- * Returning an alias map instead keeps all source untouched. esbuild's
- * alias is a global resolver override, so every reference to the same
- * specifier goes through the same absolute path — module identity stays
- * intact.
- */
-async function collectSsrLazyRequireAliases(
-  distDir: string,
-): Promise<Record<string, string>> {
-  const ssrDir = path.join(distDir, "server", "chunks", "ssr");
-  const projectRoot = path.dirname(distDir);
-  const projectRequire = createRequire(path.join(projectRoot, "package.json"));
-  const builtins = new Set([
-    ...builtinModules,
-    ...builtinModules.map((name) => `node:${name}`),
-  ]);
-
-  let entries: string[];
-  try {
-    entries = await fs.readdir(ssrDir);
-  } catch {
-    return {};
-  }
-
-  // Same regex as the [externals] patcher: `.x("X", () => require("X"))`
-  // where the two strings are identical.
-  const lazyRequirePattern =
-    /\w+\.x\(\s*(["'])([^"']+)\1\s*,\s*\(\)\s*=>\s*require\(\s*(["'])\2\3\s*\)\s*\)/g;
-
-  const seen = new Set<string>();
-  const aliasMap: Record<string, string> = {};
-
-  for (const entry of entries) {
-    if (!entry.endsWith(".js")) continue;
-    const filePath = path.join(ssrDir, entry);
-    let code: string;
-    try {
-      code = await fs.readFile(filePath, "utf-8");
-    } catch {
-      continue;
-    }
-    if (!code.includes(".x(") || !code.includes("require(")) continue;
-
-    let m: RegExpExecArray | null;
-    while ((m = lazyRequirePattern.exec(code)) !== null) {
-      const specifier = m[2];
-      if (!specifier || seen.has(specifier)) continue;
-      seen.add(specifier);
-
-      if (
-        specifier.startsWith(".") ||
-        specifier.startsWith("/") ||
-        builtins.has(specifier) ||
-        specifier === "next" ||
-        specifier.startsWith("next/") ||
-        specifier.startsWith("@next/")
-      ) {
-        continue;
-      }
-
-      let resolved: string | null = null;
-      try {
-        resolved = projectRequire.resolve(specifier);
-      } catch {
-        // no-op — specifier will fail esbuild too, nothing we can fix
-        continue;
-      }
-      if (!resolved || resolved.endsWith(".node")) continue;
-
-      aliasMap[specifier] = resolved;
-    }
-  }
-
-  return aliasMap;
-}
-
-async function patchAppPageManifestSingletons(distDir: string): Promise<void> {
-  const ssrDir = path.join(distDir, "server", "chunks", "ssr");
-  let entries: string[] = [];
-  try {
-    entries = await fs.readdir(ssrDir);
-  } catch {
-    return;
-  }
-
-  const manifestProxyPattern =
-    /case"moduleLoading":case"entryCSSFiles":case"entryJSFiles":\{if\(!(\w+)\)throw[\s\S]*?let (\w+)=(\w+)\.get\(\1\.route\);if\(!\2\)throw[\s\S]*?return \2\[(\w+)\]\}/g;
-
-  for (const entry of entries) {
-    if (!entry.endsWith(".js")) continue;
-    const filePath = path.join(ssrDir, entry);
-    let code: string;
-    try {
-      code = await fs.readFile(filePath, "utf-8");
-    } catch {
-      continue;
-    }
-    if (!code.includes('entryCSSFiles') || !code.includes('without a work store')) {
-      continue;
-    }
-
-    const patched = code.replace(
-      manifestProxyPattern,
-      (_match, workStoreVar: string, manifestVar: string, manifestsVar: string, propVar: string) =>
-        `case"moduleLoading":case"entryCSSFiles":case"entryJSFiles":{if(!${workStoreVar}){for(let a of ${manifestsVar}.values()){let b=a[${propVar}];if(void 0!==b)return b}return}let ${manifestVar}=${manifestsVar}.get(${workStoreVar}.route);if(!${manifestVar}){for(let a of ${manifestsVar}.values()){let b=a[${propVar}];if(void 0!==b)return b}return}return ${manifestVar}[${propVar}]}`,
-    );
-
-    if (patched !== code) {
-      await fs.writeFile(filePath, patched);
-    }
-  }
-}
-
-function patchBundledManifestSingleton(workerCode: string): string {
-  const bundledManifestProxyPattern =
-    /case "moduleLoading":\s*case "entryCSSFiles":\s*case "entryJSFiles": \{\s*if \(!(\w+)\) throw[\s\S]*?let (\w+) = (\w+)\.get\(\1\.route\);\s*if \(!\2\) throw[\s\S]*?return \2\[(\w+)\];\s*\}/g;
-  const bundledManifestLookupPattern =
-    /if \((\w+)\) \{\s*let (\w+) = (\w+)\.get\(\1\.route\);\s*if \(null == \2 \? void 0 : \2\[(\w+)\]\[(\w+)\]\) return \2\[\4\]\[\5\];\s*\} else for \(let (\w+) of \3\.values\(\)\) \{\s*let (\w+) = \6\[\4\]\[\5\];\s*if \(void 0 !== \7\) return \7;\s*\}/g;
-
-  workerCode = workerCode.replace(
-    bundledManifestProxyPattern,
-    (_match, workStoreVar: string, manifestVar: string, manifestsVar: string, propVar: string) =>
-      `case "moduleLoading":
-              case "entryCSSFiles":
-              case "entryJSFiles": {
-                if (!${workStoreVar}) {
-                  for (const manifest of ${manifestsVar}.values()) {
-                    const entry = manifest[${propVar}];
-                    if (entry !== undefined) {
-                      return entry;
-                    }
-                  }
-                  return undefined;
-                }
-                let ${manifestVar} = ${manifestsVar}.get(${workStoreVar}.route);
-                if (!${manifestVar}) {
-                  for (const manifest of ${manifestsVar}.values()) {
-                    const entry = manifest[${propVar}];
-                    if (entry !== undefined) {
-                      return entry;
-                    }
-                  }
-                  return undefined;
-                }
-                return ${manifestVar}[${propVar}];
-              }`,
-  );
-
-  workerCode = workerCode.replace(
-    bundledManifestLookupPattern,
-    (
-      _match,
-      workStoreVar: string,
-      manifestVar: string,
-      manifestsVar: string,
-      propVar: string,
-      idVar: string,
-      iterManifestVar: string,
-      iterEntryVar: string,
-    ) =>
-      `if (${workStoreVar}) {
-                    let ${manifestVar} = ${manifestsVar}.get(${workStoreVar}.route);
-                    let ${iterEntryVar} = null == ${manifestVar} ? void 0 : ${manifestVar}[${propVar}][${idVar}];
-                    if (void 0 === ${iterEntryVar} && ${propVar} === "edgeSSRModuleMapping") ${iterEntryVar} = null == ${manifestVar} ? void 0 : ${manifestVar}.ssrModuleMapping[${idVar}];
-                    if (void 0 === ${iterEntryVar} && ${propVar} === "edgeRscModuleMapping") ${iterEntryVar} = null == ${manifestVar} ? void 0 : ${manifestVar}.rscModuleMapping[${idVar}];
-                    if (typeof process !== "undefined" && process.env.CREEK_DEBUG_MANIFESTS === "1" && (${idVar} === "99807" || ${idVar} === 99807 || String(${workStoreVar}.route || "").includes("basic-edge"))) {
-                      console.error("[creek:bundled-manifest:route]", JSON.stringify({
-                        route: ${workStoreVar}.route,
-                        prop: ${propVar},
-                        id: ${idVar},
-                        routeHit: !!${manifestVar},
-                        entryId: ${iterEntryVar} && typeof ${iterEntryVar} === "object" ? ${iterEntryVar}.id ?? (typeof ${iterEntryVar}["*"] === "object" ? ${iterEntryVar}["*"].id : undefined) : undefined,
-                      }));
-                    }
-                    if (void 0 !== ${iterEntryVar}) return ${iterEntryVar};
-                  }
-                  let __creekNodeFallback;
-                  for (let ${iterManifestVar} of ${manifestsVar}.values()) {
-                    let ${iterEntryVar} = ${iterManifestVar}[${propVar}][${idVar}];
-                    if (typeof process !== "undefined" && process.env.CREEK_DEBUG_MANIFESTS === "1" && (${idVar} === "99807" || ${idVar} === 99807) && void 0 !== ${iterEntryVar}) {
-                      console.error("[creek:bundled-manifest:scan-hit]", JSON.stringify({
-                        prop: ${propVar},
-                        id: ${idVar},
-                        entryId: ${iterEntryVar} && typeof ${iterEntryVar} === "object" ? ${iterEntryVar}.id ?? (typeof ${iterEntryVar}["*"] === "object" ? ${iterEntryVar}["*"].id : undefined) : undefined,
-                      }));
-                    }
-                    if (void 0 !== ${iterEntryVar}) return ${iterEntryVar};
-                    if (void 0 === __creekNodeFallback && ${propVar} === "edgeSSRModuleMapping") __creekNodeFallback = ${iterManifestVar}.ssrModuleMapping[${idVar}];
-                    if (void 0 === __creekNodeFallback && ${propVar} === "edgeRscModuleMapping") __creekNodeFallback = ${iterManifestVar}.rscModuleMapping[${idVar}];
-                  }
-                  if (typeof process !== "undefined" && process.env.CREEK_DEBUG_MANIFESTS === "1" && (${idVar} === "99807" || ${idVar} === 99807) && void 0 !== __creekNodeFallback) {
-                    console.error("[creek:bundled-manifest:node-fallback]", JSON.stringify({
-                      prop: ${propVar},
-                      id: ${idVar},
-                      entryId: __creekNodeFallback && typeof __creekNodeFallback === "object" ? __creekNodeFallback.id ?? (typeof __creekNodeFallback["*"] === "object" ? __creekNodeFallback["*"].id : undefined) : undefined,
-                    }));
-                  }
-                  if (void 0 !== __creekNodeFallback) return __creekNodeFallback;`,
-  );
-
-  // Cloudflare Workers executes the bundled app through the edge runtime path,
-  // but many app pages only populate the node/RSC module maps. Keep true edge
-  // routes on the edge maps when they exist, otherwise fall back to the node
-  // maps so React Server Consumer Manifest lookups can still resolve.
-  workerCode = workerCode.replace(
-    /moduleMap: j2, serverModuleMap:/g,
-    "moduleMap: Object.keys(i2 || {}).length ? i2 : j2, serverModuleMap:",
-  );
-
-  return workerCode;
-}
-
-function stripAsyncLocalStorageSnapshotTernaries(workerCode: string): string {
-  const snapshotCall = ".snapshot()";
-  let out = "";
-  let last = 0;
-  let searchFrom = 0;
-
-  const isIdent = (ch: string) => /[A-Za-z0-9_$]/.test(ch);
-  const skipWsBack = (i: number) => {
-    while (i > 0 && /\s/.test(workerCode[i - 1])) i--;
-    return i;
-  };
-  const skipWsForward = (i: number) => {
-    while (i < workerCode.length && /\s/.test(workerCode[i])) i++;
-    return i;
-  };
-
-  while (true) {
-    const snapshotIndex = workerCode.indexOf(snapshotCall, searchFrom);
-    if (snapshotIndex === -1) break;
-
-    let rightNameStart = snapshotIndex;
-    while (rightNameStart > 0 && isIdent(workerCode[rightNameStart - 1])) {
-      rightNameStart--;
-    }
-    const name = workerCode.slice(rightNameStart, snapshotIndex);
-    if (!name) {
-      searchFrom = snapshotIndex + snapshotCall.length;
-      continue;
-    }
-
-    let qIndex = skipWsBack(rightNameStart);
-    if (workerCode[qIndex - 1] !== "?") {
-      searchFrom = snapshotIndex + snapshotCall.length;
-      continue;
-    }
-    qIndex--;
-
-    let leftNameEnd = skipWsBack(qIndex);
-    let leftNameStart = leftNameEnd;
-    while (leftNameStart > 0 && isIdent(workerCode[leftNameStart - 1])) {
-      leftNameStart--;
-    }
-    if (workerCode.slice(leftNameStart, leftNameEnd) !== name) {
-      searchFrom = snapshotIndex + snapshotCall.length;
-      continue;
-    }
-
-    let colonIndex = skipWsForward(snapshotIndex + snapshotCall.length);
-    if (workerCode[colonIndex] !== ":") {
-      searchFrom = snapshotIndex + snapshotCall.length;
-      continue;
-    }
-    colonIndex = skipWsForward(colonIndex + 1);
-
-    out += workerCode.slice(last, leftNameStart);
-    last = colonIndex;
-    searchFrom = colonIndex;
-  }
-
-  return out ? out + workerCode.slice(last) : workerCode;
-}
-
-function patchUseCachePrerenderDanglingPromiseBailout(workerCode: string): string {
-  const serializedKeyPattern =
-    /let\s+(\w+)\s*=\s*"string"\s*==\s*typeof\s+(\w+)\s*\?\s*\2\s*:\s*await\s+(\w+)\(\2\),\s*(\w+)\s*=\s*(\w+)\.rootParams/g;
-
-  return workerCode.replace(
-    serializedKeyPattern,
-    (
-      match: string,
-      serializedKeyVar: string,
-      encodedKeyVar: string,
-      encodeFnVar: string,
-      rootParamsVar: string,
-      workUnitStoreVar: string,
-      offset: number,
-      fullCode: string,
-    ) => {
-      const followingCode = fullCode.slice(offset, offset + 3000);
-      const hangingCallPattern = new RegExp(
-        String.raw`\(0,\s*(\w+)\.makeHangingPromise\)\(\s*${workUnitStoreVar}\.renderSignal\s*,\s*(\w+)\.route`,
-      );
-      const hangingCallMatch = hangingCallPattern.exec(followingCode);
-      if (!hangingCallMatch) return match;
-
-      const makeHangingPromiseVar = hangingCallMatch[1];
-      const workStoreVar = hangingCallMatch[2];
-
-      return `let ${serializedKeyVar} = "string" == typeof ${encodedKeyVar} ? ${encodedKeyVar} : await ${encodeFnVar}(${encodedKeyVar}); if ("prerender" === ${workUnitStoreVar}.type && "string" == typeof ${serializedKeyVar}) { let __creekDanglingThenableStart = ${serializedKeyVar}.lastIndexOf("$@"); if (__creekDanglingThenableStart !== -1 && ${serializedKeyVar}.indexOf(":", __creekDanglingThenableStart) === -1) return (0, ${makeHangingPromiseVar}.makeHangingPromise)(${workUnitStoreVar}.renderSignal, ${workStoreVar}.route, 'dynamic "use cache"'); } let ${rootParamsVar} = ${workUnitStoreVar}.rootParams`;
-    },
-  );
-}
-
-function patchNullFallbackPartialShellBlocking(workerCode: string): string {
-  const minifiedPartialFallbackUpgradePattern =
-    /true\s*!==\s*(\w+)\.experimental\.partialFallbacks\s*\|\|\s*\(null\s*==\s*(\w+)\s*\?\s*void\s*0\s*:\s*\2\.fallback\)\s*!==\s*null\s*\|\|\s*(\w+)\s*\|\|\s*(\w+)\s*\|\|\s*!\((\w+)\.length\s*>\s*0\)\s*\|\|\s*\((\w+)\s*=\s*(\w+)\.FallbackMode\.PRERENDER\)/g;
-
-  return workerCode.replace(
-    minifiedPartialFallbackUpgradePattern,
-    (
-      _match: string,
-      nextConfigVar: string,
-      prerenderInfoVar: string,
-      omittedFallbackParamVar: string,
-      unresolvedRootParamsVar: string,
-      remainingParamsVar: string,
-      fallbackModeVar: string,
-      fallbackEnumVar: string,
-    ) =>
-      `true !== ${nextConfigVar}.experimental.partialFallbacks || (null == ${prerenderInfoVar} ? void 0 : ${prerenderInfoVar}.fallback) !== null || ${omittedFallbackParamVar} || ${unresolvedRootParamsVar} || !(${remainingParamsVar}.length > 0) || (${fallbackModeVar} = ${fallbackEnumVar}.FallbackMode.BLOCKING_STATIC_RENDER)`,
-  );
-}
-
 export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   // Patch Turbopack runtime BEFORE wrangler bundles.
   // Turbopack's R.c() dynamically loads chunks from the filesystem.
   // CF Workers has no filesystem, so we replace R.c() with a switch
   // statement that maps chunk paths to static require() calls.
   await patchTurbopackRuntime(opts.distDir);
-  await patchNodeExternalRequireConditions(opts.distDir);
-  await patchAppPageManifestSingletons(opts.distDir);
-  const ssrLazyRequireAliases = await collectSsrLazyRequireAliases(opts.distDir);
 
   // Write the generated worker entry
   const entryPath = path.join(opts.outputDir, "__entry.mjs");
@@ -627,16 +172,6 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
 
   if (process.env.CREEK_DEBUG) {
     await fs.writeFile(path.join(opts.outputDir, "__entry_debug.mjs"), opts.workerSource);
-  }
-
-  // Copy WASM files alongside the bundle BEFORE wrangler runs. wrangler's
-  // bundler needs the files resolvable from the entry `import __wasm_0 from
-  // "./wasm_<hex>.wasm"` to apply the CompiledWasm rule — copying later
-  // (after the bundle step) is too late.
-  for (const [name, absPath] of opts.wasmFiles) {
-    const destName = name.endsWith(".wasm") ? name : name + ".wasm";
-    const destPath = path.join(opts.outputDir, destName);
-    await fs.copyFile(absPath, destPath);
   }
 
   // Resolve adapter paths
@@ -656,12 +191,7 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     },
     // Mark optional/unavailable deps as external to prevent build errors.
     // These are caught at runtime and handled gracefully.
-    //
-    // `ssrLazyRequireAliases` is spread FIRST so static entries below take
-    // precedence if they collide — our shims (fs, vm, critters, etc.)
-    // always win over a happenstance SSR lazy-require of the same name.
     alias: {
-      ...ssrLazyRequireAliases,
       "@opentelemetry/api": path.join(adapterDir, "src", "shims", "opentelemetry.js"),
       // fs shim — intercept both bare and node: prefixed imports.
       // Turbopack runtime uses require("fs") which wrangler must redirect
@@ -672,32 +202,11 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       "node:vm": path.join(adapterDir, "src", "shims", "vm.js"),
       // critters is bundled by Next.js for CSS inlining — not needed on Workers.
       "critters": path.join(adapterDir, "src", "shims", "critters.js"),
-      // sharp has native .node bindings that workerd can't load. Without this
-      // alias, wrangler pulls in ~1MB of sharp's JS wrapper and the module
-      // ends up non-callable at runtime — \`@vercel/og\`'s node path then
-      // throws \`sharp is not a function\`. Aliasing to a shim whose default
-      // is undefined makes \`@vercel/og\` fall back to its resvg.wasm path.
+      // sharp has native .node bindings that workerd can't load.
       "sharp": path.join(adapterDir, "src", "shims", "sharp.js"),
-      // Some packages intentionally leave unreachable dynamic imports such as
-      // `if (Math.random() < 0) import("fail")` in their ESM entry. Turbopack
-      // externalizes the package and never resolves that branch, but wrangler
-      // follows it once we preload the concrete ESM file. Stub it so the dead
-      // branch remains harmless.
+      // Dead-branch dynamic imports.
       "fail": path.join(adapterDir, "src", "shims", "empty.js"),
-      // Replace Next's track-module-loading.{instance,external} with a
-      // per-request AsyncLocalStorage version. The original keeps a
-      // module-level CacheSignal whose internal setImmediate closure
-      // leaks IoContext across requests on workerd — second-and-later
-      // requests throw "Cannot perform I/O on behalf of a different
-      // request" when CacheSignal.pendingTimeoutCleanup fires
-      // clearImmediate on an Immediate from the first request. Repros
-      // on any route that does dynamic imports during render (notably
-      // \`new ImageResponse(...)\` — every \`@vercel/og\` call triggers
-      // trackPendingImport). We alias \`.external\` as well because
-      // call sites import from that module (the internal relative
-      // \`./track-module-loading.instance\` import never passes through
-      // esbuild's bare-specifier alias map). See
-      // src/shims/track-module-loading.js.
+      // track-module-loading: per-request AsyncLocalStorage to avoid IoContext leak.
       "next/dist/server/app-render/module-loading/track-module-loading.external":
         path.join(adapterDir, "src", "shims", "track-module-loading.js"),
       "next/dist/server/app-render/module-loading/track-module-loading.external.js":
@@ -706,20 +215,30 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
         path.join(adapterDir, "src", "shims", "track-module-loading.js"),
       "next/dist/server/app-render/module-loading/track-module-loading.instance.js":
         path.join(adapterDir, "src", "shims", "track-module-loading.js"),
-      // Next's fast-set-immediate module patches node:timers/promises, whose
-      // ESM namespace is frozen in Workers. More importantly, workerd can run
-      // the next setTimeout(0) stage before a setImmediate scheduled by the
-      // previous cache-components stage. The shim keeps native setImmediate
-      // except during Next's explicit fast-immediate capture window.
+      // fast-set-immediate: workerd's frozen ESM namespace + scheduling order.
       "next/dist/server/node-environment-extensions/fast-set-immediate.external":
         path.join(adapterDir, "src", "shims", "fast-set-immediate.js"),
       "next/dist/server/node-environment-extensions/fast-set-immediate.external.js":
         path.join(adapterDir, "src", "shims", "fast-set-immediate.js"),
-      // NOTE: load-manifest shim exists in src/shims/ but is handled by the
-      // fs shim (manifest loading), so no alias needed.
-      // NOTE: http/node:http is NOT aliased — CF Workers nodejs_compat provides it.
-      // The worker entry uses our custom IncomingMessage/ServerResponse inline via
-      // the NODE_BRIDGE_CODE template, which imports from "http" (the built-in).
+      // CF Workers does NOT provide node:http / node:https even with
+      // nodejs_compat. TCP-server-shaped APIs have no Workers equivalent.
+      // Our shim provides IncomingMessage + ServerResponse stubs.
+      "http": path.join(adapterDir, "src", "shims", "http.js"),
+      "node:http": path.join(adapterDir, "src", "shims", "http.js"),
+      "https": path.join(adapterDir, "src", "shims", "http.js"),
+      "node:https": path.join(adapterDir, "src", "shims", "http.js"),
+      // net: Socket class needed by Next.js http bridge.
+      "net": path.join(adapterDir, "src", "shims", "net.js"),
+      "node:net": path.join(adapterDir, "src", "shims", "net.js"),
+      // Modules with no meaningful Workers runtime — empty stubs.
+      "inspector": path.join(adapterDir, "src", "shims", "empty.js"),
+      "node:inspector": path.join(adapterDir, "src", "shims", "empty.js"),
+      "tls": path.join(adapterDir, "src", "shims", "empty.js"),
+      "node:tls": path.join(adapterDir, "src", "shims", "empty.js"),
+      "dns": path.join(adapterDir, "src", "shims", "empty.js"),
+      "node:dns": path.join(adapterDir, "src", "shims", "empty.js"),
+      "child_process": path.join(adapterDir, "src", "shims", "empty.js"),
+      "node:child_process": path.join(adapterDir, "src", "shims", "empty.js"),
     },
   };
   const configPath = path.join(opts.outputDir, "__wrangler.json");
@@ -728,35 +247,17 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   // Bundle with wrangler --dry-run
   // Wrangler internally uses esbuild but with Turbopack-aware resolution
   // and proper CJS/ESM interop for CF Workers.
-  // Ensure @next/routing is resolvable from the project directory. It's a
-  // dependency of the adapter, not the user's project, so wrangler can't
-  // find it when run from the project's cwd. Resolve via \`createRequire\`
-  // rather than guessing \`adapterDir/node_modules/@next/routing\` — pnpm's
-  // virtual-store layout means that path often doesn't exist (the real
-  // install lives under \`node_modules/.pnpm/@next+routing@X/\`), and the
-  // guess only works for the link-protocol install of the adapter.
+  // Ensure @next/routing is resolvable from the project directory.
+  // It's a dependency of the adapter, not the user's project.
+  // Symlink it into the project's node_modules if missing.
   const projectNodeModules = path.join(path.dirname(opts.distDir), "node_modules");
   const routingDest = path.join(projectNodeModules, "@next", "routing");
-  const adapterRequire = createRequire(path.join(adapterDir, "package.json"));
-  let routingSrc: string;
-  try {
-    routingSrc = path.dirname(adapterRequire.resolve("@next/routing/package.json"));
-  } catch {
-    // Fallback to the legacy guess so a classic link-install still works.
-    routingSrc = path.join(adapterDir, "node_modules", "@next", "routing");
-  }
+  const routingSrc = path.join(adapterDir, "node_modules", "@next", "routing");
   try {
     await fs.access(routingDest);
   } catch {
     await fs.mkdir(path.join(projectNodeModules, "@next"), { recursive: true });
-    try {
-      await fs.symlink(routingSrc, routingDest, "junction");
-    } catch (err: unknown) {
-      // Racy repeat runs (same project dir rebuilt back-to-back) can leave a
-      // dangling symlink that \`access\` reports as missing while \`symlink\`
-      // still refuses to overwrite.
-      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") throw err;
-    }
+    await fs.symlink(routingSrc, routingDest, "junction");
   }
 
   const bundleDir = path.join(opts.outputDir, "__bundle");
@@ -821,252 +322,13 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       'err.code !== "ENOENT" && err.code !== "MODULE_NOT_FOUND" && err.code !== "ERR_MODULE_NOT_FOUND" && !err.message?.includes("is not supported")',
     );
 
-    // Some libraries hide builtin requires from the bundler, e.g.
-    // @typescript/vfs constructs `require("path")` via String.fromCharCode.
-    // Wrangler can't statically rewrite that, so esbuild's __require helper
-    // throws at runtime even though the node:path wrapper is already present
-    // elsewhere in the bundle. Route those builtin dynamic requires back to
-    // wrangler's generated require_path() module when available.
-    workerCode = workerCode.replace(
-      /throw Error\('Dynamic require of "' \+ x \+ '" is not supported'\);/,
-      'if ((x === "path" || x === "node:path") && typeof require_path === "function") return require_path();\n  throw Error(\'Dynamic require of "\' + x + \'" is not supported\');',
-    );
-    workerCode = workerCode.replace(
-      /(throw Error\('Dynamic require of "' \+ x \+ '" is not supported'\);\n\}\);)/,
-      '$1\n__require.resolve = (id) => id === "typescript" ? "node_modules/typescript/lib/typescript.js" : id;',
-    );
-
-    // `next/dist/server/node-environment.js` imports
-    // `./node-environment-extensions/fast-set-immediate.external` by relative
-    // path, so Wrangler's bare-specifier alias cannot intercept it. If the
-    // original module installs first, our scoped shim stores Next's patched
-    // timer functions as its "native" originals and the workerd ordering fix
-    // becomes re-entrant. Route that side-effect import to the aliased shim
-    // module that Wrangler emitted for Turbopack's external import.
-    workerCode = workerCode.replace(
-      /\brequire_fast_set_immediate_external\(\);/g,
-      'typeof init_fast_set_immediate === "function" ? init_fast_set_immediate() : require_fast_set_immediate_external();',
-    );
-
-    // Next.js's \`getInstrumentationModule\` does
-    // \`await __require(path.join(projectDir, distDir, "server",
-    // \`\${INSTRUMENTATION_HOOK_FILENAME}.js\`))\`. workerd can't resolve
-    // dynamic-require paths — the call rejects, the catch above swallows it,
-    // and \`instrumentation.register()\` is never invoked. Worker-entry
-    // static-imports the user file onto \`globalThis.__CREEK_INSTRUMENTATION\`
-    // when present, so prefer that over \`__require\` here. Falls through
-    // to the original call when no user instrumentation is registered so
-    // the \`module.exports = {}\` placeholder path still works.
-    workerCode = workerCode.replace(
-      /(cachedInstrumentationModule\s*=\s*\(0,\s*_interopdefault\.interopDefault\)\s*\()\s*await __require\(/g,
-      "$1globalThis.__CREEK_INSTRUMENTATION || await __require(",
-    );
-
-    workerCode = patchBundledManifestSingleton(workerCode);
-
-    // depd (via raw-body) uses `eval("(function ("+args+") {...})")` to build a
-    // deprecation-wrapping thunk. workerd + CF Workers block code generation
-    // from strings ("Code generation from strings disallowed for this context"),
-    // so any module that pulls in raw-body — notably the Pages Router API
-    // body parser — throws at module load time, and the outer try/catch in
-    // parse-body.ts surfaces it to the browser as `400 Invalid body`.
-    //
-    // Replace the minified eval expression with a direct function literal
-    // that preserves the runtime semantics (log + call). We lose the
-    // `function.length` preservation the eval form achieved, but nothing
-    // in the raw-body → parse-body call chain reads it.
-    //
-    // Fixes middleware-redirects "should redirect to api route with locale"
-    // (and the /fr variant) — both fail because their navigation ends at
-    // an API route whose parse-body path can't load raw-body.
-    workerCode = workerCode.replace(
-      /var\s+(\w+)\s*=\s*eval\("\(function \(".*?return\s+\1\s*;?\s*\}/s,
-      "return function(){log.call(deprecate,message,site);return fn.apply(this,arguments)}}",
-    );
-
-    // Route \`externalImport(id)\` through \`globalThis.__CREEK_EXT_MODS\` so
-    // we can serve bundled-but-externalized-by-Turbopack modules from
-    // our worker-entry static imports. Turbopack emits chunks like
-    // \`[externals]_next_dist_compiled_@vercel_og_index_node_...\` that do
-    // \`await e.y("next/dist/compiled/@vercel/og/index.node.js")\`; on
-    // workerd that \`await import(id)\` path throws "No such module" and
-    // the handler 500s. When our entry registers the module in
-    // \`__CREEK_EXT_MODS\`, the patched \`externalImport\` returns it
-    // directly without going through workerd's external loader.
-    // Fixes og-api \`/og-node\` (node runtime) +
-    // use-cache-metadata-route-handler opengraph/icon tests.
-    workerCode = workerCode.replace(
-      /async function externalImport\((\w+)\)\s*\{\s*let\s+raw;\s*try\s*\{\s*raw\s*=\s*await import\(\1\);/g,
-      (match, idVar) =>
-        `async function externalImport(${idVar}) {\n` +
-        `      let raw;\n` +
-        `      { const __loaders = globalThis.__CREEK_EXT_LOADERS; if (__loaders && __loaders[${idVar}]) {\n` +
-        `        const __cached = globalThis.__CREEK_EXT_MODS = globalThis.__CREEK_EXT_MODS || {};\n` +
-        `        if (${idVar} in __cached) { raw = __cached[${idVar}]; }\n` +
-        `        else { try { raw = await __loaders[${idVar}](); __cached[${idVar}] = raw; } catch (err) { throw new Error(\`Failed to load external module \${${idVar}}: \${err}\`); } }\n` +
-        `        if (raw && raw.__esModule && raw.default && "default" in raw.default) { return interopEsm(raw.default, createNS(raw), true); }\n` +
-        `        return raw;\n` +
-        `      } }\n` +
-        `      try {\n` +
-        `        raw = await import(${idVar});`,
-    );
-
-    // \`@vercel/og/index.node.js\` evaluates at module load:
-    //
-    //   var fontData = fs.readFileSync(fileURLToPath(new URL("./Geist-Regular.ttf", import.meta.url)));
-    //   var resvg_wasm = fs.readFileSync(fileURLToPath(new URL("./resvg.wasm", import.meta.url)));
-    //
-    // workerd rejects \`new URL("./X", import.meta.url)\` with
-    // "Invalid URL string" in the bundled-worker context, so evaluation
-    // aborts before any request hits the route. Rewrite these two calls
-    // to pass literal paths into fs.readFileSync directly — our fs shim
-    // has a basename fallback for .wasm/.ttf, so the embedded bundled
-    // bytes resolve regardless of path.
-    workerCode = workerCode.replace(
-      /fileURLToPath\(new URL\(("\.\/[^"]+\.(?:wasm|ttf|otf|woff2?|png|jpg|jpeg|gif|webp|svg|ico)")\s*,\s*import\.meta\.url\)\)/g,
-      (_match, filename) => filename.replace(/^"\.\//, '"'),
-    );
-
-    // Strip `AsyncLocalStorage.snapshot()` bindings in Next's
-    // `server/app-render/async-local-storage.js` and its Turbopack-inlined
-    // variants. On workerd, `ALS.snapshot()` captures the CURRENT IoContext
-    // and invoking the returned function from a later request throws
-    // "Cannot perform I/O on behalf of a different request". Next uses
-    // `createSnapshot()` / `runInCleanSnapshot: ALS.snapshot()` for cache-
-    // invalidation + edge-action callback propagation — both paths cross
-    // request boundaries on workerd. Replace the snapshot binding with a
-    // direct passthrough, matching @opennextjs/cloudflare's `patchUseCacheIO`
-    // (their comment: "TODO: Find a better fix for this issue.").
-    //
-    // Four forms exist post-bundling:
-    //   1. `function createSnapshot() { if (X) return X.snapshot(); return function(fn,...args){...}; }`
-    //      — clean esm form from next/dist/esm (one copy embedded by wrangler).
-    //   2. `function <name>() { return X ? X.snapshot() : function(a,...b){ return a(...b); }; }`
-    //      — Turbopack's minified module-level shim (edge-side copies).
-    //   3. `a.s(["bindSnapshot", 0, q, "createSnapshot", 0, function(){ return p ? p.snapshot() : ...; }])`
-    //      — Turbopack's export-binding form in the same shim.
-    //   4. `runInCleanSnapshot: X ? X.snapshot() : function(a,...b){ return a(...b); }`
-    //      — inlined call-site in the bundled work-store constructor.
-    // A single regex `(\w+) ? \1.snapshot() : ` stripped from the minified
-    // forms covers 2/3/4; form 1 uses an if-guard so handle it separately.
-    workerCode = workerCode.replace(
-      /if\s*\(\s*(\w+)\s*\)\s*\{\s*return\s+\1\.snapshot\(\);\s*\}/g,
-      "// Ignored snapshot",
-    );
-    workerCode = stripAsyncLocalStorageSnapshotTernaries(workerCode);
-    // `use cache` arguments that contain an unresolved React thenable marker
-    // (`$@`) during a prerender are request-bound values. Next's dynamic
-    // access instrumentation usually catches this before cache fill, but an
-    // async params transform can hide the access until after serialization.
-    // Node eventually trips the 50s cache-fill timeout; under workerd that
-    // blocks the whole response. Treat the cache function as a dynamic hole
-    // immediately so the PPR fallback shell can resume.
-    workerCode = patchUseCachePrerenderDanglingPromiseBailout(workerCode);
-    // Null-fallback partial routes don't have a concrete fallback artifact
-    // on disk; under workerd the follow-up path that tries to specialize a
-    // generic shell on the first request can surface as a static-generation
-    // bailout instead of completing the request. Keep these routes on the
-    // blocking path and let the concrete request render/cache directly.
-    workerCode = patchNullFallbackPartialShellBlocking(workerCode);
-
-    // Unify Next's `*AsyncStorageInstance` singletons across Turbopack
-    // chunks via a `globalThis` key. Turbopack emits the `work-unit-async-
-    // storage-instance.js` / `work-async-storage-instance.js` / etc.
-    // factories INLINE into every chunk that references them (see the
-    // `'turbopack-transition': 'next-shared'` import attribute in the
-    // next-shared layer); each chunk evaluates its own
-    // `createAsyncLocalStorage()` call and gets a fresh ALS instance.
-    // On the edge-runtime server-action path this fragments the store:
-    // the action handler runs `workUnitAsyncStorage.run(d, fn)` inside
-    // chunk A's ALS, the inner `headers()` call reads from chunk B's
-    // ALS, finds no store, and throws "headers was called outside a
-    // request scope". Node action path survives because its caller +
-    // callee happen to resolve to the same chunk's copy.
-    //
-    // Fix: rewrite the module factory bodies to key the ALS on the
-    // exported instance name (`workUnitAsyncStorageInstance`, etc.)
-    // under a single `globalThis.__CREEK_ALS` bag, so all chunks share
-    // one instance per logical store. Name-keyed is narrower than
-    // "dedup every `new AsyncLocalStorage()`" — we don't accidentally
-    // merge unrelated per-store ALSes (tracing requestStorage,
-    // react-server-dom temporaryReferences, etc.).
-    //
-    // Target pattern (both `a.i(N)` and `a.r(N)` create-variants
-    // exist):
-    //   let <v> = (0, a.i(43291).createAsyncLocalStorage)();
-    //   …short gap…
-    //   a.s(["<Name>AsyncStorageInstance", 0, <v>], …)
-    // Replacement keeps the original create call so the per-isolate
-    // fallback works if globalThis isn't carried through an unusual
-    // loader; the `??=` idempotently promotes the first copy into the
-    // shared bag.
-    workerCode = workerCode.replace(
-      /let\s+(\w+)\s*=\s*(\(0,\s*a\.[ir]\(\d+\)\.createAsyncLocalStorage\)\(\));([\s\S]{0,400}?a\.s\(\["(\w+AsyncStorageInstance)",\s*0,\s*\1\])/g,
-      (_match, varName: string, createCall: string, tail: string, storeName: string) =>
-        `let ${varName} = ((globalThis.__CREEK_ALS ??= {})["${storeName}"] ??= ${createCall});${tail}`,
-    );
-    // Same dedup for the CJS-wrapped variants esbuild produces when it
-    // bundles Next's non-Turbopack ESM copy. Two observed shapes:
-    //   a. `var <Name>AsyncStorageInstance = (0, _als.createAsyncLocalStorage)();`
-    //      — top-level from `work-unit-async-storage-instance.js` etc.
-    //   b. `Object.defineProperty(c, "<Name>AsyncStorageInstance", {…get…return <v>…}); let <v> = (0, a.r(N).createAsyncLocalStorage)();`
-    //      — Turbopack-emitted CJS compiled form (edge chunks).
-    workerCode = workerCode.replace(
-      /var\s+(\w+AsyncStorageInstance)\s*=\s*(\(0,\s*\w+\.createAsyncLocalStorage\)\(\));/g,
-      (_match, storeName: string, createCall: string) =>
-        `var ${storeName} = ((globalThis.__CREEK_ALS ??= {})["${storeName}"] ??= ${createCall});`,
-    );
-    workerCode = workerCode.replace(
-      /(Object\.defineProperty\(c,\s*"(\w+AsyncStorageInstance)",\s*\{[^}]*get:\s*(?:\/\*[^*]*\*\/\s*)?(?:__name\()?function\(\)\s*\{\s*return (\w+);[^}]*\}[\s\S]*?\}\);)\s*let\s+\3\s*=\s*(\(0,\s*a\.[ir]\(\d+\)\.createAsyncLocalStorage\)\(\))/g,
-      (_match, prefix: string, storeName: string, varName: string, createCall: string) =>
-        `${prefix}\nlet ${varName} = ((globalThis.__CREEK_ALS ??= {})["${storeName}"] ??= ${createCall})`,
-    );
-
-    // Turbopack's node.js runtime implements top-level-await by assigning
-    // \`module.exports = <Promise>\`. esbuild's \`__toESM\` wraps imports with
-    // \`__create(__getProtoOf(mod))\`, and for a Promise that yields a plain
-    // object whose \`__proto__\` is \`Promise.prototype\`. Awaiting that object
-    // invokes \`Promise.prototype.then\` with a non-Promise receiver — workerd
-    // rejects it as "incompatible receiver" and the route 500s. Detect a
-    // Promise input and return it unchanged so await resolves the real
-    // async-module promise instead. Fixes \`metadata-edge\` and
-    // \`metadata-dynamic-routes-async-deps\` \`opengraph-image\` routes.
-    workerCode = workerCode.replace(
-      /var __toESM = \(mod, isNodeMode, target\) => \(target = mod != null \? __create\(__getProtoOf\(mod\)\) : \{\}, __copyProps\(\s*(?:\/\/[^\n]*\n\s*)*isNodeMode \|\| !mod \|\| !mod\.__esModule \? __defProp\(target, "default", \{ value: mod, enumerable: true \}\) : target,\s*mod\s*\)\);/,
-      `var __toESM = (mod, isNodeMode, target) => {
-  if (mod != null && typeof mod === "object" && typeof mod.then === "function" && __getProtoOf(mod) === Promise.prototype) {
-    return mod;
-  }
-  target = mod != null ? __create(__getProtoOf(mod)) : {};
-  return __copyProps(
-    isNodeMode || !mod || !mod.__esModule ? __defProp(target, "default", { value: mod, enumerable: true }) : target,
-    mod
-  );
-};`,
-    );
-
     await fs.writeFile(workerPath, workerCode);
   } catch {}
 
-  // Emit wrangler.toml that covers both local dev (workerd via wrangler dev)
-  // and \`wrangler deploy\`. Dev and prod MUST share the same config so
-  // deployment behavior stays predictable — that's what the adapter is
-  // expected to guarantee.
-  //
-  // The file lives alongside worker.js in \`.creek/adapter-output/server/\`.
-  // Users can override specific values by creating a \`wrangler.toml\`
-  // at their project root — the adapter reads that at build time and
-  // merges over our defaults (support added in a follow-up TODO).
-  await emitWranglerConfig({
-    outputDir: opts.outputDir,
-    assetsRelPath: "../assets", // server/ → assets/
-    // Same normalization as the copy loop above — ensure every wasm
-    // filename declared in the rules ends with \`.wasm\` so wrangler's
-    // CompiledWasm rule discovers the file we actually wrote to disk.
-    wasmFilenames: [...opts.wasmFiles.keys()].map((n) =>
-      n.endsWith(".wasm") ? n : n + ".wasm"
-    ),
-  });
+  // Copy WASM files alongside the bundle
+  for (const [name, absPath] of opts.wasmFiles) {
+    await fs.copyFile(absPath, path.join(opts.outputDir, name));
+  }
 
   // Clean up temp files
   await fs.rm(entryPath, { force: true });
@@ -1076,101 +338,4 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   // List output files
   const files = await fs.readdir(opts.outputDir);
   return files.filter(f => !f.startsWith("__"));
-}
-
-/**
- * Write a wrangler.toml next to worker.js so the same config drives both
- * \`wrangler dev\` (local dev / test harness) and \`wrangler deploy\` (prod).
- *
- * Contents:
- *   - \`name\`, \`main\`, \`compatibility_date\`, \`compatibility_flags\` — runtime
- *   - \`[assets]\` — binds the assets directory with \`run_worker_first\` so our
- *     worker handles routing before workerd's static asset shortcut
- *   - \`[[durable_objects.bindings]]\` + \`[[migrations]]\` — the three DO
- *     classes the worker entry declares (DOQueueHandler, DOShardedTagCache,
- *     BucketCachePurge)
- *   - \`[[rules]] type = "CompiledWasm"\` — declares wasm siblings (next/og
- *     yoga/resvg, sharp, etc.) as module imports for workerd's loader
- */
-async function emitWranglerConfig(opts: {
-  outputDir: string;
-  assetsRelPath: string;
-  wasmFilenames: string[];
-}): Promise<void> {
-  const { outputDir, assetsRelPath, wasmFilenames } = opts;
-  // Turbopack + wrangler both emit wasm siblings (hashed \`wasm_<xxh3>\`
-  // from us, \`<sha1>-yoga.wasm\` / \`<sha1>-resvg.wasm\` from wrangler's
-  // own esbuild pass when the app imports next/og). A wildcard glob
-  // covers every sibling regardless of who emitted it. Listing specific
-  // filenames fails because wrangler normalises import paths with a
-  // leading \`./\` that literal-name globs don't match — the built-in
-  // \`**/*.wasm\` rule then fires and aborts the build with
-  // "ignored because a previous rule ... was not marked as fallthrough".
-  let hasWasm = wasmFilenames.length > 0;
-  if (!hasWasm) {
-    try {
-      const entries = await fs.readdir(outputDir);
-      hasWasm = entries.some((e) => e.endsWith(".wasm"));
-    } catch {}
-  }
-  const wasmRule = hasWasm
-    ? [
-        "",
-        "# Declare every wasm sibling as a CompiledWasm module so \`import",
-        "# foo from \"./<hash>.wasm\"\` in the bundle resolves at runtime.",
-        "# Without this, Turbopack's runtime registry returns undefined and",
-        "# throws \"dynamically loading WebAssembly is not supported\".",
-        "[[rules]]",
-        `globs = ["**/*.wasm"]`,
-        `type = "CompiledWasm"`,
-        `fallthrough = false`,
-      ].join("\n")
-    : "";
-
-  const toml = `# Generated by @solcreek/adapter-creek. Hand edits will be overwritten on
-# the next \`next build\`. To extend (add KV, queues, env vars, etc.), create
-# a \`wrangler.toml\` at your project root — the adapter merges it on top.
-
-name = "creek"
-main = "worker.js"
-compatibility_date = "2026-03-23"
-compatibility_flags = ["nodejs_compat"]
-
-# Static assets from Next.js's \`.next/static\` + \`public/\` live alongside
-# this server dir under \`../assets/\`. \`run_worker_first = true\` tells
-# workerd to invoke our worker BEFORE serving static files — the adapter
-# handles middleware, routing, and cache headers before any asset shortcut.
-[assets]
-directory = "${assetsRelPath}"
-binding = "ASSETS"
-run_worker_first = true
-
-# Durable Object classes declared by the adapter's worker-entry. The
-# binding \`name\` (what runtime code reads via \`env.<NAME>\`) must match
-# what Creek's control plane injects in production — see
-# \`packages/control-plane/src/modules/deployments/deploy.ts:129-140\` in
-# the Creek repo. Do NOT rename these without coordinating with Creek.
-#
-# \`class_name\` is our internal export name from worker-entry.ts.
-# \`new_sqlite_classes\` (not \`new_classes\`) selects SQLite-backed DO
-# storage — DOShardedTagCache and BucketCachePurge both use
-# \`ctx.storage.sql\`. DOQueueHandler is currently a placeholder but
-# declared under SQLite too so future queue persistence has no migration
-# cost.
-[[durable_objects.bindings]]
-name = "NEXT_CACHE_DO_QUEUE"
-class_name = "DOQueueHandler"
-[[durable_objects.bindings]]
-name = "NEXT_TAG_CACHE_DO_SHARDED"
-class_name = "DOShardedTagCache"
-[[durable_objects.bindings]]
-name = "NEXT_CACHE_DO_BUCKET_PURGE"
-class_name = "BucketCachePurge"
-
-[[migrations]]
-tag = "v1"
-new_sqlite_classes = ["DOQueueHandler", "DOShardedTagCache", "BucketCachePurge"]
-${wasmRule}
-`;
-  await fs.writeFile(path.join(outputDir, "wrangler.toml"), toml);
 }

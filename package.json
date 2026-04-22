@@ -1,6 +1,6 @@
 {
   "name": "@solcreek/adapter-creek",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Next.js deployment adapter for Creek (Cloudflare Workers)",
   "type": "module",
   "main": "./dist/index.js",
@@ -45,7 +45,6 @@
   },
   "dependencies": {
     "@next/routing": "16.2.3",
-    "@node-rs/xxhash": "^1.7.6",
     "sql.js": "^1.14.1",
     "wrangler": "^4.82.2"
   },
@@ -53,6 +52,7 @@
     "next": ">=16.2.3"
   },
   "devDependencies": {
+    "@node-rs/xxhash": "^1.7.6",
     "@types/node": "^22.13.10",
     "miniflare": "^4.20260410.0",
     "next": "16.2.3",

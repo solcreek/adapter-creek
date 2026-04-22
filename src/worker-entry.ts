@@ -482,8 +482,17 @@ if (typeof process !== "undefined") {
     }, { bigint: () => BigInt(Math.floor(performance.now() * 1e6)) });
   }
   if (!process.on) process.on = () => process;
-  if (!process.removeListener) process.removeListener = () => process;
   if (!process.off) process.off = () => process;
+  if (!process.removeListener) process.removeListener = () => process;
+  if (!process.removeAllListeners) process.removeAllListeners = () => process;
+  if (!process.listeners) process.listeners = () => [];
+  if (!process.listenerCount) process.listenerCount = () => 0;
+  if (!process.rawListeners) process.rawListeners = () => [];
+  if (!process.emit) process.emit = () => false;
+  if (!process.prependListener) process.prependListener = () => process;
+  if (!process.prependOnceListener) process.prependOnceListener = () => process;
+  if (!process.once) process.once = () => process;
+  if (!process.addListener) process.addListener = () => process;
 }
 
 import { resolveRoutes, responseToMiddlewareResult } from "@next/routing";
