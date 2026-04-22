@@ -45,6 +45,16 @@ for (const [label, p] of [
 const portArg = args.find((a) => a.startsWith("--port="));
 const port = portArg ? parseInt(portArg.split("=")[1], 10) : 8899;
 
+// The node-runtime worker contains the full single-worker bundle, so it
+// needs every binding that bundle normally consumes — ASSETS, Durable
+// Objects, env vars. The dispatcher's only job right now is to forward,
+// so it only needs the service bindings to reach the runtime workers.
+//
+// Phase 2b will move ASSETS onto the dispatcher (for static fast path)
+// once middleware + routing live there. Until then, placing ASSETS on
+// the node-runtime keeps the existing worker-entry code working
+// unchanged on its \`env.ASSETS.fetch()\` call sites.
+const nodeAssetsDir = join(outputRoot, "assets");
 const mf = new Miniflare({
   port,
   workers: [
@@ -56,16 +66,41 @@ const mf = new Miniflare({
         NODE_WORKER: "node-runtime",
         EDGE_WORKER: "edge-runtime",
       },
-      // Phase 1: omit the assets binding — miniflare's default is to
-      // answer from assets BEFORE calling the worker (equivalent to CF's
-      // \`not_found_handling\`), which intercepts every unprefixed path
-      // in the scaffold. Phase 2 wires \`run_worker_first\` semantics so
-      // the dispatcher runs first and only falls back to assets.
     },
     {
       name: "node-runtime",
-      modules: true,
-      scriptPath: nodeScript,
+      // Pass the bundled worker.js as an explicit single ESModule. Using
+      // \`modules: true\` + \`scriptPath\` triggers miniflare's acorn-based
+      // import walker which throws on the \`import(varName)\` pattern our
+      // adapter bundle uses for lazy handler loading. Providing the
+      // module list manually bypasses the walker and lets workerd itself
+      // resolve dynamic specifiers at runtime (which it does fine).
+      modules: [{ type: "ESModule", path: nodeScript }],
+      compatibilityDate: "2026-03-23",
+      compatibilityFlags: ["nodejs_compat"],
+      assets: {
+        directory: nodeAssetsDir,
+        binding: "ASSETS",
+        // Match the single-worker wrangler.toml's \`run_worker_first = true\`
+        // — the adapter's worker.js owns routing for every URL (including
+        // ones that look like assets), then explicitly delegates to
+        // \`env.ASSETS.fetch()\` where appropriate. Miniflare's SDK nests
+        // this under \`routerConfig.invoke_user_worker_ahead_of_assets\`.
+        // Without it, miniflare serves matched files directly and 404s
+        // unknowns, bypassing middleware and routing entirely.
+        routerConfig: {
+          invoke_user_worker_ahead_of_assets: true,
+          has_user_worker: true,
+        },
+      },
+      // Declare + bind the same DO classes the single-worker wrangler.toml
+      // uses. Miniflare auto-provisions these locally — SQLite-backed per
+      // our \`new_sqlite_classes\` migration.
+      durableObjects: {
+        NEXT_CACHE_DO_QUEUE: { className: "DOQueueHandler", useSQLite: true },
+        NEXT_TAG_CACHE_DO_SHARDED: { className: "DOShardedTagCache", useSQLite: true },
+        NEXT_CACHE_DO_BUCKET_PURGE: { className: "BucketCachePurge", useSQLite: true },
+      },
     },
     {
       name: "edge-runtime",
