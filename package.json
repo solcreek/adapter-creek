@@ -47,6 +47,7 @@
     "@next/routing": "16.2.3",
     "@node-rs/xxhash": "^1.7.6",
     "miniflare": "^4.20260410.0",
+    "sql.js": "^1.14.1",
     "wrangler": "^4.82.2"
   },
   "peerDependencies": {

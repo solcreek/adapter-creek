@@ -67,6 +67,14 @@ log "Running pnpm install..."
 pnpm install --store-dir "${PNPM_STORE_DIR}" --no-frozen-lockfile --prefer-offline --ignore-scripts >&2 2>&1
 log "pnpm install complete"
 
+# Creek sqlite3 shim: when a fixture imports \`sqlite3\`, the stock package
+# tries to \`require('bindings')('node_sqlite3.node')\` during Next.js build-
+# time static analysis. That .node file was never compiled (--ignore-scripts)
+# and wouldn't load on workerd anyway. Replace sqlite3's binding file with
+# our sql.js-backed shim — same API surface, WASM backend, works everywhere.
+# Silent no-op when the fixture doesn't depend on sqlite3.
+node "${ADAPTER_DIR}/scripts/patch-node-modules-sqlite3.mjs" "${PWD}" || true
+
 # Patch Next.js: fix invariant error for dynamic metadata routes in handleBuildComplete.
 # Static metadata files (e.g., icon.png) inside dynamic route segments cause a
 # "failed to find source route" invariant because the prerender entry's srcRoute

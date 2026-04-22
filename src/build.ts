@@ -1116,6 +1116,9 @@ async function collectUserFiles(
     ".ttf", ".otf", ".woff", ".woff2", ".eot",
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".avif", ".ico",
     ".svg", ".wasm", ".pdf",
+    // SQLite databases — our sqlite3 shim (via sql.js) reads these at
+    // request time when getStaticProps fallback runs on the worker.
+    ".sqlite", ".sqlite3", ".db",
   ]);
   const MAX_TOTAL_BYTES = 10 * 1024 * 1024; // 10MB cap (base64 inflates binary)
 
