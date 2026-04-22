@@ -5782,6 +5782,38 @@ async function __handleRequestInner(request, env, ctx) {
       }
     }
   } catch {}
+  // Pin Content-Encoding to identity on streaming text/html responses that
+  // don't already declare an encoding. Miniflare's edge simulator looks at
+  // the Content-Type header and, for types in Cloudflare FL's compress
+  // list (text/html, text/css, application/json, etc.), re-encodes the
+  // body with gzip when the client sent Accept-Encoding: gzip — collapsing
+  // streamed chunk boundaries into a single decompressed chunk on the
+  // client side. Its gate logic in ensureAcceptableEncoding() is:
+  //   if (contentEncoding !== null && contentEncoding !== "gzip" && contentEncoding !== "br") return response;
+  // so an explicit "identity" bypasses the transform. Real CF edge re-reads
+  // Accept-Encoding and re-compresses the bytes on the fly at the edge, so
+  // this label doesn't cost us production bandwidth — it only prevents
+  // miniflare's bulk-encode from breaking tests that assert progressive-
+  // chunk arrival (e.g. use-server-inserted-html).
+  try {
+    if (
+      response &&
+      typeof response.headers?.get === "function" &&
+      !response.headers.has("content-encoding") &&
+      response.body !== null
+    ) {
+      const ct = response.headers.get("content-type") ?? "";
+      if (ct.startsWith("text/html")) {
+        const headers = new Headers(response.headers);
+        headers.set("content-encoding", "identity");
+        return new Response(response.body, {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
+      }
+    }
+  } catch {}
   return response;
 }
 

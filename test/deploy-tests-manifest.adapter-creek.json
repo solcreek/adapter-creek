@@ -24,12 +24,6 @@
       ],
       "_note": "Progressive streaming works end-to-end (our Content-Encoding: identity fix landed in 221db12). The exact-equality assertion `'Received 50 chunks'` fails because workerd's HTTP chunked-transfer splits each 91-byte payload into two wire chunks, inflating React's RSC binary framer to ~149 frames — a workerd transport quirk, not an adapter defect."
     },
-    "test/e2e/app-dir/use-server-inserted-html/use-server-inserted-html.test.ts": {
-      "failed": [
-        "use-server-inserted-html should render css-in-js suspense boundary correctly"
-      ],
-      "_note": "Response contains all three markers in the right order; the test's EXACT ORDER assertion fails because miniflare's HTTP proxy auto-gzips text/html responses to EOF and Node's async iterator sees one collapsed chunk. Production CF Workers compresses at byte-stream granularity so this is a dev-env (miniflare) artefact. Other 2 subtests pass."
-    },
     "test/e2e/undici-fetch/index.test.ts": {
       "failed": [
         "undici fetch undici global Headers should return true when undici is used",
