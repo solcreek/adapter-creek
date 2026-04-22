@@ -1,5 +1,11 @@
 # adapter-creek
 
+[![npm](https://img.shields.io/npm/v/@solcreek/adapter-creek?color=brightgreen&logo=npm)](https://www.npmjs.com/package/@solcreek/adapter-creek)
+[![checks](https://github.com/solcreek/adapter-creek/actions/workflows/checks.yml/badge.svg?branch=main)](https://github.com/solcreek/adapter-creek/actions/workflows/checks.yml)
+[![e2e deploy tests](https://github.com/solcreek/adapter-creek/actions/workflows/test-e2e-deploy.yml/badge.svg)](https://github.com/solcreek/adapter-creek/actions/workflows/test-e2e-deploy.yml)
+[![Next.js](https://img.shields.io/badge/next.js-%E2%89%A516.2-black?logo=nextdotjs)](https://nextjs.org/docs/app/api-reference/adapters)
+[![license](https://img.shields.io/npm/l/@solcreek/adapter-creek?color=blue)](./LICENSE)
+
 Next.js deployment adapter for [Creek](https://creek.dev).
 
 ## What is Creek?
