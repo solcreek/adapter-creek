@@ -115,6 +115,18 @@ jobs:
           chmod +x adapter/scripts/e2e-logs.sh
           chmod +x adapter/scripts/e2e-cleanup.sh
 
+      # Resolve adapter tarball at runtime — npm pack names the file after
+      # the package's current version, which drifts every release. Hard-
+      # coding a version means a missing-file check downstream silently
+      # falls back to `file:`, which pnpm symlinks → realpath escapes the
+      # project tree → Turbopack rejects the cacheHandler path.
+      - name: Resolve adapter tarball
+        id: tarball
+        run: |
+          TARBALL="$(ls -1 "${{ github.workspace }}"/solcreek-adapter-creek-*.tgz | head -n1)"
+          test -n "$TARBALL" || { echo "no tarball found"; exit 1; }
+          echo "path=$TARBALL" >> "$GITHUB_OUTPUT"
+
       - name: Run deploy tests
         working-directory: nextjs
         env:
@@ -128,7 +140,7 @@ jobs:
           # across all manifests.
           NEXT_EXTERNAL_TESTS_FILTERS: test/deploy-tests-manifest.json,${{ github.workspace }}/adapter/test/deploy-tests-manifest.adapter-creek.json
           ADAPTER_DIR: ${{ github.workspace }}/adapter
-          ADAPTER_TARBALL: ${{ github.workspace }}/solcreek-adapter-creek-0.1.0.tgz
+          ADAPTER_TARBALL: ${{ steps.tarball.outputs.path }}
           IS_TURBOPACK_TEST: 1
           NEXT_TEST_JOB: 1
           NEXT_TELEMETRY_DISABLED: 1
