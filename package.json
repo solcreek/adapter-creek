@@ -1,6 +1,6 @@
 {
   "name": "@solcreek/adapter-creek",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "description": "Next.js deployment adapter for Creek (Cloudflare Workers)",
   "type": "module",
   "main": "./dist/index.js",
@@ -45,6 +45,7 @@
   },
   "dependencies": {
     "@next/routing": "16.2.3",
+    "@solcreek/adapter-core": "^0.1.0",
     "sql.js": "^1.14.1",
     "wrangler": "^4.82.2"
   },
