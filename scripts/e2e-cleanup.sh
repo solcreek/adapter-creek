@@ -63,4 +63,16 @@ if [ -f "${WORKER_LOG}" ]; then
   fi
 fi
 
+# Dump the last 200 lines of the per-test worker server log to stderr.
+# The Next.js deploy harness captures jest stdout/stderr but only the
+# build-time logs go through NEXT_TEST_DEPLOY_LOGS_SCRIPT_PATH — anything
+# the worker prints at request time (uncaught throws, console.error from
+# handlers, our [creek-…] diagnostics) lives only in .adapter-server.log.
+# Surface it on cleanup so 500s in CI are debuggable from the GHA log.
+if [ -f ".adapter-server.log" ]; then
+  echo "[adapter-creek] === server log (last 200 lines) ===" >&2
+  tail -200 ".adapter-server.log" >&2
+  echo "[adapter-creek] === end server log ===" >&2
+fi
+
 echo "[adapter-creek] Cleanup complete" >&2
