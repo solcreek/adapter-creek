@@ -8084,7 +8084,18 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     const origAddListener = res.addListener.bind(res);
     const captureCloseListener = (listener) => {
       if (typeof listener === "function") {
-        syntheticCloseListeners.push(listener);
+        if (syntheticCloseFired) {
+          queueMicrotask(() => {
+            try {
+              const maybePromise = listener.call(res);
+              if (maybePromise?.then) ctx.waitUntil(Promise.resolve(maybePromise).catch(() => {}));
+            } catch (err) {
+              queueMicrotask(() => { throw err; });
+            }
+          });
+        } else {
+          syntheticCloseListeners.push(listener);
+        }
       }
       return res;
     };
