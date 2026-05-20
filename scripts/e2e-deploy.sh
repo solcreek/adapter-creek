@@ -65,14 +65,29 @@ pkg.dependencies['@solcreek/adapter-creek'] = 'file:${ADAPTER_DIR}';
 require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 " >&2
 fi
-log "Running pnpm install..."
+log "Installing project dependencies..."
+PKG_MANAGER=$(node -e "try{const p=JSON.parse(require('fs').readFileSync('package.json','utf8'));console.log(p.packageManager||'')}catch{console.log('')}")
+if [[ "${PKG_MANAGER}" == npm@* ]]; then
+  log "Detected ${PKG_MANAGER}; running npm install..."
+  npm install --ignore-scripts --cache "${NPM_CACHE_DIR}" --prefer-offline --no-audit --no-fund >&2 2>&1
+else
 # --prefer-offline: use the store whenever possible, only hit the network
 # for packages that aren't already cached. This is what turns a ~3min
 # install into a ~5s link operation once the store is warm.
 # Dropping --force so pnpm can actually use the cached store. --force
 # would re-download every package.
-pnpm install --store-dir "${PNPM_STORE_DIR}" --no-frozen-lockfile --prefer-offline --ignore-scripts >&2 2>&1
-log "pnpm install complete"
+  pnpm install --store-dir "${PNPM_STORE_DIR}" --no-frozen-lockfile --prefer-offline --ignore-scripts >&2 2>&1
+fi
+if grep -R "@swc/helpers/_/_object_spread" pages app src 2>/dev/null >/dev/null; then
+  if [ -d node_modules/@swc/helpers ] && [ -d node_modules/next ]; then
+    mkdir -p node_modules/next/node_modules/@swc
+    if [ ! -e node_modules/next/node_modules/@swc/helpers ]; then
+      mv node_modules/@swc/helpers node_modules/next/node_modules/@swc/
+      log "Moved @swc/helpers under next/node_modules for non-hoisted helper fixture"
+    fi
+  fi
+fi
+log "package install complete"
 
 # Creek sqlite3 shim: when a fixture imports \`sqlite3\`, the stock package
 # tries to \`require('bindings')('node_sqlite3.node')\` during Next.js build-
@@ -165,7 +180,11 @@ if node -e "const p=JSON.parse(require('fs').readFileSync('package.json','utf8')
   # and \`cache-components-unstable-deprecations\` assert on warnings
   # Next.js emits during \`next build\`; without capturing the build
   # output those assertions see only the empty worker-dev-server log.
-  pnpm run build 2>&1 | tee .adapter-build-cli.log >&2
+  if [[ "${PKG_MANAGER}" == npm@* ]]; then
+    npm run build 2>&1 | tee .adapter-build-cli.log >&2
+  else
+    pnpm run build 2>&1 | tee .adapter-build-cli.log >&2
+  fi
 else
   npx next build --experimental-next-config-strip-types 2>&1 | tee .adapter-build-cli.log >&2
 fi

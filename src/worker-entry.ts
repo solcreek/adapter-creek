@@ -899,12 +899,27 @@ globalThis.__MANIFESTS = ${JSON.stringify(opts.manifests)};
 // mismatch in workerd.
 globalThis.__USER_FILES = ${JSON.stringify(opts.userFiles)};
 
+function __creekPathnameAliases(pathname) {
+  const aliases = [];
+  const add = (value) => {
+    if (typeof value === "string" && value && !aliases.includes(value)) aliases.push(value);
+  };
+  add(pathname);
+  try { add(decodeURIComponent(pathname)); } catch {}
+  try { add(encodeURI(pathname)); } catch {}
+  return aliases;
+}
+
 // Prerender entries for ISR cache seeding (PPR shells + static prerenders)
 const __PRERENDER_ENTRIES = ${JSON.stringify(opts.prerenderEntries)};
 const __CREEK_PRERENDER_ENTRY_BY_PATH = (() => {
   const map = new Map();
   for (const entry of __PRERENDER_ENTRIES) {
-    if (entry && typeof entry.pathname === "string") map.set(entry.pathname, entry);
+    if (entry && typeof entry.pathname === "string") {
+      for (const pathname of __creekPathnameAliases(entry.pathname)) {
+        map.set(pathname, entry);
+      }
+    }
   }
   return map;
 })();
@@ -1294,14 +1309,60 @@ function __collectConfigHeaders(url, requestHeaders) {
   return any ? out : null;
 }
 
-// Manually re-apply ROUTING.beforeFiles rewrites and check if the
+function __escapeRouteSubstitutionRegex(value) {
+  return String(value).replace(/[|\\{}()[\]^$+*?.]/g, "\\$&");
+}
+
+function __substituteRouteDestination(destination, match, routeKeys) {
+  if (typeof destination !== "string") return destination;
+  let dest = destination;
+
+  for (let i = 1; i < match.length; i++) {
+    if (match[i] !== undefined) {
+      dest = dest.replace(new RegExp("\\$" + i, "g"), match[i]);
+    }
+  }
+
+  const named = {};
+  const addNamed = (name, value) => {
+    if (!name || value === undefined) return;
+    named[name] = value;
+    if (name.startsWith("nxtP") || name.startsWith("nxtI")) {
+      named[name.slice(4)] = value;
+    }
+  };
+
+  if (match.groups) {
+    for (const [k, v] of Object.entries(match.groups)) {
+      addNamed(k, v);
+    }
+  }
+  if (routeKeys && typeof routeKeys === "object" && match.groups) {
+    for (const [groupKey, routeKey] of Object.entries(routeKeys)) {
+      const value = match.groups[groupKey] ?? match.groups[routeKey];
+      addNamed(groupKey, value);
+      addNamed(routeKey, value);
+    }
+  }
+
+  for (const [name, value] of Object.entries(named)) {
+    if (value === undefined) continue;
+    const escapedName = __escapeRouteSubstitutionRegex(name);
+    dest = dest.replace(new RegExp("\\$" + escapedName + "(?![a-zA-Z0-9_])", "g"), value);
+    dest = dest.replace(new RegExp(":" + escapedName + "(?:\\*|\\+)?(?![a-zA-Z0-9_])", "g"), value);
+  }
+
+  return dest;
+}
+
+// Manually re-apply ROUTING rewrites and check if the
 // destination is a path-only target (potential public file). The routing
 // layer applies these internally but only surfaces \`invocationTarget\` for
 // destinations that match a known PATHNAME — so a rewrite to \`/file.txt\`
 // (a /public asset) gets silently dropped. Returns the destination
 // pathname if a rewrite matches and looks file-like, else null.
 function __resolveRewriteToPublicFile(url, headers) {
-  if (!ROUTING || !Array.isArray(ROUTING.beforeFiles)) return null;
+  if (!ROUTING) return null;
   // Apply the same locale prefix the routing layer applies internally.
   let candidatePath = url.pathname;
   if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
@@ -1311,33 +1372,25 @@ function __resolveRewriteToPublicFile(url, headers) {
       candidatePath = "/" + def + url.pathname;
     }
   }
-  for (const rule of ROUTING.beforeFiles) {
-    if (!rule || !rule.sourceRegex || !rule.destination) continue;
-    let regex;
-    try { regex = new RegExp(rule.sourceRegex, "i"); } catch { continue; }
-    const match = candidatePath.match(regex);
-    if (!match) continue;
-    // Substitute $1, $2, ... and named groups into destination.
-    let dest = rule.destination;
-    for (let i = 1; i < match.length; i++) {
-      if (match[i] !== undefined) {
-        dest = dest.replace(new RegExp("\\\\$" + i, "g"), match[i]);
+  for (const list of [ROUTING.beforeFiles || [], ROUTING.afterFiles || [], ROUTING.fallback || []]) {
+    if (!Array.isArray(list)) continue;
+    for (const rule of list) {
+      if (!rule || !rule.sourceRegex || !rule.destination) continue;
+      let regex;
+      try { regex = new RegExp(rule.sourceRegex, "i"); } catch { continue; }
+      const match = candidatePath.match(regex);
+      if (!match) continue;
+      const dest = __substituteRouteDestination(rule.destination, match, rule.routeKeys);
+      // Only treat as a potential public file if the destination is path-only,
+      // doesn't start with /api/, and looks file-like (has an extension).
+      const destPath = dest.split("?")[0];
+      if (
+        destPath.startsWith("/") &&
+        !destPath.startsWith("/api/") &&
+        /\\.[a-zA-Z0-9]+$/.test(destPath)
+      ) {
+        return destPath;
       }
-    }
-    if (match.groups) {
-      for (const [k, v] of Object.entries(match.groups)) {
-        if (v !== undefined) dest = dest.replace(new RegExp("\\\\$" + k, "g"), v);
-      }
-    }
-    // Only treat as a potential public file if the destination is path-only,
-    // doesn't start with /api/, and looks file-like (has an extension).
-    const destPath = dest.split("?")[0];
-    if (
-      destPath.startsWith("/") &&
-      !destPath.startsWith("/api/") &&
-      /\\.[a-zA-Z0-9]+$/.test(destPath)
-    ) {
-      return destPath;
     }
   }
   return null;
@@ -1466,6 +1519,36 @@ async function __withEdgeRouteEnv(entryKey, fn) {
   }
 }
 
+async function __withNodeMiddlewareEnv(fn) {
+  if (typeof process === "undefined") return await fn();
+  if (!process.env) process.env = {};
+
+  const envOverrides = {
+    __NEXT_BASE_PATH: BASE_PATH || "",
+    __NEXT_I18N_CONFIG: I18N || "",
+    __NEXT_TRAILING_SLASH: CONFIG?.trailingSlash ? "1" : "",
+    __NEXT_CACHE_LIFE: CONFIG?.experimental?.cacheLife || "",
+    __NEXT_EXPERIMENTAL_AUTH_INTERRUPTS: CONFIG?.experimental?.authInterrupts ? "1" : "",
+    __NEXT_CLIENT_PARAM_PARSING_ORIGINS: CONFIG?.experimental?.clientParamParsingOrigins || "",
+  };
+  const previous = new Map();
+  const missing = new Set();
+  for (const [key, value] of Object.entries(envOverrides)) {
+    if (Object.prototype.hasOwnProperty.call(process.env, key)) {
+      previous.set(key, process.env[key]);
+    } else {
+      missing.add(key);
+    }
+    process.env[key] = value;
+  }
+  try {
+    return await fn();
+  } finally {
+    for (const key of missing) delete process.env[key];
+    for (const [key, value] of previous) process.env[key] = value;
+  }
+}
+
 // ---------------------------------------------------------------
 // IncrementalCache data/tag helpers — bridge CreekCacheHandler to the
 // auto-provisioned DOs and (eventually) R2.
@@ -1520,9 +1603,16 @@ function __creekShardStub(env, shardKey) {
 // when we read a cache entry for key "/foo" we have to check those tags
 // even though Next.js never stored them on the entry itself.
 const __CREEK_IMPLICIT_TAG_PREFIX = "_N_T_";
+const __CREEK_OUT_OF_HEADER_CLASS = /[^\t\x20-\x7e]/;
+const __CREEK_OUT_OF_HEADER_CLASS_RUN = /[^\t\x20-\x7e]+/g;
+function __creekEncodeCacheTag(tag) {
+  return __CREEK_OUT_OF_HEADER_CLASS.test(tag)
+    ? tag.replace(__CREEK_OUT_OF_HEADER_CLASS_RUN, (run) => encodeURIComponent(run))
+    : tag;
+}
 function __creekImplicitTagsForKey(key) {
   if (typeof key !== "string" || !key.startsWith("/")) return [];
-  const tags = [__CREEK_IMPLICIT_TAG_PREFIX + "/layout"];
+  const tags = [__creekEncodeCacheTag(__CREEK_IMPLICIT_TAG_PREFIX + "/layout")];
   const parts = key.split("/");
   for (let i = 1; i < parts.length + 1; i++) {
     let cur = parts.slice(0, i).join("/");
@@ -1530,10 +1620,10 @@ function __creekImplicitTagsForKey(key) {
     if (!cur.endsWith("/page") && !cur.endsWith("/route")) {
       cur = cur + (cur.endsWith("/") ? "" : "/") + "layout";
     }
-    tags.push(__CREEK_IMPLICIT_TAG_PREFIX + cur);
+    tags.push(__creekEncodeCacheTag(__CREEK_IMPLICIT_TAG_PREFIX + cur));
   }
-  tags.push(__CREEK_IMPLICIT_TAG_PREFIX + key);
-  if (key === "/") tags.push(__CREEK_IMPLICIT_TAG_PREFIX + "/index");
+  tags.push(__creekEncodeCacheTag(__CREEK_IMPLICIT_TAG_PREFIX + key));
+  if (key === "/") tags.push(__creekEncodeCacheTag(__CREEK_IMPLICIT_TAG_PREFIX + "/index"));
   return tags;
 }
 
@@ -1567,11 +1657,19 @@ async function __creekTagsInvalidatedSince(tags, since) {
 
 async function __creekWriteRevalidatedTags(tags) {
   if (!Array.isArray(tags) || tags.length === 0) return;
+  const normalizedTags = [];
+  for (const tag of tags) {
+    if (typeof tag !== "string") continue;
+    if (!normalizedTags.includes(tag)) normalizedTags.push(tag);
+    const encoded = __creekEncodeCacheTag(tag);
+    if (!normalizedTags.includes(encoded)) normalizedTags.push(encoded);
+  }
+  if (normalizedTags.length === 0) return;
   const now = Date.now();
   // Always update in-memory (fast, covers same-isolate subsequent reads).
   const mem = globalThis.__CREEK_TAG_INVALIDATED_AT;
   if (mem) {
-    for (const t of tags) if (typeof t === "string") mem.set(t, now);
+    for (const t of normalizedTags) mem.set(t, now);
   }
   // Also update Next.js's internal tagsManifest — \`areTagsExpired\` /
   // \`areTagsStale\` (server/lib/incremental-cache/tags-manifest.external.ts)
@@ -1582,8 +1680,7 @@ async function __creekWriteRevalidatedTags(tags) {
   // flip. Fixes next-after-app-deploy, trailingslash revalidate, and
   // use-cache-route-handler-only revalidate.
   try {
-    for (const t of tags) {
-      if (typeof t !== "string") continue;
+    for (const t of normalizedTags) {
       const existing = __nextTagsManifest.get(t) || {};
       __nextTagsManifest.set(t, Object.assign({}, existing, { stale: now, expired: now }));
     }
@@ -1591,7 +1688,7 @@ async function __creekWriteRevalidatedTags(tags) {
   // Also persist to DO shards so other isolates / future requests see it.
   const env = __creekCurrentEnv();
   if (env && env.NEXT_TAG_CACHE_DO_SHARDED) {
-    const buckets = __creekBucketTagsByShard(tags);
+    const buckets = __creekBucketTagsByShard(normalizedTags);
     const writes = [];
     for (const [shardKey, shardTags] of buckets) {
       const stub = __creekShardStub(env, shardKey);
@@ -1658,10 +1755,17 @@ async function __creekFetchAssetBuffer(assetPath) {
 
 async function __creekSeededAppPageEntry(key, ctx) {
   if (ctx?.kind !== "APP_PAGE") return null;
-  const seed = __CREEK_PRERENDER_ENTRY_BY_PATH.get(key);
+  let seed = __CREEK_PRERENDER_ENTRY_BY_PATH.get(key);
+  if (!seed) {
+    for (const candidate of __creekPathnameAliases(key)) {
+      seed = __CREEK_PRERENDER_ENTRY_BY_PATH.get(candidate);
+      if (seed) break;
+    }
+  }
   // Bracket-form fallback shells go through \`__CREEK_POSTPONED_BY_SHELL\`
   // regex mapping, not direct seeds. Seeds only cover concrete paths.
   if (!seed || seed.pathname.includes("[")) return null;
+  const assetBasePath = seed.pathname || key;
   // Only seed PPR-chain pages. Non-PPR static pages flow through the
   // static-asset fast-path (\`STATIC_PAGES\` lookup in the main handler) —
   // intercepting them here would race the fast-path and can cause the
@@ -1708,9 +1812,9 @@ async function __creekSeededAppPageEntry(key, ctx) {
   //                                  check.
   let rscData;
   if (!ctx.isFallback) {
-    rscData = await __creekFetchAssetBuffer(key + ".rsc");
+    rscData = await __creekFetchAssetBuffer(assetBasePath + ".rsc");
     if (!rscData && ctx.isRoutePPREnabled && typeof seed.postponedState === "string") {
-      rscData = await __creekFetchAssetBuffer(key + ".segments/_full.segment.rsc");
+      rscData = await __creekFetchAssetBuffer(assetBasePath + ".segments/_full.segment.rsc");
     }
     if (!rscData && (!ctx.isRoutePPREnabled || seed.postponedState == null)) {
       return null;
@@ -1722,7 +1826,7 @@ async function __creekSeededAppPageEntry(key, ctx) {
   // so we don't pin 2MB-per-page HTML into isolate memory.
   let html = seed.html;
   if (!html) {
-    const htmlAssetKey = key === "/" ? "/index.html" : key + ".html";
+    const htmlAssetKey = assetBasePath === "/" ? "/index.html" : assetBasePath + ".html";
     const htmlBuf = await __creekFetchAssetBuffer(htmlAssetKey);
     html = htmlBuf ? htmlBuf.toString("utf-8") : "";
   }
@@ -1732,7 +1836,7 @@ async function __creekSeededAppPageEntry(key, ctx) {
     const segments = new Map();
     for (const segmentPath of seed.segmentPaths) {
       if (typeof segmentPath !== "string") continue;
-      const buf = await __creekFetchAssetBuffer(key + ".segments" + segmentPath + ".segment.rsc");
+      const buf = await __creekFetchAssetBuffer(assetBasePath + ".segments" + segmentPath + ".segment.rsc");
       if (buf) segments.set(segmentPath, buf);
     }
     if (segments.size > 0) segmentData = segments;
@@ -2153,16 +2257,22 @@ class CreekComposableCacheHandler {
   async updateTags(tags, durations) {
     const now = Date.now();
     const expire = durations && durations.expire !== undefined ? now + durations.expire * 1000 : now;
+    const normalizedTags = [];
     for (const tag of tags) {
+      if (typeof tag !== "string") continue;
+      if (!normalizedTags.includes(tag)) normalizedTags.push(tag);
+      const encoded = __creekEncodeCacheTag(tag);
+      if (!normalizedTags.includes(encoded)) normalizedTags.push(encoded);
+    }
+    for (const tag of normalizedTags) {
       globalThis.__CREEK_CC_TAG_STATE.set(tag, { stale: now, expire });
     }
     try {
       const mem = globalThis.__CREEK_TAG_INVALIDATED_AT;
       if (mem) {
-        for (const t of tags) if (typeof t === "string") mem.set(t, now);
+        for (const t of normalizedTags) mem.set(t, now);
       }
-      for (const t of tags) {
-        if (typeof t !== "string") continue;
+      for (const t of normalizedTags) {
         const existing = __nextTagsManifest.get(t) || {};
         __nextTagsManifest.set(t, Object.assign({}, existing, { stale: now, expired: now }));
       }
@@ -2245,8 +2355,9 @@ const __CREEK_CC_SEEDS_BY_SHELL = (() => {
 function __creekSeedsForPathname(pathname) {
   if (!pathname || __CREEK_CC_SEEDS_BY_SHELL.length === 0) return null;
   let merged = null;
+  const pathnameAliases = __creekPathnameAliases(pathname);
   for (const shell of __CREEK_CC_SEEDS_BY_SHELL) {
-    if (!shell.regex.test(pathname)) continue;
+    if (!pathnameAliases.some((candidate) => shell.regex.test(candidate))) continue;
     if (!merged) merged = new Map();
     for (const [k, v] of shell.entries) if (!merged.has(k)) merged.set(k, v);
   }
@@ -2275,7 +2386,7 @@ const __CREEK_POSTPONED_BY_SHELL = (() => {
   for (const entry of __PRERENDER_ENTRIES) {
     if (typeof entry.postponedState !== "string" || entry.postponedState.length === 0) continue;
     if (!entry.pathname.includes("[")) continue; // concrete prerenders use their own URL directly
-    if (entry.allowsFallbackShellResume === false) continue;
+    if (entry.allowsFallbackShellResume !== true) continue;
     let re = "";
     let i = 0;
     while (i < entry.pathname.length) {
@@ -2299,8 +2410,9 @@ const __CREEK_POSTPONED_BY_SHELL = (() => {
 
 function __creekPostponedForPathname(pathname) {
   if (!pathname || __CREEK_POSTPONED_BY_SHELL.length === 0) return null;
+  const pathnameAliases = __creekPathnameAliases(pathname);
   for (const shell of __CREEK_POSTPONED_BY_SHELL) {
-    if (shell.regex.test(pathname)) return shell.postponedState;
+    if (pathnameAliases.some((candidate) => shell.regex.test(candidate))) return shell.postponedState;
   }
   return null;
 }
@@ -2514,8 +2626,13 @@ function __initManifests() {
               ? workStore.page
               : "app" + workStore.page;
             entry = mergedWorkers[pageKey];
+            if (!entry && !pageKey.endsWith("/page")) {
+              entry = mergedWorkers[pageKey + "/page"];
+            }
+            if (!entry) return undefined;
+          } else {
+            entry = Object.values(mergedWorkers)[0];
           }
-          if (!entry) entry = Object.values(mergedWorkers)[0];
           return entry ? { id: entry.moduleId, name: id, chunks: [], async: entry.async } : undefined;
         }
       }),
@@ -2529,6 +2646,48 @@ function __initManifests() {
   // Pre-seeding breaks Pages Router ISR fallback behavior (isFallback: true)
   // and doesn't correctly distinguish between App Router and Pages Router entries.
   // The cache will be populated on first request by CreekCacheHandler.set().
+}
+
+function __creekActionNotFoundResponse() {
+  const headers = new Headers();
+  headers.set("content-type", "text/plain; charset=utf-8");
+  headers.set("x-nextjs-action-not-found", "1");
+  return new Response("Server action not found.", { status: 404, headers });
+}
+
+function __creekActionPageCandidates(pageName) {
+  const pages = [];
+  if (!pageName || typeof pageName !== "string") return pages;
+  pages.push(pageName);
+  if (pageName.startsWith("app")) {
+    pages.push(pageName.slice(3));
+  } else {
+    pages.push("app" + pageName);
+  }
+  const withPage = [];
+  for (const page of pages) {
+    if (!page.endsWith("/page")) withPage.push(page + "/page");
+  }
+  return Array.from(new Set([...pages, ...withPage]));
+}
+
+function __creekActionHasWorkerForPage(actionId, pageName) {
+  if (!actionId || !pageName) return false;
+  try {
+    const manifests = globalThis[Symbol.for("next.server.manifests")];
+    const manifest = manifests?.serverActionsManifest;
+    const workers = [
+      manifest?.node?.[actionId]?.workers,
+      manifest?.edge?.[actionId]?.workers,
+    ];
+    const candidates = __creekActionPageCandidates(pageName);
+    return workers.some((workerMap) => {
+      if (!workerMap) return false;
+      return candidates.some((candidate) => workerMap[candidate]);
+    });
+  } catch {
+    return false;
+  }
 }
 
 
@@ -2704,7 +2863,11 @@ const middlewareHandler = async (mwCtx) => {
 import * as __middleware_mod from ${JSON.stringify(opts.outputs.middleware.filePath)};
 const middlewareHandler = async (mwCtx) => {
   try {
-    const handler = __middleware_mod.handler || __middleware_mod.default;
+    const handler =
+      __middleware_mod.proxy ||
+      __middleware_mod.middleware ||
+      __middleware_mod.handler ||
+      __middleware_mod.default;
     if (typeof handler !== "function") return {};
     // Mirror the edge middleware path: strip flight headers and the _rsc
     // search param so middleware sees a clean request.
@@ -2762,7 +2925,7 @@ const middlewareHandler = async (mwCtx) => {
         } catch {}
       },
     };
-    const response = await handler(mwReq, mwInvokeCtx);
+    const response = await __withNodeMiddlewareEnv(() => handler(mwReq, mwInvokeCtx));
     const mwResult = responseToMiddlewareResult(response, mwHeaders, mwCtx.url);
     mwResult.__mwResponse = response;
     // See edge variant for rationale: restore flight headers so the page
@@ -3713,6 +3876,7 @@ async function __handleRequestInner(request, env, ctx) {
                 // assertions observe the same dimensions as Vercel's optimizer.
                 if (
                   (env?.NEXT_PRIVATE_TEST_MODE === "e2e" || process.env.NEXT_PRIVATE_TEST_MODE === "e2e") &&
+                  !imageUrl.startsWith("/_next/static/") &&
                   url.searchParams.has("w")
                 ) {
                   const bytes = new Uint8Array(await assetRes.arrayBuffer());
@@ -4756,15 +4920,7 @@ async function __handleRequestInner(request, env, ctx) {
               try { re = new RegExp(rule.sourceRegex, "i"); } catch { continue; }
               const m = servePath.match(re);
               if (!m) continue;
-              let dest = rule.destination;
-              for (let i = 1; i < m.length; i++) {
-                if (m[i] !== undefined) dest = dest.replace(new RegExp("\\\\$" + i, "g"), m[i]);
-              }
-              if (m.groups) {
-                for (const [k, v] of Object.entries(m.groups)) {
-                  if (v !== undefined) dest = dest.replace(new RegExp("\\\\$" + k, "g"), v);
-                }
-              }
+              const dest = __substituteRouteDestination(rule.destination, m, rule.routeKeys);
               const destPath = dest.split("?")[0];
               if (STATIC_PAGES[destPath]) {
                 servePath = destPath;
@@ -4773,6 +4929,25 @@ async function __handleRequestInner(request, env, ctx) {
               }
             }
             if (staticEntry) break;
+          }
+        }
+      }
+      if (!staticEntry && !resolvedPathname) {
+        let matchPathname = url.pathname;
+        if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+          const firstSeg = url.pathname.split("/")[1] || "";
+          if (I18N.locales.includes(firstSeg)) {
+            matchPathname = url.pathname.slice(firstSeg.length + 1) || "/";
+          }
+        }
+        const staticDyn = __matchDynamicRoute(matchPathname);
+        if (staticDyn && STATIC_PAGES[staticDyn.page]) {
+          const prerenderManifest = __getPrerenderManifest();
+          const dynamicRoute = prerenderManifest?.dynamicRoutes?.[staticDyn.page];
+          if (dynamicRoute?.fallback !== false) {
+            resolvedPathname = staticDyn.page;
+            servePath = staticDyn.page;
+            staticEntry = STATIC_PAGES[staticDyn.page];
           }
         }
       }
@@ -5458,6 +5633,12 @@ async function __handleRequestInner(request, env, ctx) {
             // Force 404 status — the handler renders the not-found boundary
             // but doesn't know the original request was unmatched.
             if (!result.status) result = { ...result, status: 404 };
+          } else if (HANDLERS["/404"]) {
+            // Pages Router custom 404 pages can be dynamic when _app defines
+            // getInitialProps. In that case there is no static /404 asset, and
+            // unmatched paths must invoke pages/404 so _app props are present.
+            resolvedPathname = "/404";
+            if (!result.status) result = { ...result, status: 404 };
           } else {
             // Try static 404 page from assets. For basePath apps the
             // 404 HTML is at /docs/404/index.html — prepend BASE_PATH
@@ -5516,6 +5697,25 @@ async function __handleRequestInner(request, env, ctx) {
         const fallbackHeaders = new Headers();
         fallbackHeaders.set("content-type", "text/plain; charset=utf-8");
         return new Response("Not Found", { status: 404, headers: fallbackHeaders });
+      }
+
+      const actionId = request.headers.get("next-action");
+      if (actionId && handler.type === "APP_PAGE") {
+        const rewritePath = typeof result?.mwRewrite === "string"
+          ? result.mwRewrite.split("?")[0]
+          : "";
+        const actionReroutedByMiddleware = !!rewritePath && rewritePath !== url.pathname && (
+          rewritePath === resolvedPathname ||
+          rewritePath === handler.pathname
+        );
+        const actionForwarded = request.headers.get("x-action-forwarded") === "1";
+        if (
+          (actionReroutedByMiddleware || actionForwarded) &&
+          !__creekActionHasWorkerForPage(actionId, handler.pathname || resolvedPathname) &&
+          !__creekActionHasWorkerForPage(actionId, resolvedPathname)
+        ) {
+          return __creekActionNotFoundResponse();
+        }
       }
 
       // \`_next/data\` request that middleware rewrote to an app-router route:
@@ -6486,6 +6686,27 @@ function routePatternMatches(routePattern: string, pathname: string): boolean {
   return pathIndex === pathSegments.length;
 }
 
+function staticPathnameAliases(pathname: string): string[] {
+  const aliases: string[] = [];
+  const add = (value: string) => {
+    if (value && !aliases.includes(value)) aliases.push(value);
+  };
+  add(pathname);
+  try { add(decodeURIComponent(pathname)); } catch {}
+  try { add(encodeURI(pathname)); } catch {}
+  return aliases;
+}
+
+function setStaticPageEntry(
+  map: Record<string, StaticPageEntry>,
+  pathname: string,
+  entry: StaticPageEntry,
+) {
+  for (const alias of staticPathnameAliases(pathname)) {
+    map[alias] = entry;
+  }
+}
+
 // Collect paths whose build-time prerender has an ISR revalidate > 0 AND
 // is NOT a metadata route. Intent: allow \`export const revalidate = N\`
 // route handlers (e.g. /revalidate-1/[slug]/data.json) to bypass the
@@ -6635,13 +6856,13 @@ function collectStaticPageMap(
       applyCacheTags(file.pathname, entry);
       applyStaleTime(file.pathname, entry);
       // Map the original pathname
-      map[file.pathname] = entry;
+      setStaticPageEntry(map, file.pathname, entry);
       // Also map normalized form: /index → /, /foo/index → /foo
       if (file.pathname.endsWith("/index")) {
         const parent = file.pathname.slice(0, -6) || "/";
         applyCacheTags(parent, entry);
         applyStaleTime(parent, entry);
-        map[parent] = entry;
+        setStaticPageEntry(map, parent, entry);
       }
     }
   }
@@ -6699,10 +6920,10 @@ function collectStaticPageMap(
       entry.initialRevalidate = prerender.fallback.initialRevalidate;
     }
 
-    map[prerender.pathname] = entry;
+    setStaticPageEntry(map, prerender.pathname, entry);
     if (prerender.pathname.endsWith("/index")) {
       const parent = prerender.pathname.slice(0, -6) || "/";
-      map[parent] = entry;
+      setStaticPageEntry(map, parent, entry);
     }
   }
   return map;
@@ -8203,6 +8424,8 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
               streamClosed = true;
               try { streamController.close(); } catch {}
             }
+            res.emit("finish");
+            res.emit("close");
           }).catch(() => {});
         }, IDLE_MS);
       };

@@ -1285,9 +1285,11 @@ async function collectPrerenderEntries(
         pathname: prerender.pathname,
         html: "",
         postponedState: fallback.postponedState,
-        allowsFallbackShellResume: fallbackShellRoutes
-          ? fallbackShellRoutes.has(prerender.pathname)
-          : undefined,
+        allowsFallbackShellResume:
+          prerender.config?.partialFallback === true &&
+          (fallbackShellRoutes
+            ? fallbackShellRoutes.has(prerender.pathname)
+            : true),
         initialRevalidate: fallback.initialRevalidate,
         initialStatus: fallback.initialStatus,
         initialHeaders: fallback.initialHeaders,
@@ -1351,10 +1353,11 @@ async function collectComposableCacheSeeds(
   // leaking into \`/without-suspense/*\` where the test expects "runtime").
   const byShell = new Map<string, ComposableCacheSeed[]>();
   for (const prerender of outputs.prerenders) {
+    const isPartialFallback = prerender.config?.partialFallback === true;
     if (
       prerender.pathname.includes("[") &&
-      fallbackShellRoutes &&
-      !fallbackShellRoutes.has(prerender.pathname)
+      (!isPartialFallback ||
+        (fallbackShellRoutes && !fallbackShellRoutes.has(prerender.pathname)))
     ) {
       continue;
     }

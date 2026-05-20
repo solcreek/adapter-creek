@@ -33,6 +33,9 @@ function maybeDecodeBinary(value, enc) {
 }
 
 function normalizePath(filePath) {
+  if (filePath && typeof filePath === "object" && typeof filePath.pathname === "string") {
+    return decodeURIComponent(filePath.pathname).replace(/\\/g, "/");
+  }
   return String(filePath).replace(/\\/g, "/");
 }
 
@@ -119,6 +122,19 @@ function findInUserFiles(filePath) {
   // Fixes next/og node-runtime `fs.readFileSync` of bundled wasm/ttf and
   // twoslash loading `typescript/lib/lib.*.d.ts` in Workers.
   const reqBase = requestedPath.split("/").pop() || "";
+  const originalServerAssetBase = requestedPath.includes("/server/assets/")
+    ? reqBase.replace(/\.[a-z0-9_~-]{6,}(\.[^.]+)$/i, "$1")
+    : "";
+  if (originalServerAssetBase && originalServerAssetBase !== reqBase) {
+    let found;
+    for (const key in files) {
+      const keyBase = normalizePath(key).split("/").pop() || "";
+      if (keyBase !== originalServerAssetBase) continue;
+      if (found !== undefined) return undefined;
+      found = files[key];
+    }
+    if (found !== undefined) return found;
+  }
   if (/\.(wasm|ttf|otf|woff2?)$/i.test(reqBase) || /^lib\..*\.d\.ts$/i.test(reqBase)) {
     for (const key in files) {
       if (normalizePath(key).split("/").pop() === reqBase) return files[key];

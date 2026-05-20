@@ -1,0 +1,13 @@
+diff --git a/test/e2e/app-dir/expire-time/expire-time.test.ts b/test/e2e/app-dir/expire-time/expire-time.test.ts
+index 5659fdb893..8a0f7de68f 100644
+--- a/test/e2e/app-dir/expire-time/expire-time.test.ts
++++ b/test/e2e/app-dir/expire-time/expire-time.test.ts
+@@ -20,7 +20,7 @@ describe('expire-time', () => {
+   // updated to honor the expire value, this test will start passing in deploy
+   // mode and `it.failing` will itself fail. That's the signal to flip it back
+   // to `it`.
+-  const itFailsWhenDeployed = isNextDeploy ? it.failing : it
++  const itFailsWhenDeployed = it
+ 
+   /* eslint-disable jest/no-standalone-expect */
+   itFailsWhenDeployed(

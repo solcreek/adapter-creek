@@ -59,3 +59,14 @@ with a warning rather than failing.
   grep -l "Minified React error #441" /tmp/next-check/dist/compiled/react-server-dom-webpack*/cjs/*.browser.production.js
   ```
   If that grep finds a match, the patch is no longer needed.
+
+### `0003-expire-time-adapter-deploy.patch`
+
+- **Upstream context**: `test/e2e/app-dir/expire-time/expire-time.test.ts`
+  currently marks deploy mode as `it.failing` because Vercel's Proxy ignores
+  `expireTime` and serves stale content past the configured expiration.
+- **What**: runs the assertion normally for adapter deploy tests. Creek's
+  runtime handles the route's expiration window itself, so passing this test
+  is expected adapter behavior rather than an upstream failure.
+- **When to drop**: once upstream removes the Vercel-specific `it.failing`
+  branch from the canary test.
