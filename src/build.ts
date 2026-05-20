@@ -801,6 +801,7 @@ async function collectStaticFiles(
 ): Promise<number> {
   let count = 0;
   const allPathnames = new Set(outputs.staticFiles.map((f) => f.pathname));
+  const appRoutePathnames = new Set(outputs.appRoutes.map((route) => route.pathname));
   const copyStaticHtml = async (srcPath: string, destRelative: string): Promise<boolean> => {
     const destPath = path.join(assetsDir, destRelative);
     if (!(await safeMkdirForDest(destPath, destRelative))) return false;
@@ -849,6 +850,11 @@ async function collectStaticFiles(
       // extension over the pathname — \`/opengraph-image\` has no dot but
       // maps to \`opengraph-image.body\`.
       const isBinary = prerender.fallback.filePath.endsWith(".body");
+      if (isBinary && !appRoutePathnames.has(prerender.pathname)) {
+        // Static App Page .body fallbacks are RSC artifacts; copying them
+        // extensionless would block nested paths like /(.)foo/bar.
+        continue;
+      }
       const isHtml = !isBinary && isStaticHtmlPage(prerender.pathname);
       let destRelative = prerender.pathname;
       if (isHtml) {

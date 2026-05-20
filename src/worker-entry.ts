@@ -2563,6 +2563,26 @@ function __creekPostponedForPathname(pathname) {
   return null;
 }
 
+function __creekPrerenderEntryForPathname(pathname) {
+  if (typeof pathname !== "string" || pathname.length === 0) return null;
+  for (const candidate of __creekPathnameAliases(pathname)) {
+    const entry = __CREEK_PRERENDER_ENTRY_BY_PATH.get(candidate);
+    if (entry) return entry;
+  }
+  return null;
+}
+
+function __creekHasPostponedPrerenderForPathname(...pathnames) {
+  for (const pathname of pathnames) {
+    const entry = __creekPrerenderEntryForPathname(pathname);
+    if (typeof entry?.postponedState === "string" && entry.postponedState.length > 0) {
+      return true;
+    }
+    if (__creekPostponedForPathname(pathname)) return true;
+  }
+  return false;
+}
+
 // Initialize manifests singleton — called lazily on first SSR request.
 function __initManifests() {
   const MANIFESTS_SINGLETON = Symbol.for('next.server.manifests');
@@ -4979,12 +4999,30 @@ async function __handleRequestInner(request, env, ctx) {
       // doesn't find the index handler and 404s.
       {
         let isRoot = url.pathname === "/";
+        if (BASE_PATH && (url.pathname === BASE_PATH || url.pathname === BASE_PATH + "/")) {
+          isRoot = true;
+        }
         if (!isRoot && result.invocationTarget?.pathname === "/") isRoot = true;
         if (!isRoot && result.mwRewrite) {
           try {
             const rp = result.mwRewrite.split("?")[0];
             if (rp === "/") isRoot = true;
           } catch {}
+        }
+        if (
+          isRoot &&
+          BASE_PATH &&
+          (url.pathname === BASE_PATH || url.pathname === BASE_PATH + "/") &&
+          (STATIC_PAGES["/"] || HANDLERS["/index"])
+        ) {
+          resolvedPathname = HANDLERS["/index"] ? "/index" : "/";
+          result = {
+            ...result,
+            resolvedPathname,
+            invocationTarget: undefined,
+            routeMatches: undefined,
+            resolvedQuery: undefined,
+          };
         }
         if (isRoot && (!resolvedPathname || !HANDLERS[resolvedPathname])) {
           if (HANDLERS["/index"]) resolvedPathname = "/index";
@@ -5188,7 +5226,7 @@ async function __handleRequestInner(request, env, ctx) {
         if (!staticEntry && ROUTING) {
           const canApplyAfterFilesRewrite = (() => {
             if (!HANDLERS[servePath]) return true;
-            let matchPathname = url.pathname;
+            let matchPathname = assetPath || url.pathname;
             if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
               const firstSeg = matchPathname.split("/")[1] || "";
               if (I18N.locales.includes(firstSeg)) {
@@ -5259,11 +5297,11 @@ async function __handleRequestInner(request, env, ctx) {
         url.pathname === BASE_PATH ||
         url.pathname.startsWith(BASE_PATH + "/");
       if (!staticEntry && !resolvedPathname && canUseBasePathDynamicFallback) {
-        let matchPathname = url.pathname;
+        let matchPathname = assetPath || url.pathname;
         if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
-          const firstSeg = url.pathname.split("/")[1] || "";
+          const firstSeg = matchPathname.split("/")[1] || "";
           if (I18N.locales.includes(firstSeg)) {
-            matchPathname = url.pathname.slice(firstSeg.length + 1) || "/";
+            matchPathname = matchPathname.slice(firstSeg.length + 1) || "/";
           }
         }
         const staticDyn = __matchDynamicRoute(matchPathname);
@@ -5488,7 +5526,8 @@ async function __handleRequestInner(request, env, ctx) {
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
         !nextDataAppRouterPath &&
-        !(isISRPage && hasHandler)
+        !(isISRPage && hasHandler) &&
+        (!isRewritten || !hasHandlerForTarget)
       ) {
         try {
           // For nested paths (\`/foo/index.html\`) the RSC sibling is
@@ -5810,11 +5849,11 @@ async function __handleRequestInner(request, env, ctx) {
         // and bypassing fallback:false 404 enforcement. Fixes
         // i18n-fallback-collision "should 404 properly for fallback:false
         // non-prerendered /es/first/second/non-existent".
-        let matchPathname = url.pathname;
+        let matchPathname = assetPath || url.pathname;
         if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
-          const firstSeg = url.pathname.split("/")[1] || "";
+          const firstSeg = matchPathname.split("/")[1] || "";
           if (I18N.locales.includes(firstSeg)) {
-            matchPathname = url.pathname.slice(firstSeg.length + 1) || "/";
+            matchPathname = matchPathname.slice(firstSeg.length + 1) || "/";
           }
         }
         const dyn = canUseBasePathDynamicFallback
@@ -7964,7 +8003,7 @@ function applyStaticAssetHeaders(headers, pathname) {
 async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname, handlerType) {
   const url = new URL(request.url);
   const normalizedRouteParams = getNormalizedRouteParams(routeResult, handlerPathname, url, request.headers);
-  const isRSCRequest = request.headers.has("rsc");
+  const isRSCRequest = request.headers.has("rsc") || request.headers.has("next-router-state-tree");
   const isPrefetchRSCRequest = request.headers.get("next-router-prefetch") === "1";
   const segmentPrefetchRSCRequest = request.headers.get("next-router-segment-prefetch");
 
@@ -8522,6 +8561,18 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       h.set("content-type", "text/x-component");
       h.delete("content-length");
       ctLower = "text/x-component";
+      if (
+        !h.has("x-nextjs-postponed") &&
+        !segmentPrefetchRSCRequest &&
+        __creekHasPostponedPrerenderForPathname(
+          url.pathname,
+          handlerPathname,
+          routeResult?.resolvedPathname,
+          routeResult?.invocationTarget?.pathname,
+        )
+      ) {
+        h.set("x-nextjs-postponed", "1");
+      }
     }
     if (ctLower.includes("text/html")) {
       h.delete("content-length");
