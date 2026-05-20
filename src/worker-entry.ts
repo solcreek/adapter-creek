@@ -6811,7 +6811,19 @@ function collectHandlers(
   for (const page of outputs.appPages) addOutput(page, "APP_PAGE");
   for (const route of outputs.appRoutes) addOutput(route, "APP_ROUTE");
   for (const route of supplementalMetadataRoutes) addOutput(route, "APP_ROUTE");
-  for (const page of outputs.pages) addOutput(page, "PAGES");
+  let hasPagesErrorHandler = false;
+  let pages404Output: (typeof outputs.pages)[number] | undefined;
+  for (const page of outputs.pages) {
+    if (page.pathname === "/_error") hasPagesErrorHandler = true;
+    if (page.pathname === "/404") pages404Output = page;
+    addOutput(page, "PAGES");
+  }
+  if (!hasPagesErrorHandler && pages404Output) {
+    const errorFilePath = path.join(path.dirname(pages404Output.filePath), "_error.js");
+    if (existsSync(errorFilePath)) {
+      addOutput({ ...pages404Output, pathname: "/_error", filePath: errorFilePath }, "PAGES");
+    }
+  }
   for (const api of outputs.pagesApi) addOutput(api, "PAGES_API");
 
   return handlers;
