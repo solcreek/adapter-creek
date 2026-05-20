@@ -173,6 +173,16 @@ if (script && !script.includes('--experimental-next-config-strip-types')) {
 }
 " >&2 2>&1
 if node -e "const p=JSON.parse(require('fs').readFileSync('package.json','utf8'));process.exit(p.scripts&&p.scripts.build?0:1);" 2>/dev/null; then
+  if [[ "${PKG_MANAGER}" == npm@* ]]; then
+    node -e "
+const fs = require('fs');
+const pkg = JSON.parse(fs.readFileSync('package.json','utf8'));
+if (pkg.scripts && typeof pkg.scripts.build === 'string') {
+  pkg.scripts.build = pkg.scripts.build.replace(/&&\\s*pnpm\\s+post-build\\b/g, '&& npm run post-build');
+  fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2));
+}
+" >&2 2>&1
+  fi
   # Tee build output both to stderr (for live debugging) and to
   # \`.adapter-build-cli.log\` so the logs script can later replay it
   # into \`cliOutput\`. Tests like
