@@ -319,52 +319,69 @@ if (
   const __creekNativeClearTimeout = globalThis.clearTimeout.bind(globalThis);
   let __creekTimerIdleStart = 1;
   const __creekTimerNativeHandle = Symbol("creek.timer.nativeHandle");
-  const __creekTimerQueueItem = Symbol("creek.timer.queueItem");
+  const __creekTimerRecord = Symbol("creek.timer.record");
   const __creekNextIdleStart = () => __creekTimerIdleStart++;
-  let __creekZeroTimerQueue = [];
-  let __creekZeroTimerNativeHandle = null;
-  let __creekFlushingZeroTimers = false;
-  const __creekRunNextZeroTimer = () => {
-    while (true) {
-      const item = __creekZeroTimerQueue.shift();
-      if (!item) {
-        __creekZeroTimerNativeHandle = null;
-        return;
-      }
-      if (item.cleared) continue;
-      item.cleared = true;
-      __creekFlushingZeroTimers = true;
-      try {
-        item.callback(...item.args);
-      } catch (err) {
-        queueMicrotask(() => { throw err; });
-      } finally {
-        __creekFlushingZeroTimers = false;
-      }
-      if (__creekZeroTimerQueue.length > 0) {
-        queueMicrotask(__creekRunNextZeroTimer);
-      } else {
-        __creekZeroTimerNativeHandle = null;
-      }
-      return;
-    }
-  };
+  const __creekPendingZeroTimers = new Set();
   const __creekGetNativeTimerHandle = (timer) =>
     timer && typeof timer === "object" && __creekTimerNativeHandle in timer
       ? timer[__creekTimerNativeHandle]
       : timer;
-  const __creekCreateTimerHandle = (nativeHandle, queueItem) => {
+  const __creekRunTimerCallback = (record) => {
+    record.cleared = true;
+    __creekPendingZeroTimers.delete(record);
+    try {
+      record.callback(...record.args);
+    } catch (err) {
+      queueMicrotask(() => { throw err; });
+    }
+  };
+  const __creekRunGroupedTimers = (records) => {
+    const next = records.shift();
+    if (!next) return;
+    __creekNativeClearTimeout(next.nativeHandle);
+    __creekRunTimerCallback(next);
+    if (records.length > 0) {
+      queueMicrotask(() => __creekRunGroupedTimers(records));
+    }
+  };
+  const __creekFlushTimerRecord = (record) => {
+    if (!record || record.cleared) return;
+    if (record.delay <= 0) {
+      const grouped = [];
+      for (const pending of __creekPendingZeroTimers) {
+        if (
+          !pending.cleared &&
+          pending.delay <= 0 &&
+          pending.idleStart === record.idleStart
+        ) {
+          grouped.push(pending);
+        }
+      }
+      if (grouped.length > 1) {
+        __creekRunGroupedTimers(grouped);
+        return;
+      }
+    }
+    __creekRunTimerCallback(record);
+  };
+  const __creekCreateTimerHandle = (record) => {
+    const nativeHandle = record.nativeHandle;
     const handle = {
       [__creekTimerNativeHandle]: nativeHandle,
-      [__creekTimerQueueItem]: queueItem,
-      _idleStart: __creekNextIdleStart(),
-      ref() { nativeHandle?.ref?.(); if (queueItem) queueItem.hasRef = true; return this; },
-      unref() { nativeHandle?.unref?.(); if (queueItem) queueItem.hasRef = false; return this; },
-      hasRef() { return nativeHandle?.hasRef?.() ?? queueItem?.hasRef ?? true; },
+      [__creekTimerRecord]: record,
+      get _idleStart() { return record.idleStart; },
+      set _idleStart(value) {
+        const numberValue = Number(value);
+        if (!Number.isNaN(numberValue)) record.idleStart = numberValue;
+      },
+      ref() { nativeHandle?.ref?.(); record.hasRef = true; return this; },
+      unref() { nativeHandle?.unref?.(); record.hasRef = false; return this; },
+      hasRef() { return nativeHandle?.hasRef?.() ?? record.hasRef; },
       refresh() { nativeHandle?.refresh?.(); return this; },
       [Symbol.dispose]() {
-        if (queueItem) queueItem.cleared = true;
-        else __creekNativeClearTimeout(nativeHandle);
+        record.cleared = true;
+        __creekPendingZeroTimers.delete(record);
+        __creekNativeClearTimeout(nativeHandle);
       },
       valueOf() { return nativeHandle; },
       toString() { return String(nativeHandle); },
@@ -372,37 +389,31 @@ if (
     };
     return handle;
   };
-  const __creekScheduleZeroTimer = (callback, args) => {
-    const item = { callback, args, cleared: false, hasRef: true };
-    __creekZeroTimerQueue.push(item);
-    if (__creekZeroTimerNativeHandle === null) {
-      __creekZeroTimerNativeHandle = __creekNativeSetTimeout(
-        __creekRunNextZeroTimer,
-        0
-      );
-    }
-    return __creekCreateTimerHandle(__creekZeroTimerNativeHandle, item);
-  };
   globalThis.setTimeout = function __creekSetTimeout(callback, delay, ...args) {
     const normalizedDelay = Number(delay) || 0;
-    if (
-      typeof callback === "function" &&
-      normalizedDelay <= 0 &&
-      !__creekFlushingZeroTimers
-    ) {
-      return __creekScheduleZeroTimer(callback, args);
-    }
-    return __creekCreateTimerHandle(
-      __creekNativeSetTimeout(callback, delay, ...args),
-      null
+    const record = {
+      callback,
+      args,
+      cleared: false,
+      delay: normalizedDelay,
+      hasRef: true,
+      idleStart: __creekNextIdleStart(),
+      nativeHandle: null,
+    };
+    record.nativeHandle = __creekNativeSetTimeout(
+      () => __creekFlushTimerRecord(record),
+      delay
     );
+    if (normalizedDelay <= 0) __creekPendingZeroTimers.add(record);
+    return __creekCreateTimerHandle(record);
   };
   globalThis.clearTimeout = function __creekClearTimeout(timer) {
-    if (timer && typeof timer === "object" && __creekTimerQueueItem in timer) {
-      const item = timer[__creekTimerQueueItem];
-      if (item) {
-        item.cleared = true;
-        return;
+    if (timer && typeof timer === "object" && __creekTimerRecord in timer) {
+      const record = timer[__creekTimerRecord];
+      if (record) {
+        record.cleared = true;
+        __creekPendingZeroTimers.delete(record);
+        return __creekNativeClearTimeout(record.nativeHandle);
       }
     }
     return __creekNativeClearTimeout(__creekGetNativeTimerHandle(timer));
