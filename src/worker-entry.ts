@@ -4957,7 +4957,7 @@ async function __handleRequestInner(request, env, ctx) {
                 STATIC_PAGES[resolvedPathname]?.assetPath,
                 __creekInternalStaticPageAssetPath(resolvedPathname),
                 resolvedPathname + "/index.html",
-                "/" + fallback.replace(/^\/+/, ""),
+                "/" + fallback.replace(/^\\/+/, ""),
               ].filter(Boolean);
               for (const assetPath of assetCandidates) {
                 const assetRes = await env.ASSETS.fetch(
