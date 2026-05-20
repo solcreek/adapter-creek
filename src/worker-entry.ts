@@ -319,70 +319,20 @@ if (
   const __creekNativeClearTimeout = globalThis.clearTimeout.bind(globalThis);
   let __creekTimerIdleStart = 1;
   const __creekTimerNativeHandle = Symbol("creek.timer.nativeHandle");
-  const __creekTimerRecord = Symbol("creek.timer.record");
   const __creekNextIdleStart = () => __creekTimerIdleStart++;
-  const __creekPendingZeroTimers = new Set();
   const __creekGetNativeTimerHandle = (timer) =>
     timer && typeof timer === "object" && __creekTimerNativeHandle in timer
       ? timer[__creekTimerNativeHandle]
       : timer;
-  const __creekRunTimerCallback = (record) => {
-    record.cleared = true;
-    __creekPendingZeroTimers.delete(record);
-    try {
-      record.callback(...record.args);
-    } catch (err) {
-      queueMicrotask(() => { throw err; });
-    }
-  };
-  const __creekRunGroupedTimers = (records) => {
-    const next = records.shift();
-    if (!next) return;
-    __creekNativeClearTimeout(next.nativeHandle);
-    __creekRunTimerCallback(next);
-    if (records.length > 0) {
-      queueMicrotask(() => __creekRunGroupedTimers(records));
-    }
-  };
-  const __creekFlushTimerRecord = (record) => {
-    if (!record || record.cleared) return;
-    if (record.delay <= 0) {
-      const grouped = [];
-      for (const pending of __creekPendingZeroTimers) {
-        if (
-          !pending.cleared &&
-          pending.delay <= 0 &&
-          pending.idleStart === record.idleStart
-        ) {
-          grouped.push(pending);
-        }
-      }
-      if (grouped.length > 1) {
-        __creekRunGroupedTimers(grouped);
-        return;
-      }
-    }
-    __creekRunTimerCallback(record);
-  };
-  const __creekCreateTimerHandle = (record) => {
-    const nativeHandle = record.nativeHandle;
+  const __creekCreateTimerHandle = (nativeHandle) => {
     const handle = {
       [__creekTimerNativeHandle]: nativeHandle,
-      [__creekTimerRecord]: record,
-      get _idleStart() { return record.idleStart; },
-      set _idleStart(value) {
-        const numberValue = Number(value);
-        if (!Number.isNaN(numberValue)) record.idleStart = numberValue;
-      },
-      ref() { nativeHandle?.ref?.(); record.hasRef = true; return this; },
-      unref() { nativeHandle?.unref?.(); record.hasRef = false; return this; },
-      hasRef() { return nativeHandle?.hasRef?.() ?? record.hasRef; },
+      _idleStart: __creekNextIdleStart(),
+      ref() { nativeHandle?.ref?.(); return this; },
+      unref() { nativeHandle?.unref?.(); return this; },
+      hasRef() { return nativeHandle?.hasRef?.() ?? true; },
       refresh() { nativeHandle?.refresh?.(); return this; },
-      [Symbol.dispose]() {
-        record.cleared = true;
-        __creekPendingZeroTimers.delete(record);
-        __creekNativeClearTimeout(nativeHandle);
-      },
+      [Symbol.dispose]() { __creekNativeClearTimeout(nativeHandle); },
       valueOf() { return nativeHandle; },
       toString() { return String(nativeHandle); },
       [Symbol.toPrimitive]() { return nativeHandle; },
@@ -390,32 +340,9 @@ if (
     return handle;
   };
   globalThis.setTimeout = function __creekSetTimeout(callback, delay, ...args) {
-    const normalizedDelay = Number(delay) || 0;
-    const record = {
-      callback,
-      args,
-      cleared: false,
-      delay: normalizedDelay,
-      hasRef: true,
-      idleStart: __creekNextIdleStart(),
-      nativeHandle: null,
-    };
-    record.nativeHandle = __creekNativeSetTimeout(
-      () => __creekFlushTimerRecord(record),
-      delay
-    );
-    if (normalizedDelay <= 0) __creekPendingZeroTimers.add(record);
-    return __creekCreateTimerHandle(record);
+    return __creekCreateTimerHandle(__creekNativeSetTimeout(callback, delay, ...args));
   };
   globalThis.clearTimeout = function __creekClearTimeout(timer) {
-    if (timer && typeof timer === "object" && __creekTimerRecord in timer) {
-      const record = timer[__creekTimerRecord];
-      if (record) {
-        record.cleared = true;
-        __creekPendingZeroTimers.delete(record);
-        return __creekNativeClearTimeout(record.nativeHandle);
-      }
-    }
     return __creekNativeClearTimeout(__creekGetNativeTimerHandle(timer));
   };
 }
@@ -6497,17 +6424,25 @@ async function __handleRequestInner(request, env, ctx) {
         const __applyMwResponseHeaders = (edgeRes) => {
           if (!(edgeRes instanceof Response)) return edgeRes;
           let status = edgeRes.status;
-          if (
-            edgeRes.headers.get("x-action-redirect") &&
-            request.headers.get("x-action-forwarded") !== "1"
-          ) {
-            status = 303;
-          } else if (edgeRes.headers.get("x-nextjs-action-not-found") === "1") {
-            status = 404;
-          }
           let touched = false;
           const merged = new Headers(edgeRes.headers);
+          const actionRedirect = merged.get("x-action-redirect");
+          const requestWasForwarded = request.headers.get("x-action-forwarded") === "1";
+          const responseWasForwarded = merged.get("x-creek-action-forwarded") === "1";
+          if (actionRedirect && requestWasForwarded) {
+            merged.set("x-creek-action-forwarded", "1");
+            touched = true;
+          }
+          if (actionRedirect && !requestWasForwarded && !responseWasForwarded) {
+            status = 303;
+          } else if (merged.get("x-nextjs-action-not-found") === "1") {
+            status = 404;
+          }
           if (status !== edgeRes.status) touched = true;
+          if (responseWasForwarded && !requestWasForwarded) {
+            merged.delete("x-creek-action-forwarded");
+            touched = true;
+          }
           if (result?.resolvedHeaders) {
             result.resolvedHeaders.forEach((val, key) => {
               const lower = key.toLowerCase();
@@ -8675,11 +8610,19 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     // text/x-component, the client tries to apply an empty/invalid RSC stream
     // and lands in the App Router error UI instead of hard-navigating.
     const actionRedirect = h.get("x-action-redirect");
-    if (actionRedirect && request.headers.get("x-action-forwarded") !== "1") {
+    const requestWasForwarded = request.headers.get("x-action-forwarded") === "1";
+    const responseWasForwarded = h.get("x-creek-action-forwarded") === "1";
+    if (actionRedirect && requestWasForwarded) {
+      h.set("x-creek-action-forwarded", "1");
+    }
+    if (actionRedirect && !requestWasForwarded && !responseWasForwarded) {
       status = 303;
     } else if (h.get("x-nextjs-action-not-found") === "1") {
       status = 404;
       h.set("content-type", "text/plain; charset=utf-8");
+    }
+    if (responseWasForwarded && !requestWasForwarded) {
+      h.delete("x-creek-action-forwarded");
     }
     if (actionRedirect) {
       const redirectTarget = actionRedirect.split(";")[0] || "";
