@@ -730,6 +730,27 @@ function internalStaticPageAssetPath(pathname: string): string {
   return path.join("_creek", "static-pages", encoded + ".html");
 }
 
+const METADATA_ROUTE_NAMES = new Set([
+  "sitemap",
+  "robots",
+  "manifest",
+  "opengraph-image",
+  "twitter-image",
+  "icon",
+  "apple-icon",
+  "favicon",
+]);
+
+function isMetadataRoutePath(pathname: string): boolean {
+  const segments = pathname.split("/").filter(Boolean);
+  if (segments.length === 0) return false;
+  const last = segments[segments.length - 1] || "";
+  const lastNoExt = last.replace(/\.[a-z0-9]+$/i, "");
+  if (METADATA_ROUTE_NAMES.has(lastNoExt)) return true;
+  const secondLast = segments[segments.length - 2] || "";
+  return METADATA_ROUTE_NAMES.has(secondLast);
+}
+
 // Inject `data-dpl-id="<buildId>"` into the `<html>` tag of static HTML
 // files at build time. The Pages Router client reads this attribute on
 // page load to populate `globalThis.NEXT_DEPLOYMENT_ID`, then sends
@@ -877,6 +898,48 @@ async function collectStaticFiles(
   }
 
   if (distDir) {
+    try {
+      const manifestPath = path.join(distDir, "prerender-manifest.json");
+      const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {
+        routes?: Record<string, unknown>;
+      };
+      for (const routePath of Object.keys(manifest.routes || {})) {
+        if (allPathnames.has(routePath)) continue;
+        if (!isMetadataRoutePath(routePath)) continue;
+
+        const relativeRoutePath = routePath.replace(/^\/+/, "");
+        const sourceCandidates = [
+          path.join(distDir, "server", "app", relativeRoutePath + ".body"),
+          path.join(distDir, "server", "app", relativeRoutePath + ".html"),
+          path.join(distDir, "server", "app", relativeRoutePath),
+        ];
+        let sourcePath: string | null = null;
+        for (const candidate of sourceCandidates) {
+          try {
+            await fs.access(candidate);
+            sourcePath = candidate;
+            break;
+          } catch {}
+        }
+        if (!sourcePath) continue;
+
+        const isHtml = sourcePath.endsWith(".html") && isStaticHtmlPage(routePath);
+        const destRelative = isHtml
+          ? path.join(routePath, "index.html")
+          : routePath;
+        const destPath = path.join(assetsDir, destRelative);
+        if (!(await safeMkdirForDest(destPath, destRelative))) continue;
+
+        if (isHtml && buildId) {
+          await copyHtmlWithDplId(sourcePath, destPath, buildId);
+        } else {
+          await fs.copyFile(sourcePath, destPath);
+        }
+        allPathnames.add(routePath);
+        count++;
+      }
+    } catch {}
+
     try {
       const manifestPath = path.join(distDir, "prerender-manifest.json");
       const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {

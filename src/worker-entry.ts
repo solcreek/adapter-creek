@@ -3241,6 +3241,20 @@ function __creekPatchFlightStaticBoundaryStream(stream) {
               digitEnd++;
             }
             if (digitEnd > digitStart) {
+              const originalBoundary = Number(
+                decoder.decode(prefix.subarray(digitStart, digitEnd))
+              );
+              if (
+                Number.isFinite(originalBoundary) &&
+                originalBoundary >= 0 &&
+                originalBoundary <= lineStart
+              ) {
+                controller.enqueue(prefix);
+                chunks.length = 0;
+                totalLength = 0;
+                patched = true;
+                return;
+              }
               const replacement = encoder.encode(String(lineStart));
               const out = new Uint8Array(
                 prefix.length - (digitEnd - digitStart) + replacement.length
@@ -3376,6 +3390,15 @@ function __creekPatchHtmlFlightStaticBoundaryStream(stream) {
       if (digitEnd === digitStart) {
         searchFrom = payloadEnd + 1;
         continue;
+      }
+
+      const originalBoundary = Number(rawPayload.slice(digitStart, digitEnd));
+      if (
+        Number.isFinite(originalBoundary) &&
+        originalBoundary >= 0 &&
+        originalBoundary <= lineStartBytes
+      ) {
+        return prefix;
       }
 
       const patchedRawPayload =
@@ -5013,7 +5036,7 @@ async function __handleRequestInner(request, env, ctx) {
           isRoot &&
           BASE_PATH &&
           (url.pathname === BASE_PATH || url.pathname === BASE_PATH + "/") &&
-          (STATIC_PAGES["/"] || HANDLERS["/index"])
+          (STATIC_PAGES["/"] || HANDLERS["/index"] || HANDLERS["/"])
         ) {
           resolvedPathname = HANDLERS["/index"] ? "/index" : "/";
           result = {
@@ -6358,27 +6381,35 @@ async function __handleRequestInner(request, env, ctx) {
         // here or NextResponse.next({ headers }) silently disappears.
         const __applyMwResponseHeaders = (edgeRes) => {
           if (!(edgeRes instanceof Response)) return edgeRes;
-          if (!result?.resolvedHeaders) return edgeRes;
+          let status = edgeRes.status;
+          if (edgeRes.headers.get("x-action-redirect")) {
+            status = 303;
+          } else if (edgeRes.headers.get("x-nextjs-action-not-found") === "1") {
+            status = 404;
+          }
           let touched = false;
           const merged = new Headers(edgeRes.headers);
-          result.resolvedHeaders.forEach((val, key) => {
-            const lower = key.toLowerCase();
-            if (lower === "set-cookie") {
-              merged.append(key, val);
-              touched = true;
-            } else if (
-              lower !== "content-encoding" &&
-              lower !== "content-length" &&
-              lower !== "transfer-encoding"
-            ) {
-              merged.set(key, val);
-              touched = true;
-            }
-          });
+          if (status !== edgeRes.status) touched = true;
+          if (result?.resolvedHeaders) {
+            result.resolvedHeaders.forEach((val, key) => {
+              const lower = key.toLowerCase();
+              if (lower === "set-cookie") {
+                merged.append(key, val);
+                touched = true;
+              } else if (
+                lower !== "content-encoding" &&
+                lower !== "content-length" &&
+                lower !== "transfer-encoding"
+              ) {
+                merged.set(key, val);
+                touched = true;
+              }
+            });
+          }
           if (!touched) return edgeRes;
           return new Response(edgeRes.body, {
-            status: edgeRes.status,
-            statusText: edgeRes.statusText,
+            status,
+            statusText: status === edgeRes.status ? edgeRes.statusText : undefined,
             headers: merged,
           });
         };
@@ -8421,7 +8452,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   function flushHeaders() {
     if (headersFlushed) return;
     headersFlushed = true;
-    const status = routeResult?.status || res.statusCode;
+    let status = res.statusCode || routeResult?.status || 200;
     responseDisallowsBody = disallowsBody(status);
     // Build Headers manually to handle multi-value headers (Set-Cookie).
     const h = new Headers();
@@ -8526,6 +8557,11 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     // text/x-component, the client tries to apply an empty/invalid RSC stream
     // and lands in the App Router error UI instead of hard-navigating.
     const actionRedirect = h.get("x-action-redirect");
+    if (actionRedirect) {
+      status = 303;
+    } else if (h.get("x-nextjs-action-not-found") === "1") {
+      status = 404;
+    }
     if (actionRedirect) {
       const redirectTarget = actionRedirect.split(";")[0] || "";
       try {
@@ -8727,7 +8763,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       // Still no doctype — buffer and wait for the next chunk.
       __preDoctypeBuffer = __preDoctypeBuffer
         ? __mergeBytes(__preDoctypeBuffer, chunk)
-        : chunk;
+        : chunk.slice();
       return null;
     }
     // Doctype found: split current chunk into the stray prefix and the

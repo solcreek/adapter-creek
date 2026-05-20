@@ -645,7 +645,7 @@ function patchUseCachePrerenderDanglingPromiseBailout(workerCode: string): strin
       const makeHangingPromiseVar = hangingCallMatch[1];
       const workStoreVar = hangingCallMatch[2];
 
-      return `let ${serializedKeyVar} = "string" == typeof ${encodedKeyVar} ? ${encodedKeyVar} : await ${encodeFnVar}(${encodedKeyVar}); if ("prerender" === ${workUnitStoreVar}.type && "string" == typeof ${serializedKeyVar}) { let __creekDanglingThenableStart = ${serializedKeyVar}.lastIndexOf("$@"); if (__creekDanglingThenableStart !== -1 && ${serializedKeyVar}.indexOf(":", __creekDanglingThenableStart) === -1) return (0, ${makeHangingPromiseVar}.makeHangingPromise)(${workUnitStoreVar}.renderSignal, ${workStoreVar}.route, 'dynamic "use cache"'); } let ${rootParamsVar} = ${workUnitStoreVar}.rootParams`;
+      return `let ${serializedKeyVar} = "string" == typeof ${encodedKeyVar} ? ${encodedKeyVar} : await ${encodeFnVar}(${encodedKeyVar}); if (("prerender" === ${workUnitStoreVar}.type || "prerender-runtime" === ${workUnitStoreVar}.type) && "string" == typeof ${serializedKeyVar}) { let __creekDanglingThenableStart = ${serializedKeyVar}.lastIndexOf("$@"); if (__creekDanglingThenableStart !== -1 && ${serializedKeyVar}.indexOf(":", __creekDanglingThenableStart) === -1) return (0, ${makeHangingPromiseVar}.makeHangingPromise)(${workUnitStoreVar}.renderSignal, ${workStoreVar}.route, 'dynamic "use cache"'); } let ${rootParamsVar} = ${workUnitStoreVar}.rootParams`;
     },
   );
 }
