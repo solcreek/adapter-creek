@@ -5964,6 +5964,12 @@ async function __handleRequestWithLog(request, env, ctx) {
   if (!debugEnabled) return __handleRequest(request, env, ctx);
   const reqUrl = (() => { try { return new URL(request.url).pathname + (new URL(request.url).search || ""); } catch { return "<unparseable>"; } })();
   const reqMethod = request.method;
+  const reqCT = request.headers && typeof request.headers.get === "function" ? (request.headers.get("content-type") || "-") : "-";
+  const reqAID = request.headers && typeof request.headers.get === "function" ? (request.headers.get("next-action") || "-") : "-";
+  // Emit at entry so a hang inside __handleRequest still leaves a paper
+  // trail. Without this, POSTs that wedge in workerd never log anything
+  // and look indistinguishable from "request never arrived".
+  console.error("[creek-req] >>>", reqMethod, reqUrl, "ct=" + reqCT, "next-action=" + reqAID);
   const t0 = Date.now();
   let res;
   try {
