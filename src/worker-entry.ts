@@ -3705,6 +3705,18 @@ async function __handleRequestInner(request, env, ctx) {
       } catch {
         return new Response("Bad Request", { status: 400 });
       }
+      if (BASE_PATH) {
+        const hasBasePathPrefix =
+          url.pathname === BASE_PATH ||
+          url.pathname.startsWith(BASE_PATH + "/");
+        const hasAssetPrefix =
+          ASSET_PREFIX_PATH &&
+          (url.pathname === ASSET_PREFIX_PATH ||
+            url.pathname.startsWith(ASSET_PREFIX_PATH + "/"));
+        if (!hasBasePathPrefix && !hasAssetPrefix) {
+          return new Response("Not Found", { status: 404 });
+        }
+      }
 
       // 1. Static assets via WfP ASSETS binding
       // /_next/data/ requests are Pages Router data fetches — must go through routing
