@@ -5404,6 +5404,52 @@ async function __handleRequestInner(request, env, ctx) {
           }
         }
       }
+      if (
+        !staticEntry &&
+        BASE_PATH &&
+        (url.pathname === BASE_PATH || url.pathname === BASE_PATH + "/") &&
+        (request.method === "GET" || request.method === "HEAD") &&
+        !request.headers.has("next-action") &&
+        !request.headers.has("rsc") &&
+        !request.headers.has("next-router-state-tree") &&
+        !nextDataAppRouterPath
+      ) {
+        const rootAssetCandidates = [
+          BASE_PATH + "/index.html",
+          BASE_PATH + "/index/index.html",
+          "/index.html",
+          "/index/index.html",
+        ];
+        for (const candidate of rootAssetCandidates) {
+          try {
+            const assetRes = await env.ASSETS.fetch(
+              new Request(new URL(candidate, url.origin), { headers: request.headers })
+            );
+            if (assetRes.status === 304) return assetRes;
+            if (assetRes.ok) {
+              const assetHeaders = applyStaticAssetHeaders(
+                new Headers(assetRes.headers),
+                url.pathname,
+              );
+              if (result.resolvedHeaders) {
+                result.resolvedHeaders.forEach((val, key) => {
+                  if (key.toLowerCase() === "set-cookie") {
+                    assetHeaders.append(key, val);
+                  } else {
+                    assetHeaders.set(key, val);
+                  }
+                });
+              }
+              assetHeaders.set("content-type", "text/html; charset=utf-8");
+              return new Response(request.method === "HEAD" ? null : assetRes.body, {
+                status: assetRes.status,
+                statusText: assetRes.statusText,
+                headers: assetHeaders,
+              });
+            }
+          } catch {}
+        }
+      }
       const canUseBasePathDynamicFallback =
         !BASE_PATH ||
         url.pathname === BASE_PATH ||
