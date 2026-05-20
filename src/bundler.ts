@@ -174,6 +174,17 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     await fs.writeFile(path.join(opts.outputDir, "__entry_debug.mjs"), opts.workerSource);
   }
 
+  // Stage WASM files alongside __entry.mjs BEFORE wrangler runs. The
+  // entry contains `import __wasm_N from "./<name>.wasm"` statements
+  // (worker-entry.ts builds them for each [hex, filename] pair). Wrangler's
+  // esbuild plugin walks those imports during bundling — if the .wasm
+  // file isn't on disk next to the entry yet, the resolver throws and
+  // the whole build fails (seen on @vercel/og fixtures pulling yoga.wasm
+  // / resvg.wasm). Copy first, then bundle.
+  for (const [name, absPath] of opts.wasmFiles) {
+    await fs.copyFile(absPath, path.join(opts.outputDir, name));
+  }
+
   // Resolve adapter paths
   const adapterDir = path.dirname(path.dirname(new URL(import.meta.url).pathname));
 
@@ -325,10 +336,7 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     await fs.writeFile(workerPath, workerCode);
   } catch {}
 
-  // Copy WASM files alongside the bundle
-  for (const [name, absPath] of opts.wasmFiles) {
-    await fs.copyFile(absPath, path.join(opts.outputDir, name));
-  }
+  // (WASM files were staged before wrangler ran — see above.)
 
   // Clean up temp files
   await fs.rm(entryPath, { force: true });
