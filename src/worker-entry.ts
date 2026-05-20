@@ -8046,7 +8046,12 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     if (syntheticCloseFired) return;
     syntheticCloseFired = true;
     for (const listener of syntheticCloseListeners.splice(0)) {
-      try { listener.call(res); } catch (err) { queueMicrotask(() => { throw err; }); }
+      try {
+        const maybePromise = listener.call(res);
+        if (maybePromise?.then) ctx.waitUntil(Promise.resolve(maybePromise).catch(() => {}));
+      } catch (err) {
+        queueMicrotask(() => { throw err; });
+      }
     }
   }
   // Pre-seed res.statusCode from routeResult.status so app-render's
