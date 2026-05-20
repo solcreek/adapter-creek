@@ -333,6 +333,38 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       'err.code !== "ENOENT" && err.code !== "MODULE_NOT_FOUND" && err.code !== "ERR_MODULE_NOT_FOUND" && !err.message?.includes("is not supported")',
     );
 
+    // Route `externalImport(id)` through `globalThis.__CREEK_EXT_LOADERS`
+    // so Turbopack-externalized modules can be served from our worker-entry
+    // static imports. Turbopack emits chunks like
+    // `[externals]_next_dist_compiled_@vercel_og_index_node_…` that call
+    // `await e.y("next/dist/compiled/@vercel/og/index.node.js")` at request
+    // time; on workerd that falls through to `await import(id)` which
+    // throws "No such module" — the route handler then 500s. When our
+    // entry registers a loader in `__CREEK_EXT_LOADERS`, the patched
+    // externalImport awaits it (lazy: keeps fs/wasm side-effects from
+    // running before __USER_FILES is populated), caches the result in
+    // `__CREEK_EXT_MODS`, and short-circuits workerd's external loader.
+    //
+    // The original patch landed in 325bf76 and was accidentally dropped
+    // during the ee4a409 refactor — restoring it. Fixes og-api node-
+    // runtime (`/og-node`) + use-cache-metadata-route-handler opengraph/
+    // icon image tests.
+    workerCode = workerCode.replace(
+      /async function externalImport\((\w+)\)\s*\{\s*let\s+raw;\s*try\s*\{\s*raw\s*=\s*await import\(\1\);/g,
+      (_match, idVar) =>
+        `async function externalImport(${idVar}) {\n` +
+        `      let raw;\n` +
+        `      { const __loaders = globalThis.__CREEK_EXT_LOADERS; if (__loaders && __loaders[${idVar}]) {\n` +
+        `        const __cached = globalThis.__CREEK_EXT_MODS = globalThis.__CREEK_EXT_MODS || {};\n` +
+        `        if (${idVar} in __cached) { raw = __cached[${idVar}]; }\n` +
+        `        else { try { raw = await __loaders[${idVar}](); __cached[${idVar}] = raw; } catch (err) { throw new Error(\`Failed to load external module \${${idVar}}: \${err}\`); } }\n` +
+        `        if (raw && raw.__esModule && raw.default && "default" in raw.default) { return interopEsm(raw.default, createNS(raw), true); }\n` +
+        `        return raw;\n` +
+        `      } }\n` +
+        `      try {\n` +
+        `        raw = await import(${idVar});`,
+    );
+
     await fs.writeFile(workerPath, workerCode);
   } catch {}
 
