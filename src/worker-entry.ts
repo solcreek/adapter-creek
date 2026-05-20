@@ -7233,7 +7233,7 @@ function collectPathnames(
 
 const NODE_BRIDGE_CODE = `
 import { EventEmitter } from "node:events";
-import { IncomingMessage as _IM, ServerResponse as _SR } from "http";
+import httpBare, { IncomingMessage as _IM, ServerResponse as _SR } from "http";
 import http from "node:http";
 import https from "node:https";
 import { Socket } from "net";
@@ -7521,6 +7521,7 @@ function __creekPatchHttpModule(mod, defaultProtocol) {
 }
 
 try {
+  __creekPatchHttpModule(httpBare, "http:");
   __creekPatchHttpModule(http, "http:");
   __creekPatchHttpModule(https, "https:");
 } catch {}
