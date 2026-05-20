@@ -1310,7 +1310,13 @@ function __collectConfigHeaders(url, requestHeaders) {
 }
 
 function __escapeRouteSubstitutionRegex(value) {
-  return String(value).replace(/[|\\{}()[\]^$+*?.]/g, "\\$&");
+  const specials = new Set(["|", "\\\\", "{", "}", "(", ")", "[", "]", "^", "$", "+", "*", "?", "."]);
+  let out = "";
+  for (const ch of String(value)) {
+    if (specials.has(ch)) out += "\\\\";
+    out += ch;
+  }
+  return out;
 }
 
 function __substituteRouteDestination(destination, match, routeKeys) {
