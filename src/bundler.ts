@@ -333,6 +333,27 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       'err.code !== "ENOENT" && err.code !== "MODULE_NOT_FOUND" && err.code !== "ERR_MODULE_NOT_FOUND" && !err.message?.includes("is not supported")',
     );
 
+    // `@vercel/og/index.node.js` evaluates at module load:
+    //
+    //   var fontData = fs.readFileSync(fileURLToPath(new URL("./Geist-Regular.ttf", import.meta.url)));
+    //   var resvg_wasm = fs.readFileSync(fileURLToPath(new URL("./resvg.wasm", import.meta.url)));
+    //
+    // workerd rejects `new URL("./X", import.meta.url)` with "Invalid URL
+    // string" in the bundled-worker context, so evaluation aborts before
+    // any request hits the route. Rewrite these two calls to pass literal
+    // paths into fs.readFileSync directly — our fs shim has a basename
+    // fallback for .wasm/.ttf/.otf/.woff[2]/etc, so the embedded bundled
+    // bytes resolve regardless of path.
+    //
+    // Companion to the externalImport restore — once externalImport routes
+    // through __CREEK_EXT_LOADERS, the @vercel/og loader actually runs and
+    // hits THIS line. Originally landed alongside in 325bf76; also dropped
+    // by ee4a409.
+    workerCode = workerCode.replace(
+      /fileURLToPath\(new URL\(("\.\/[^"]+\.(?:wasm|ttf|otf|woff2?|png|jpg|jpeg|gif|webp|svg|ico)")\s*,\s*import\.meta\.url\)\)/g,
+      (_match, filename) => filename.replace(/^"\.\//, '"'),
+    );
+
     // Route `externalImport(id)` through `globalThis.__CREEK_EXT_LOADERS`
     // so Turbopack-externalized modules can be served from our worker-entry
     // static imports. Turbopack emits chunks like
