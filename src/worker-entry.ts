@@ -3862,6 +3862,22 @@ async function __handleRequestInner(request, env, ctx) {
             return assetRes;
           }
         } catch {}
+        {
+          const candidate = __resolveRewriteToPublicFile(url, request.headers);
+          if (candidate) {
+            try {
+              const candidates = [];
+              if (BASE_PATH) candidates.push(BASE_PATH + candidate);
+              candidates.push(candidate);
+              for (const cand of candidates) {
+                const assetRes = await env.ASSETS.fetch(
+                  new Request(new URL(cand, url.origin), { headers: request.headers })
+                );
+                if (assetRes.status === 304 || assetRes.ok) return assetRes;
+              }
+            } catch {}
+          }
+        }
       }
 
       // Debug endpoint
@@ -5081,22 +5097,70 @@ async function __handleRequestInner(request, env, ctx) {
         // Fixes prerender.test.ts "should allow rewriting to SSG page
         // with fallback: false" (\`/about\` → \`/lang/en/about\`) and the
         // blocking-fallback variant.
-        if (!staticEntry && !HANDLERS[servePath] && ROUTING) {
-          for (const list of [ROUTING.beforeFiles || [], ROUTING.afterFiles || []]) {
+        if (!staticEntry && ROUTING) {
+          const canApplyAfterFilesRewrite = (() => {
+            if (!HANDLERS[servePath]) return true;
+            let matchPathname = url.pathname;
+            if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+              const firstSeg = matchPathname.split("/")[1] || "";
+              if (I18N.locales.includes(firstSeg)) {
+                matchPathname = matchPathname.slice(firstSeg.length + 1) || "/";
+              }
+            }
+            const dyn = __matchDynamicRoute(matchPathname);
+            return !!dyn && dyn.page === servePath;
+          })();
+          const rewriteLists = [ROUTING.beforeFiles || []];
+          if (canApplyAfterFilesRewrite) rewriteLists.push(ROUTING.afterFiles || []);
+          for (const list of rewriteLists) {
             for (const rule of list) {
               const sourceRegex = rule?.sourceRegex || rule?.regex || rule?.namedRegex;
               if (!sourceRegex || !rule?.destination) continue;
               let re;
               try { re = new RegExp(sourceRegex, "i"); } catch { continue; }
-              const m = servePath.match(re);
+              const rewriteSourceCandidates = [servePath];
+              if (url.pathname && !rewriteSourceCandidates.includes(url.pathname)) {
+                rewriteSourceCandidates.push(url.pathname);
+              }
+              if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+                for (const sourcePath of [...rewriteSourceCandidates]) {
+                  const firstSeg = sourcePath.split("/")[1] || "";
+                  if (!I18N.locales.includes(firstSeg)) {
+                    const localized = "/" + (I18N.defaultLocale || I18N.locales[0]) + (sourcePath === "/" ? "" : sourcePath);
+                    if (!rewriteSourceCandidates.includes(localized)) rewriteSourceCandidates.push(localized);
+                  }
+                }
+              }
+              let m = null;
+              let matchedSourcePath = null;
+              for (const sourcePath of rewriteSourceCandidates) {
+                m = sourcePath.match(re);
+                if (m) {
+                  matchedSourcePath = sourcePath;
+                  break;
+                }
+              }
               if (!m) continue;
               const dest = __substituteRouteDestination(rule.destination, m, rule.routeKeys, rule.source);
               const destPath = dest.split("?")[0];
-              if (STATIC_PAGES[destPath]) {
-                servePath = destPath;
-                staticEntry = STATIC_PAGES[destPath];
+              const destCandidates = [destPath];
+              if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0 && destPath.startsWith("/")) {
+                const destFirstSeg = destPath.split("/")[1] || "";
+                if (!I18N.locales.includes(destFirstSeg)) {
+                  const sourceFirstSeg = (matchedSourcePath || "").split("/")[1] || "";
+                  const locale = I18N.locales.includes(sourceFirstSeg)
+                    ? sourceFirstSeg
+                    : (I18N.defaultLocale || I18N.locales[0]);
+                  destCandidates.push("/" + locale + (destPath === "/" ? "" : destPath));
+                }
+              }
+              for (const candidatePath of destCandidates) {
+                if (!STATIC_PAGES[candidatePath]) continue;
+                servePath = candidatePath;
+                staticEntry = STATIC_PAGES[candidatePath];
                 break;
               }
+              if (staticEntry) break;
             }
             if (staticEntry) break;
           }
