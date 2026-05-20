@@ -5952,8 +5952,37 @@ async function __handleRequestInner(request, env, ctx) {
   return response;
 }
 
+async function __handleRequestWithLog(request, env, ctx) {
+  // Diagnostic-only request/response trace. Gated on CREEK_DEBUG_REQUESTS=1
+  // (or the workerd binding of the same name) so it's a no-op in normal
+  // operation. Helps pin down empty-body / silent-failure cases that don't
+  // print a stack to .adapter-server.log (e.g. esm-externals /ssr, action
+  // POST forwarding) by recording status + content-length for every fetch.
+  const debugEnabled =
+    (env && env.CREEK_DEBUG_REQUESTS === "1") ||
+    (typeof globalThis !== "undefined" && globalThis.CREEK_DEBUG_REQUESTS === "1");
+  if (!debugEnabled) return __handleRequest(request, env, ctx);
+  const reqUrl = (() => { try { return new URL(request.url).pathname + (new URL(request.url).search || ""); } catch { return "<unparseable>"; } })();
+  const reqMethod = request.method;
+  const t0 = Date.now();
+  let res;
+  try {
+    res = await __handleRequest(request, env, ctx);
+  } catch (err) {
+    console.error("[creek-req] THROW", reqMethod, reqUrl, err instanceof Error ? (err.stack || err.message) : String(err));
+    throw err;
+  }
+  const dt = Date.now() - t0;
+  const status = res && typeof res.status === "number" ? res.status : "?";
+  const ct = res && res.headers && typeof res.headers.get === "function" ? (res.headers.get("content-type") || "-") : "-";
+  const cl = res && res.headers && typeof res.headers.get === "function" ? (res.headers.get("content-length") || "-") : "-";
+  const anf = res && res.headers && typeof res.headers.get === "function" ? (res.headers.get("x-nextjs-action-not-found") || "-") : "-";
+  console.error("[creek-req]", reqMethod, reqUrl, "→", status, "ct=" + ct, "cl=" + cl, "anf=" + anf, dt + "ms");
+  return res;
+}
+
 export default {
-  fetch: __handleRequest,
+  fetch: __handleRequestWithLog,
 };
 `;
 }
