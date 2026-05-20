@@ -146,7 +146,7 @@ export function generateWorkerEntry(opts: WorkerEntryOptions): string {
   const handlers = collectHandlers(opts.outputs, opts.manifests);
   const pathnames = collectPathnames(opts.outputs, opts.manifests);
   const serverActionPages = collectServerActionPagePathnames(opts.manifests);
-  const staticPageMap = collectStaticPageMap(opts.outputs, serverActionPages, opts.prerenderEntries);
+  const staticPageMap = collectStaticPageMap(opts.outputs, opts.manifests, serverActionPages, opts.prerenderEntries);
   const revalidatePaths = collectRevalidatePaths(opts.outputs);
   const composableCacheSeedsByShell = opts.composableCacheSeedsByShell ?? [];
 
@@ -1319,7 +1319,18 @@ function __escapeRouteSubstitutionRegex(value) {
   return out;
 }
 
-function __substituteRouteDestination(destination, match, routeKeys) {
+function __extractRouteSourceParamNames(source) {
+  if (typeof source !== "string") return [];
+  const names = [];
+  const re = /:([A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?[*+?]?/g;
+  let match;
+  while ((match = re.exec(source))) {
+    if (match[1]) names.push(match[1]);
+  }
+  return names;
+}
+
+function __substituteRouteDestination(destination, match, routeKeys, source) {
   if (typeof destination !== "string") return destination;
   let dest = destination;
 
@@ -1350,6 +1361,10 @@ function __substituteRouteDestination(destination, match, routeKeys) {
       addNamed(routeKey, value);
     }
   }
+  const sourceParamNames = __extractRouteSourceParamNames(source);
+  for (let i = 0; i < sourceParamNames.length; i++) {
+    addNamed(sourceParamNames[i], match[i + 1]);
+  }
 
   for (const [name, value] of Object.entries(named)) {
     if (value === undefined) continue;
@@ -1361,6 +1376,34 @@ function __substituteRouteDestination(destination, match, routeKeys) {
   return dest;
 }
 
+function __duplicateRewriteQueryForPath(pathname) {
+  if (!ROUTING || typeof pathname !== "string") return null;
+  for (const list of [ROUTING.beforeFiles || [], ROUTING.afterFiles || [], ROUTING.fallback || []]) {
+    if (!Array.isArray(list)) continue;
+    for (const rule of list) {
+      const sourceRegex = rule?.sourceRegex || rule?.regex || rule?.namedRegex;
+      if (!sourceRegex || !rule?.destination || !String(rule.destination).includes("?")) continue;
+      let regex;
+      try { regex = new RegExp(sourceRegex, "i"); } catch { continue; }
+      const match = pathname.match(regex);
+      if (!match) continue;
+      const dest = __substituteRouteDestination(rule.destination, match, rule.routeKeys, rule.source);
+      const query = dest.split("?")[1];
+      if (!query) continue;
+      const values = {};
+      for (const [key, value] of new URLSearchParams(query).entries()) {
+        (values[key] ||= []).push(value);
+      }
+      const duplicates = {};
+      for (const [key, items] of Object.entries(values)) {
+        if (items.length > 1) duplicates[key] = items;
+      }
+      if (Object.keys(duplicates).length > 0) return duplicates;
+    }
+  }
+  return null;
+}
+
 // Manually re-apply ROUTING rewrites and check if the
 // destination is a path-only target (potential public file). The routing
 // layer applies these internally but only surfaces \`invocationTarget\` for
@@ -1369,33 +1412,48 @@ function __substituteRouteDestination(destination, match, routeKeys) {
 // pathname if a rewrite matches and looks file-like, else null.
 function __resolveRewriteToPublicFile(url, headers) {
   if (!ROUTING) return null;
-  // Apply the same locale prefix the routing layer applies internally.
-  let candidatePath = url.pathname;
-  if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
-    const seg = url.pathname.split("/")[1] || "";
-    if (!I18N.locales.includes(seg)) {
-      const def = I18N.defaultLocale || I18N.locales[0];
-      candidatePath = "/" + def + url.pathname;
+  const candidatePaths = [];
+  const addCandidate = (pathname) => {
+    if (typeof pathname !== "string" || !pathname.startsWith("/")) return;
+    if (!candidatePaths.includes(pathname)) candidatePaths.push(pathname);
+    // Apply the same default-locale prefix the routing layer applies
+    // internally for i18n builds.
+    if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+      const seg = pathname.split("/")[1] || "";
+      if (!I18N.locales.includes(seg)) {
+        const def = I18N.defaultLocale || I18N.locales[0];
+        const localized = "/" + def + pathname;
+        if (!candidatePaths.includes(localized)) candidatePaths.push(localized);
+      }
     }
+  };
+  addCandidate(url.pathname);
+  if (BASE_PATH && url.pathname.startsWith(BASE_PATH + "/")) {
+    addCandidate(url.pathname.slice(BASE_PATH.length) || "/");
+  } else if (BASE_PATH && url.pathname === BASE_PATH) {
+    addCandidate("/");
   }
   for (const list of [ROUTING.beforeFiles || [], ROUTING.afterFiles || [], ROUTING.fallback || []]) {
     if (!Array.isArray(list)) continue;
     for (const rule of list) {
-      if (!rule || !rule.sourceRegex || !rule.destination) continue;
+      const sourceRegex = rule?.sourceRegex || rule?.regex || rule?.namedRegex;
+      if (!rule || !sourceRegex || !rule.destination) continue;
       let regex;
-      try { regex = new RegExp(rule.sourceRegex, "i"); } catch { continue; }
-      const match = candidatePath.match(regex);
-      if (!match) continue;
-      const dest = __substituteRouteDestination(rule.destination, match, rule.routeKeys);
-      // Only treat as a potential public file if the destination is path-only,
-      // doesn't start with /api/, and looks file-like (has an extension).
-      const destPath = dest.split("?")[0];
-      if (
-        destPath.startsWith("/") &&
-        !destPath.startsWith("/api/") &&
-        /\\.[a-zA-Z0-9]+$/.test(destPath)
-      ) {
-        return destPath;
+      try { regex = new RegExp(sourceRegex, "i"); } catch { continue; }
+      for (const candidatePath of candidatePaths) {
+        const match = candidatePath.match(regex);
+        if (!match) continue;
+        const dest = __substituteRouteDestination(rule.destination, match, rule.routeKeys, rule.source);
+        // Only treat as a potential public file if the destination is path-only,
+        // doesn't start with /api/, and looks file-like (has an extension).
+        const destPath = dest.split("?")[0];
+        if (
+          destPath.startsWith("/") &&
+          !destPath.startsWith("/api/") &&
+          /\\.[a-zA-Z0-9]+$/.test(destPath)
+        ) {
+          return destPath;
+        }
       }
     }
   }
@@ -2781,9 +2839,9 @@ const middlewareHandler = async (mwCtx) => {
       }
     }
     const mwReq = new Request(mwUrlClean, {
-      method: mwBodyBuffer ? "POST" : "GET",
+      method: mwCtx.method || (mwBodyBuffer ? "POST" : "GET"),
       headers: mwHeaders,
-      body: mwBodyBuffer,
+      body: mwCtx.method === "GET" || mwCtx.method === "HEAD" ? undefined : mwBodyBuffer,
     });
     let response;
     try {
@@ -2867,6 +2925,7 @@ const middlewareHandler = async (mwCtx) => {
 ` : opts.outputs.middleware ? `
 // Node.js runtime middleware — import the module and call handler directly.
 import * as __middleware_mod from ${JSON.stringify(opts.outputs.middleware.filePath)};
+import { NextRequest as __CreekNextRequest } from "next/server";
 const middlewareHandler = async (mwCtx) => {
   try {
     const handler =
@@ -2916,10 +2975,15 @@ const middlewareHandler = async (mwCtx) => {
         }
       } catch {}
     }
-    const mwReq = new Request(mwUrlClean, {
-      method: mwBodyBuffer ? "POST" : "GET",
+    const mwReq = new __CreekNextRequest(mwUrlClean, {
+      method: mwCtx.method || (mwBodyBuffer ? "POST" : "GET"),
       headers: mwHeaders,
-      body: mwBodyBuffer,
+      body: mwCtx.method === "GET" || mwCtx.method === "HEAD" ? undefined : mwBodyBuffer,
+      nextConfig: {
+        basePath: BASE_PATH || undefined,
+        i18n: I18N || undefined,
+        trailingSlash: CONFIG.trailingSlash,
+      },
     });
     // Same rationale as edge middleware branch: forward waitUntil so
     // after() callbacks can extend the worker lifetime.
@@ -3979,7 +4043,7 @@ async function __handleRequestInner(request, env, ctx) {
           fixed.pathname = normPathname;
           mwCtx = { ...mwCtx, url: fixed };
         }
-        const mwRes = await middlewareHandler(mwCtx);
+        const mwRes = await middlewareHandler({ ...mwCtx, method: request.method });
         if (mwRes && mwRes.requestHeaders) {
           mwModifiedRequestHeaders = mwRes.requestHeaders;
         }
@@ -4294,6 +4358,16 @@ async function __handleRequestInner(request, env, ctx) {
         if (changed) {
           result = { ...result, resolvedQuery: fixedQuery };
         }
+      }
+      const duplicateRewriteQuery = __duplicateRewriteQueryForPath(url.pathname);
+      if (duplicateRewriteQuery && result.resolvedPathname) {
+        result = {
+          ...result,
+          resolvedQuery: {
+            ...(result.resolvedQuery || {}),
+            ...duplicateRewriteQuery,
+          },
+        };
       }
       // Strip routing-internal markers from resolvedQuery before they
       // reach the page. \`nextLocale\` is i18n metadata; the Pages Router
@@ -4921,12 +4995,13 @@ async function __handleRequestInner(request, env, ctx) {
         if (!staticEntry && !HANDLERS[servePath] && ROUTING) {
           for (const list of [ROUTING.beforeFiles || [], ROUTING.afterFiles || []]) {
             for (const rule of list) {
-              if (!rule?.sourceRegex || !rule?.destination) continue;
+              const sourceRegex = rule?.sourceRegex || rule?.regex || rule?.namedRegex;
+              if (!sourceRegex || !rule?.destination) continue;
               let re;
-              try { re = new RegExp(rule.sourceRegex, "i"); } catch { continue; }
+              try { re = new RegExp(sourceRegex, "i"); } catch { continue; }
               const m = servePath.match(re);
               if (!m) continue;
-              const dest = __substituteRouteDestination(rule.destination, m, rule.routeKeys);
+              const dest = __substituteRouteDestination(rule.destination, m, rule.routeKeys, rule.source);
               const destPath = dest.split("?")[0];
               if (STATIC_PAGES[destPath]) {
                 servePath = destPath;
@@ -6803,6 +6878,7 @@ function prerenderHtmlHasBoundServerAction(filePath: string | undefined): boolea
 
 function collectStaticPageMap(
   outputs: BuildContext["outputs"],
+  manifests: Record<string, string>,
   serverActionPages: Set<string>,
   prerenderEntries: WorkerEntryOptions["prerenderEntries"],
 ): Record<string, StaticPageEntry> {
@@ -6932,6 +7008,25 @@ function collectStaticPageMap(
       setStaticPageEntry(map, parent, entry);
     }
   }
+  try {
+    const prerenderManifestEntry = Object.entries(manifests).find(([manifestPath]) =>
+      manifestPath.replaceAll("\\", "/").endsWith("/prerender-manifest.json"),
+    );
+    if (prerenderManifestEntry) {
+      const prerenderManifest = JSON.parse(prerenderManifestEntry[1]) as {
+        dynamicRoutes?: Record<string, { fallback?: string | false | null }>;
+      };
+      for (const [route, dynamicRoute] of Object.entries(prerenderManifest.dynamicRoutes || {})) {
+        if (typeof dynamicRoute?.fallback !== "string") continue;
+        if (map[route]) continue;
+        const assetPath = __isStaticPagePathname(route)
+          ? path.join(route, "index.html")
+          : route;
+        const entry: StaticPageEntry = { assetPath, routerType: classifyRouterType(route) };
+        setStaticPageEntry(map, route, entry);
+      }
+    }
+  } catch {}
   return map;
 }
 
@@ -7797,6 +7892,43 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
 
   // Build ServerResponse with streaming output
   const res = new ServerResponse(req);
+  const syntheticCloseListeners = [];
+  let syntheticCloseFired = false;
+  if (handlerType === "APP_PAGE") {
+    const origOn = res.on.bind(res);
+    const origOnce = res.once.bind(res);
+    const origAddListener = res.addListener.bind(res);
+    const captureCloseListener = (listener) => {
+      if (typeof listener === "function") {
+        syntheticCloseListeners.push(listener);
+      }
+      return res;
+    };
+    res.on = function(event, listener) {
+      if (event === "close") return captureCloseListener(listener);
+      return origOn(event, listener);
+    };
+    res.addListener = function(event, listener) {
+      if (event === "close") return captureCloseListener(listener);
+      return origAddListener(event, listener);
+    };
+    res.once = function(event, listener) {
+      if (event !== "close") return origOnce(event, listener);
+      if (typeof listener !== "function") return res;
+      const wrapped = (...args) => {
+        try { res.off("close", wrapped); } catch {}
+        return listener.apply(res, args);
+      };
+      return origOn("close", wrapped);
+    };
+  }
+  function runSyntheticCloseListeners() {
+    if (syntheticCloseFired) return;
+    syntheticCloseFired = true;
+    for (const listener of syntheticCloseListeners.splice(0)) {
+      try { listener.call(res); } catch (err) { queueMicrotask(() => { throw err; }); }
+    }
+  }
   // Pre-seed res.statusCode from routeResult.status so app-render's
   // \`is404: res.statusCode === 404\` check (and equivalent checks for
   // other error statuses) sees the correct status DURING rendering,
@@ -8253,6 +8385,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       })
       .catch(() => {})
       .then(() => {
+        runSyntheticCloseListeners();
         res.finished = true;
         res.emit("finish");
         res.emit("close");
@@ -8385,6 +8518,9 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
         ...requestMeta,
         relativeProjectDir: ".",
         hostname: request.headers.get("host") || "localhost",
+        ...((handlerType === "PAGES" || handlerType === "PAGES_API") && Object.keys(resolvedQuery).length > 0
+          ? { query: resolvedQuery }
+          : {}),
         // Pages-api template calls \`setRequestMeta(req, ctx.requestMeta)\`
         // which REPLACES our \`req[NEXT_REQUEST_META]\` wholesale. Include
         // incrementalCache + revalidate here so they survive the overwrite.
@@ -8418,6 +8554,15 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       const IDLE_MS = 250;
       let idleTimer = null;
       let handlerDone = false;
+      const armSyntheticClose = () => {
+        if (handlerType !== "APP_PAGE" || syntheticCloseFired || res.finished) return;
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          if (syntheticCloseFired || res.finished) return;
+          runSyntheticCloseListeners();
+          if (handlerDone) armIdleClose();
+        }, IDLE_MS);
+      };
       const armIdleClose = () => {
         if (streamClosed || res.finished) return;
         if (idleTimer) clearTimeout(idleTimer);
@@ -8430,6 +8575,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
               streamClosed = true;
               try { streamController.close(); } catch {}
             }
+            runSyntheticCloseListeners();
             res.emit("finish");
             res.emit("close");
           }).catch(() => {});
@@ -8440,6 +8586,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       res.write = function(chunk, encoding, cb) {
         const r = prevWrite(chunk, encoding, cb);
         if (handlerDone) armIdleClose();
+        else armSyntheticClose();
         return r;
       };
       handlerPromise.then(() => { handlerDone = true; armIdleClose(); },

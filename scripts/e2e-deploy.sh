@@ -69,7 +69,7 @@ log "Installing project dependencies..."
 PKG_MANAGER=$(node -e "try{const p=JSON.parse(require('fs').readFileSync('package.json','utf8'));console.log(p.packageManager||'')}catch{console.log('')}")
 if [[ "${PKG_MANAGER}" == npm@* ]]; then
   log "Detected ${PKG_MANAGER}; running npm install..."
-  npm install --ignore-scripts --cache "${NPM_CACHE_DIR}" --prefer-offline --no-audit --no-fund >&2 2>&1
+  npm install --legacy-peer-deps --ignore-scripts --cache "${NPM_CACHE_DIR}" --prefer-offline --no-audit --no-fund >&2 2>&1
 else
 # --prefer-offline: use the store whenever possible, only hit the network
 # for packages that aren't already cached. This is what turns a ~3min

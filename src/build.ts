@@ -371,7 +371,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // handlers may read at runtime via fs.readFileSync. Next.js's adapter API
   // exposes these per-output as `output.assets` (the result of file tracing).
   // We embed them in __USER_FILES so the fs shim can serve them in workerd.
-  const userFiles = await collectUserFiles(ctx.outputs);
+  const userFiles = await collectUserFiles(ctx.outputs, ctx.distDir);
   if (Object.keys(userFiles).length > 0) {
     console.log(`  [Creek Adapter] ${Object.keys(userFiles).length} user data files embedded`);
   }
@@ -843,6 +843,44 @@ async function collectStaticFiles(
     }
   }
 
+  if (distDir) {
+    try {
+      const manifestPath = path.join(distDir, "prerender-manifest.json");
+      const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8")) as {
+        dynamicRoutes?: Record<string, { fallback?: string | false | null }>;
+      };
+      for (const [route, dynamicRoute] of Object.entries(manifest.dynamicRoutes || {})) {
+        const fallback = dynamicRoute?.fallback;
+        if (typeof fallback !== "string" || !fallback.endsWith(".html")) continue;
+        const relativeFallback = fallback.replace(/^\/+/, "");
+        const sourceCandidates = [
+          path.join(distDir, "server", "pages", relativeFallback),
+          path.join(distDir, "server", "app", relativeFallback),
+        ];
+        let sourcePath: string | null = null;
+        for (const candidate of sourceCandidates) {
+          try {
+            await fs.access(candidate);
+            sourcePath = candidate;
+            break;
+          } catch {}
+        }
+        if (!sourcePath) continue;
+        const destRelative = isStaticHtmlPage(route)
+          ? path.join(route, "index.html")
+          : route;
+        const destPath = path.join(assetsDir, destRelative);
+        if (!(await safeMkdirForDest(destPath, destRelative))) continue;
+        if (buildId) {
+          await copyHtmlWithDplId(sourcePath, destPath, buildId);
+        } else {
+          await fs.copyFile(sourcePath, destPath);
+        }
+        count++;
+      }
+    } catch {}
+  }
+
   // Edge asset bindings (\`.next/server/edge-chunks/asset_*\`). Edge routes
   // that do \`fetch(new URL('../../assets/foo', import.meta.url))\` get
   // rewritten by next's middleware-asset-loader to \`fetch('blob:foo')\` at
@@ -1016,6 +1054,25 @@ async function collectJsFilesRecursive(dir: string): Promise<string[]> {
   return files;
 }
 
+async function collectFilesRecursive(dir: string): Promise<string[]> {
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+  const files: string[] = [];
+  for (const entry of entries) {
+    const absPath = path.join(dir, entry.name);
+    if (entry.isDirectory()) {
+      files.push(...await collectFilesRecursive(absPath));
+      continue;
+    }
+    if (entry.isFile()) files.push(absPath);
+  }
+  return files;
+}
+
 async function getTotalSize(dir: string, files: string[]): Promise<number> {
   let total = 0;
   for (const f of files) {
@@ -1107,6 +1164,7 @@ async function collectManifests(distDir: string): Promise<Record<string, string>
  */
 async function collectUserFiles(
   outputs: BuildContext["outputs"],
+  distDir?: string,
 ): Promise<Record<string, string>> {
   const TEXT_EXTENSIONS = new Set([
     ".json", ".txt", ".yaml", ".yml", ".md", ".csv", ".xml",
@@ -1184,6 +1242,37 @@ async function collectUserFiles(
       } catch {
         // Skip files we can't read — they may have been excluded by tracing
       }
+    }
+  }
+
+  if (distDir) {
+    const serverAssetsDir = path.join(distDir, "server", "assets");
+    const serverAssets = await collectFilesRecursive(serverAssetsDir);
+    for (const sourceFile of serverAssets) {
+      const fileOutputPath = path
+        .relative(path.join(distDir, "server"), sourceFile)
+        .replace(/\\/g, "/");
+      const embeddedPath = "server/" + fileOutputPath;
+      if (files[embeddedPath]) continue;
+      const ext = path.extname(sourceFile).toLowerCase();
+      const isDeclarationFile = sourceFile.endsWith(".d.ts");
+      const isText = TEXT_EXTENSIONS.has(ext) || isDeclarationFile;
+      const isBinary = BINARY_EXTENSIONS.has(ext);
+      if (!isText && !isBinary) continue;
+      try {
+        if (isText) {
+          const content = await fs.readFile(sourceFile, "utf-8");
+          if (totalBytes + content.length > MAX_TOTAL_BYTES) continue;
+          files[embeddedPath] = content;
+          totalBytes += content.length;
+        } else {
+          const buffer = await fs.readFile(sourceFile);
+          const encoded = "__CREEK_B64__" + buffer.toString("base64");
+          if (totalBytes + encoded.length > MAX_TOTAL_BYTES) continue;
+          files[embeddedPath] = encoded;
+          totalBytes += encoded.length;
+        }
+      } catch {}
     }
   }
 
