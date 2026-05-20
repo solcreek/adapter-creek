@@ -723,6 +723,11 @@ function isStaticHtmlPage(pathname: string): boolean {
   return !path.extname(pathname);
 }
 
+function internalStaticPageAssetPath(pathname: string): string {
+  const encoded = encodeURIComponent(pathname).replace(/%/g, "~");
+  return path.join("_creek", "static-pages", encoded + ".html");
+}
+
 // Inject `data-dpl-id="<buildId>"` into the `<html>` tag of static HTML
 // files at build time. The Pages Router client reads this attribute on
 // page load to populate `globalThis.NEXT_DEPLOYMENT_ID`, then sends
@@ -794,6 +799,20 @@ async function collectStaticFiles(
 ): Promise<number> {
   let count = 0;
   const allPathnames = new Set(outputs.staticFiles.map((f) => f.pathname));
+  const copyStaticHtml = async (srcPath: string, destRelative: string): Promise<boolean> => {
+    const destPath = path.join(assetsDir, destRelative);
+    if (!(await safeMkdirForDest(destPath, destRelative))) return false;
+    try {
+      if (buildId) {
+        await copyHtmlWithDplId(srcPath, destPath, buildId);
+      } else {
+        await fs.copyFile(srcPath, destPath);
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
 
   for (const file of outputs.staticFiles) {
     let destRelative = file.pathname;
@@ -813,6 +832,9 @@ async function collectStaticFiles(
       }
       count++;
     } catch {}
+    if (isHtml && file.pathname.includes("[")) {
+      if (await copyStaticHtml(file.filePath, internalStaticPageAssetPath(file.pathname))) count++;
+    }
   }
 
   for (const prerender of outputs.prerenders) {
@@ -840,6 +862,9 @@ async function collectStaticFiles(
         }
         count++;
       } catch {}
+      if (isHtml && prerender.pathname.includes("[")) {
+        if (await copyStaticHtml(prerender.fallback.filePath, internalStaticPageAssetPath(prerender.pathname))) count++;
+      }
     }
   }
 
@@ -866,7 +891,8 @@ async function collectStaticFiles(
           } catch {}
         }
         if (!sourcePath) continue;
-        const destRelative = isStaticHtmlPage(route)
+        const isHtml = isStaticHtmlPage(route);
+        const destRelative = isHtml
           ? path.join(route, "index.html")
           : route;
         const destPath = path.join(assetsDir, destRelative);
@@ -877,6 +903,9 @@ async function collectStaticFiles(
           await fs.copyFile(sourcePath, destPath);
         }
         count++;
+        if (isHtml && route.includes("[")) {
+          if (await copyStaticHtml(sourcePath, internalStaticPageAssetPath(route))) count++;
+        }
       }
     } catch {}
   }

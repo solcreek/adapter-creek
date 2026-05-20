@@ -1370,7 +1370,7 @@ function __substituteRouteDestination(destination, match, routeKeys, source) {
     if (value === undefined) continue;
     const escapedName = __escapeRouteSubstitutionRegex(name);
     dest = dest.replace(new RegExp("\\$" + escapedName + "(?![a-zA-Z0-9_])", "g"), value);
-    dest = dest.replace(new RegExp(":" + escapedName + "(?:\\*|\\+)?(?![a-zA-Z0-9_])", "g"), value);
+    dest = dest.replace(new RegExp(":" + escapedName + "(?:[*+])?(?![a-zA-Z0-9_])", "g"), value);
   }
 
   return dest;
@@ -6677,6 +6677,20 @@ function __isStaticPagePathname(pathname: string): boolean {
   return !path.extname(pathname);
 }
 
+function internalStaticPageAssetPath(pathname: string): string {
+  const encoded = encodeURIComponent(pathname).replace(/%/g, "~");
+  return "/_creek/static-pages/" + encoded + ".html";
+}
+
+function staticPageAssetPath(pathname: string, routerType: StaticPageEntry["routerType"]): string {
+  if (routerType === "PAGES" && pathname.includes("[")) {
+    return internalStaticPageAssetPath(pathname);
+  }
+  return __isStaticPagePathname(pathname)
+    ? path.join(pathname, "index.html")
+    : pathname;
+}
+
 /**
  * Find JS manifests that need to execute before edge runtime modules evaluate.
  * This includes top-level manifest globals and all per-page client-reference manifests.
@@ -6933,8 +6947,11 @@ function collectStaticPageMap(
     // helper so dynamic segments like /catch-all/[...slug] aren't misclassified
     // as having a file extension.
     if (__isStaticPagePathname(file.pathname)) {
-      const assetPath = path.join(file.pathname, "index.html");
-      const entry: StaticPageEntry = { assetPath, routerType: classifyRouterType(file.pathname) };
+      const routerType = classifyRouterType(file.pathname);
+      const entry: StaticPageEntry = {
+        assetPath: staticPageAssetPath(file.pathname, routerType),
+        routerType,
+      };
       applyCacheTags(file.pathname, entry);
       applyStaleTime(file.pathname, entry);
       // Map the original pathname
@@ -6965,11 +6982,11 @@ function collectStaticPageMap(
       prerenderHtmlHasBoundServerAction(prerender.fallback.filePath);
     if (prerender.fallback.postponedState || (prerender.pprChain?.headers && !staticServerActionPpr)) continue;
 
-    const assetPath = __isStaticPagePathname(prerender.pathname)
-      ? path.join(prerender.pathname, "index.html")
-      : prerender.pathname;
-
-    const entry: StaticPageEntry = { assetPath, routerType: classifyRouterType(prerender.pathname) };
+    const routerType = classifyRouterType(prerender.pathname);
+    const entry: StaticPageEntry = {
+      assetPath: staticPageAssetPath(prerender.pathname, routerType),
+      routerType,
+    };
     if (typeof prerender.fallback.initialStatus === "number") {
       entry.status = prerender.fallback.initialStatus;
     }
@@ -7019,10 +7036,11 @@ function collectStaticPageMap(
       for (const [route, dynamicRoute] of Object.entries(prerenderManifest.dynamicRoutes || {})) {
         if (typeof dynamicRoute?.fallback !== "string") continue;
         if (map[route]) continue;
-        const assetPath = __isStaticPagePathname(route)
-          ? path.join(route, "index.html")
-          : route;
-        const entry: StaticPageEntry = { assetPath, routerType: classifyRouterType(route) };
+        const routerType = classifyRouterType(route);
+        const entry: StaticPageEntry = {
+          assetPath: staticPageAssetPath(route, routerType),
+          routerType,
+        };
         setStaticPageEntry(map, route, entry);
       }
     }
