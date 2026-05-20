@@ -560,6 +560,65 @@ function stripAsyncLocalStorageSnapshotTernaries(workerCode: string): string {
   return out ? out + workerCode.slice(last) : workerCode;
 }
 
+function patchAsyncLocalStorageBindSnapshot(workerCode: string): string {
+  // Next's bindSnapshot() delegates to AsyncLocalStorage.bind() when the
+  // runtime provides a native ALS. In workerd that captures request-bound
+  // context, and App Page after() callbacks can then stall after response
+  // close before the user callback starts. Keep the fake-ALS behavior: return
+  // the callback directly.
+  workerCode = workerCode.replace(
+    /function\s+bindSnapshot\((\w+)\)\s*\{\s*if\s*\(\s*\w+\s*\)\s*\{\s*return\s+\w+\.bind\(\1\);\s*\}\s*return\s+\w+\.bind\(\1\);\s*\}/g,
+    (_match, fnArg) => `function bindSnapshot(${fnArg}) { return ${fnArg}; }`,
+  );
+  workerCode = workerCode.replace(
+    /function\s+(\w+)\((\w+)\)\s*\{\s*return\s+\w+\s*\?\s*\w+\.bind\(\2\)\s*:\s*\w+\.bind\(\2\);\s*\}/g,
+    (match, fnName, fnArg, offset, fullCode) => {
+      const followingCode = fullCode.slice(offset, offset + 800);
+      if (!new RegExp(String.raw`["']bindSnapshot["']\s*,\s*0\s*,\s*${fnName}\b`).test(followingCode)) {
+        return match;
+      }
+      return `function ${fnName}(${fnArg}) { return ${fnArg}; }`;
+    },
+  );
+  workerCode = workerCode.replace(
+    /(server\/app-render\/async-local-storage\.js"[\s\S]{0,1800}?function\s+)(\w+)\((\w+)\)\s*\{\s*return\s+\w+\s*\?\s*\w+\.bind\(\3\)\s*:\s*\w+\.bind\(\3\);\s*\}/g,
+    (_match, prefix, fnName, fnArg) => `${prefix}${fnName}(${fnArg}) { return ${fnArg}; }`,
+  );
+  return workerCode;
+}
+
+function patchAfterContextRunCallbacksOnClose(workerCode: string): string {
+  // Next's AfterContext normally waits for close by resolving a Promise and
+  // then continuing to runCallbacks(). In workerd that continuation can stall
+  // for App Page renders even though the close listener fired. Run callbacks
+  // directly from the close listener and propagate completion/rejection to
+  // waitUntil.
+  const marker = "./dist/esm/server/after/after-context.js";
+  const pattern =
+    /async\s+runCallbacksOnClose\(\)\s*\{\s*return\s+await\s+new\s+Promise\(\((\w+)\)\s*=>\s*this\.onClose\(\1\)\),\s*this\.runCallbacks\(\);\s*\}/g;
+  const replacement =
+    "async runCallbacksOnClose() { return await new Promise((resolve, reject) => this.onClose(() => { Promise.resolve(this.runCallbacks()).then(resolve, reject); })); }";
+
+  let patched = "";
+  let last = 0;
+  let searchFrom = 0;
+  while (true) {
+    const markerIndex = workerCode.indexOf(marker, searchFrom);
+    if (markerIndex === -1) break;
+
+    const windowEnd = Math.min(workerCode.length, markerIndex + 6000);
+    const chunk = workerCode.slice(markerIndex, windowEnd);
+    const nextChunk = chunk.replace(pattern, replacement);
+    if (nextChunk !== chunk) {
+      patched += workerCode.slice(last, markerIndex) + nextChunk;
+      last = windowEnd;
+    }
+    searchFrom = windowEnd;
+  }
+
+  return patched ? patched + workerCode.slice(last) : workerCode;
+}
+
 function patchUseCachePrerenderDanglingPromiseBailout(workerCode: string): string {
   const serializedKeyPattern =
     /let\s+(\w+)\s*=\s*"string"\s*==\s*typeof\s+(\w+)\s*\?\s*\2\s*:\s*await\s+(\w+)\(\2\),\s*(\w+)\s*=\s*(\w+)\.rootParams/g;
@@ -982,6 +1041,8 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       "// Ignored snapshot",
     );
     workerCode = stripAsyncLocalStorageSnapshotTernaries(workerCode);
+    workerCode = patchAsyncLocalStorageBindSnapshot(workerCode);
+    workerCode = patchAfterContextRunCallbacksOnClose(workerCode);
     // `use cache` arguments that contain an unresolved React thenable marker
     // (`$@`) during a prerender are request-bound values. Next's dynamic
     // access instrumentation usually catches this before cache fill, but an

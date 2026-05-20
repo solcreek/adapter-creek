@@ -234,7 +234,26 @@ export function createServer() { throw new Error("http.createServer not availabl
 export function request() { throw new Error("http.request not available in CF Workers"); }
 export function get() { throw new Error("http.get not available in CF Workers"); }
 
+export function Agent(options) {
+  EventEmitter.call(this);
+  this.options = options || {};
+  this.requests = {};
+  this.sockets = {};
+  this.freeSockets = {};
+  this.maxSockets = this.options.maxSockets || Agent.defaultMaxSockets;
+}
+Agent.prototype = Object.create(EventEmitter.prototype);
+Agent.prototype.constructor = Agent;
+Agent.defaultMaxSockets = Infinity;
+Agent.prototype.addRequest = function(req) {
+  if (req && typeof req.emit === "function") {
+    queueMicrotask(() => req.emit("error", new Error("http.Agent sockets are not available in CF Workers")));
+  }
+};
+Agent.prototype.destroy = function() {};
+export const globalAgent = new Agent();
+
 export const METHODS = ["GET","POST","PUT","DELETE","PATCH","HEAD","OPTIONS"];
 export const STATUS_CODES = { 200:"OK",201:"Created",204:"No Content",301:"Moved Permanently",302:"Found",304:"Not Modified",400:"Bad Request",401:"Unauthorized",403:"Forbidden",404:"Not Found",500:"Internal Server Error" };
 
-export default { IncomingMessage, ServerResponse, createServer, request, get, METHODS, STATUS_CODES };
+export default { IncomingMessage, ServerResponse, createServer, request, get, Agent, globalAgent, METHODS, STATUS_CODES };

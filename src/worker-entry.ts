@@ -1359,7 +1359,7 @@ function __escapeRouteSubstitutionRegex(value) {
 function __extractRouteSourceParamNames(source) {
   if (typeof source !== "string") return [];
   const names = [];
-  const re = /:([A-Za-z_][A-Za-z0-9_]*)(?:\([^)]*\))?[*+?]?/g;
+  const re = /:([A-Za-z_][A-Za-z0-9_]*)(?:\\([^)]*\\))?[*+?]?/g;
   let match;
   while ((match = re.exec(source))) {
     if (match[1]) names.push(match[1]);
@@ -1373,7 +1373,7 @@ function __substituteRouteDestination(destination, match, routeKeys, source) {
 
   for (let i = 1; i < match.length; i++) {
     if (match[i] !== undefined) {
-      dest = dest.replace(new RegExp("\\$" + i, "g"), match[i]);
+      dest = dest.replace(new RegExp("\\\\$" + i, "g"), match[i]);
     }
   }
 
@@ -1406,7 +1406,7 @@ function __substituteRouteDestination(destination, match, routeKeys, source) {
   for (const [name, value] of Object.entries(named)) {
     if (value === undefined) continue;
     const escapedName = __escapeRouteSubstitutionRegex(name);
-    dest = dest.replace(new RegExp("\\$" + escapedName + "(?![a-zA-Z0-9_])", "g"), value);
+    dest = dest.replace(new RegExp("\\\\$" + escapedName + "(?![a-zA-Z0-9_])", "g"), value);
     dest = dest.replace(new RegExp(":" + escapedName + "(?:[*+])?(?![a-zA-Z0-9_])", "g"), value);
   }
 
@@ -1494,6 +1494,29 @@ function __resolveRewriteToPublicFile(url, headers) {
       }
     }
   }
+  return null;
+}
+
+async function __tryFetchRewritePublicFile(url, headers, env) {
+  const candidate = __resolveRewriteToPublicFile(url, headers);
+  if (!candidate) return null;
+  try {
+    const candidates = [];
+    if (BASE_PATH) candidates.push(BASE_PATH + candidate);
+    candidates.push(candidate);
+    if (candidate.startsWith("/_next/static/")) {
+      candidates.push(candidate.slice("/_next".length));
+    }
+    const seen = new Set();
+    for (const cand of candidates) {
+      if (!cand || seen.has(cand)) continue;
+      seen.add(cand);
+      const assetRes = await env.ASSETS.fetch(
+        new Request(new URL(cand, url.origin), { headers })
+      );
+      if (assetRes.status === 304 || assetRes.ok) return assetRes;
+    }
+  } catch {}
   return null;
 }
 
@@ -3705,19 +3728,6 @@ async function __handleRequestInner(request, env, ctx) {
       } catch {
         return new Response("Bad Request", { status: 400 });
       }
-      if (BASE_PATH) {
-        const hasBasePathPrefix =
-          url.pathname === BASE_PATH ||
-          url.pathname.startsWith(BASE_PATH + "/");
-        const hasAssetPrefix =
-          ASSET_PREFIX_PATH &&
-          (url.pathname === ASSET_PREFIX_PATH ||
-            url.pathname.startsWith(ASSET_PREFIX_PATH + "/"));
-        if (!hasBasePathPrefix && !hasAssetPrefix) {
-          return new Response("Not Found", { status: 404 });
-        }
-      }
-
       // 1. Static assets via WfP ASSETS binding
       // /_next/data/ requests are Pages Router data fetches — must go through routing
       // Strip basePath and assetPrefix from the URL to normalize the
@@ -3910,20 +3920,8 @@ async function __handleRequestInner(request, env, ctx) {
           }
         } catch {}
         {
-          const candidate = __resolveRewriteToPublicFile(url, request.headers);
-          if (candidate) {
-            try {
-              const candidates = [];
-              if (BASE_PATH) candidates.push(BASE_PATH + candidate);
-              candidates.push(candidate);
-              for (const cand of candidates) {
-                const assetRes = await env.ASSETS.fetch(
-                  new Request(new URL(cand, url.origin), { headers: request.headers })
-                );
-                if (assetRes.status === 304 || assetRes.ok) return assetRes;
-              }
-            } catch {}
-          }
+          const rewriteAssetRes = await __tryFetchRewritePublicFile(url, request.headers, env);
+          if (rewriteAssetRes) return rewriteAssetRes;
         }
       }
 
@@ -4858,20 +4856,8 @@ async function __handleRequestInner(request, env, ctx) {
       }
 
       {
-        const candidate = __resolveRewriteToPublicFile(url, request.headers);
-        if (candidate) {
-          try {
-            const candidates = [];
-            if (BASE_PATH) candidates.push(BASE_PATH + candidate);
-            candidates.push(candidate);
-            for (const cand of candidates) {
-              const assetRes = await env.ASSETS.fetch(
-                new Request(new URL(cand, url.origin), { headers: request.headers })
-              );
-              if (assetRes.status === 304 || assetRes.ok) return assetRes;
-            }
-          } catch {}
-        }
+        const rewriteAssetRes = await __tryFetchRewritePublicFile(url, request.headers, env);
+        if (rewriteAssetRes) return rewriteAssetRes;
       }
 
       // Strip Next.js internal sentinel values from route matches. The
@@ -5214,7 +5200,11 @@ async function __handleRequestInner(request, env, ctx) {
           }
         }
       }
-      if (!staticEntry && !resolvedPathname) {
+      const canUseBasePathDynamicFallback =
+        !BASE_PATH ||
+        url.pathname === BASE_PATH ||
+        url.pathname.startsWith(BASE_PATH + "/");
+      if (!staticEntry && !resolvedPathname && canUseBasePathDynamicFallback) {
         let matchPathname = url.pathname;
         if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
           const firstSeg = url.pathname.split("/")[1] || "";
@@ -5302,6 +5292,7 @@ async function __handleRequestInner(request, env, ctx) {
       const isDraftModeRequest = (() => {
         const cookieHeader = request.headers.get("cookie");
         if (!cookieHeader) return false;
+        if (/(?:^|;\\s*)__next_preview_data=/.test(cookieHeader)) return true;
         const m = cookieHeader.match(/(?:^|;\\s*)__prerender_bypass=([^;]+)/);
         if (!m) return false;
         const cookieVal = m[1];
@@ -5339,6 +5330,8 @@ async function __handleRequestInner(request, env, ctx) {
       // trailingslash revalidation, and stale-cache-serving tests.
       const isISRPage = staticEntry?.initialRevalidate != null && staticEntry.initialRevalidate > 0;
       const hasHandler = resolvedPathname && HANDLERS[resolvedPathname];
+      const isAppRouterBracketShell =
+        staticEntry?.routerType === "APP" && isServingBracketShell && !!hasHandler;
       // Any tag on this prerender invalidated since build? If yes the static
       // HTML is stale — skip the fast-path and let the handler rebuild so the
       // server-action-side updateTag/revalidateTag actually takes effect.
@@ -5391,6 +5384,7 @@ async function __handleRequestInner(request, env, ctx) {
         !nextDataAppRouterPath &&
         !isDraftModeRequest &&
         !(isCrawlerRequest && isServingBracketShell) &&
+        !isAppRouterBracketShell &&
         (!isRewritten || !hasHandlerForTarget) &&
         // ISR pages bypass static assets when a handler exists.
         !(isISRPage && hasHandler) &&
@@ -5711,7 +5705,9 @@ async function __handleRequestInner(request, env, ctx) {
             matchPathname = url.pathname.slice(firstSeg.length + 1) || "/";
           }
         }
-        const dyn = __matchDynamicRoute(matchPathname);
+        const dyn = canUseBasePathDynamicFallback
+          ? __matchDynamicRoute(matchPathname)
+          : null;
         // Include PAGES_API (dynamic API routes like /api/blog/[slug])
         // in the fallback. Without this, /api/blog/first 404s because
         // resolveRoutes doesn't find it in PATHNAMES and our fallback
@@ -5794,20 +5790,8 @@ async function __handleRequestInner(request, env, ctx) {
         // PATHNAME — so we manually re-apply the beforeFiles rewrites and
         // check if the destination is a static asset.
         if (!resolvedPathname || !HANDLERS[resolvedPathname]) {
-          const candidate = __resolveRewriteToPublicFile(url, request.headers);
-          if (candidate) {
-            try {
-              const candidates = [];
-              if (BASE_PATH) candidates.push(BASE_PATH + candidate);
-              candidates.push(candidate);
-              for (const cand of candidates) {
-                const assetRes = await env.ASSETS.fetch(
-                  new Request(new URL(cand, url.origin))
-                );
-                if (assetRes.status === 304 || assetRes.ok) return assetRes;
-              }
-            } catch {}
-          }
+          const rewriteAssetRes = await __tryFetchRewritePublicFile(url, request.headers, env);
+          if (rewriteAssetRes) return rewriteAssetRes;
         }
 
         // Pages Router data URL with a middleware rewrite that didn't
@@ -5920,6 +5904,13 @@ async function __handleRequestInner(request, env, ctx) {
             // getInitialProps. In that case there is no static /404 asset, and
             // unmatched paths must invoke pages/404 so _app props are present.
             resolvedPathname = "/404";
+            if (!result.status) result = { ...result, status: 404 };
+          } else if (HANDLERS["/_error"]) {
+            // Apps without a user pages/404 still have Next's generated
+            // pages/_error handler in pages-manifest.json. Invoke it for
+            // unmatched Pages Router URLs so _app.getInitialProps and the
+            // default client error behavior match Next.
+            resolvedPathname = "/_error";
             if (!result.status) result = { ...result, status: 404 };
           } else {
             // Try static 404 page from assets. For basePath apps the
@@ -6297,6 +6288,15 @@ async function __handleRequestInner(request, env, ctx) {
         );
       } else {
         __invokedResponse = await invokeNodeHandler(request, mod, ctx, result, handler.pathname, handler.type);
+      }
+      if (
+        __invokedResponse &&
+        __invokedResponse.status === 200 &&
+        handler.type === "PAGES" &&
+        staticPagesDataRoutePath &&
+        handler.pathname.includes("[")
+      ) {
+        __creekMarkGeneratedFallbackPath(staticPagesDataRoutePath);
       }
       // For Pages Router page errors (status 500 from getServerSideProps
       // throwing) on a NON-data URL navigation, replace our generic JSON
@@ -6870,6 +6870,29 @@ function collectHandlers(
     const errorFilePath = path.join(path.dirname(pages404Output.filePath), "_error.js");
     if (existsSync(errorFilePath)) {
       addOutput({ ...pages404Output, pathname: "/_error", filePath: errorFilePath }, "PAGES");
+      hasPagesErrorHandler = true;
+    }
+  }
+  if (!hasPagesErrorHandler) {
+    const pagesManifestEntry = Object.entries(manifests).find(([manifestPath]) =>
+      manifestPath.replaceAll("\\", "/").endsWith("/server/pages-manifest.json"),
+    );
+    if (pagesManifestEntry) {
+      const [manifestPath, manifestContent] = pagesManifestEntry;
+      try {
+        const pagesManifest = JSON.parse(manifestContent) as Record<string, string>;
+        const relErrorPath = pagesManifest["/_error"];
+        if (relErrorPath) {
+          const errorFilePath = path.join(path.dirname(manifestPath), relErrorPath);
+          if (existsSync(errorFilePath)) {
+            addOutput({
+              pathname: "/_error",
+              filePath: errorFilePath,
+              runtime: "nodejs",
+            }, "PAGES");
+          }
+        }
+      } catch {}
     }
   }
   for (const api of outputs.pagesApi) addOutput(api, "PAGES_API");
@@ -8175,7 +8198,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
         try { res.off("close", wrapped); } catch {}
         return listener.apply(res, args);
       };
-      return origOn("close", wrapped);
+      return captureCloseListener(wrapped);
     };
   }
   function runSyntheticCloseListeners() {
@@ -8771,7 +8794,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
         : {}),
     };
     const handlerResult = handlerFn(req, res, {
-      waitUntil: (p) => ctx.waitUntil(p.catch(() => {})),
+      waitUntil: (p) => ctx.waitUntil(Promise.resolve(p).catch(() => {})),
       // Some Next.js handler templates still read params directly from ctx,
       // but App Router handlers consume requestMeta.params/query instead.
       params: paramsForHandler,
