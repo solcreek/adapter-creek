@@ -903,6 +903,9 @@ async function collectStaticFiles(
           await fs.copyFile(sourcePath, destPath);
         }
         count++;
+        if (isHtml && relativeFallback !== destRelative) {
+          if (await copyStaticHtml(sourcePath, relativeFallback)) count++;
+        }
         if (isHtml && route.includes("[")) {
           if (await copyStaticHtml(sourcePath, internalStaticPageAssetPath(route))) count++;
         }

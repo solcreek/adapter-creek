@@ -899,6 +899,11 @@ globalThis.__MANIFESTS = ${JSON.stringify(opts.manifests)};
 // mismatch in workerd.
 globalThis.__USER_FILES = ${JSON.stringify(opts.userFiles)};
 
+function __creekInternalStaticPageAssetPath(pathname) {
+  const encoded = encodeURIComponent(pathname).replace(/%/g, "~");
+  return "/_creek/static-pages/" + encoded + ".html";
+}
+
 function __creekPathnameAliases(pathname) {
   const aliases = [];
   const add = (value) => {
@@ -4789,6 +4794,23 @@ async function __handleRequestInner(request, env, ctx) {
         return new Response("{}", { status: 200, headers: mwPrefetchHeaders });
       }
 
+      {
+        const candidate = __resolveRewriteToPublicFile(url, request.headers);
+        if (candidate) {
+          try {
+            const candidates = [];
+            if (BASE_PATH) candidates.push(BASE_PATH + candidate);
+            candidates.push(candidate);
+            for (const cand of candidates) {
+              const assetRes = await env.ASSETS.fetch(
+                new Request(new URL(cand, url.origin), { headers: request.headers })
+              );
+              if (assetRes.status === 304 || assetRes.ok) return assetRes;
+            }
+          } catch {}
+        }
+      }
+
       // Strip Next.js internal sentinel values from route matches. The
       // sentinel format is \`$nxtP{paramName}\` (e.g. \`$nxtPslug\`,
       // \`$nxtPrest\`), used for empty optional catch-all segments. Match by
@@ -4905,6 +4927,58 @@ async function __handleRequestInner(request, env, ctx) {
             resolvedPathname = stripped;
           }
         }
+      }
+      if (
+        resolvedPathname &&
+        HANDLERS[resolvedPathname]?.type === "PAGES" &&
+        (request.method === "GET" || request.method === "HEAD") &&
+        !request.headers.has("next-action") &&
+        !request.headers.has("rsc") &&
+        !request.headers.has("next-router-state-tree") &&
+        !nextDataAppRouterPath
+      ) {
+        try {
+          const prerenderManifest = __getPrerenderManifest();
+          const dynamicRoute = prerenderManifest?.dynamicRoutes?.[resolvedPathname];
+          const fallback = dynamicRoute?.fallback;
+          if (typeof fallback === "string" && fallback.endsWith(".html")) {
+            const pathCandidates = [url.pathname];
+            if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+              const firstSeg = url.pathname.split("/")[1] || "";
+              if (!I18N.locales.includes(firstSeg)) {
+                for (const locale of I18N.locales) pathCandidates.push("/" + locale + url.pathname);
+              }
+            }
+            const hasConcretePrerender = pathCandidates.some((p) => prerenderManifest?.routes?.[p] != null);
+            const ua = request.headers.get("user-agent") || "";
+            const isCrawler = /bot|spider|crawler|slurp|ia_archiver|facebookexternalhit/i.test(ua);
+            if (!hasConcretePrerender && !isCrawler) {
+              const assetCandidates = [
+                STATIC_PAGES[resolvedPathname]?.assetPath,
+                __creekInternalStaticPageAssetPath(resolvedPathname),
+                resolvedPathname + "/index.html",
+                "/" + fallback.replace(/^\/+/, ""),
+              ].filter(Boolean);
+              for (const assetPath of assetCandidates) {
+                const assetRes = await env.ASSETS.fetch(
+                  new Request(new URL(assetPath, url.origin), { headers: request.headers })
+                );
+                if (assetRes.status === 304) return assetRes;
+                if (assetRes.ok) {
+                  const headers = new Headers(assetRes.headers);
+                  headers.set("content-type", "text/html; charset=utf-8");
+                  headers.set("cache-control", "public, max-age=0, must-revalidate");
+                  if (!headers.has("x-nextjs-cache")) headers.set("x-nextjs-cache", "HIT");
+                  return new Response(request.method === "HEAD" ? null : assetRes.body, {
+                    status: 200,
+                    statusText: assetRes.statusText,
+                    headers,
+                  });
+                }
+              }
+            }
+          }
+        } catch {}
       }
       // 4a. Static pages — serve pre-rendered HTML from assets.
       // Pages Router static pages and auto-optimized pages are pre-rendered
