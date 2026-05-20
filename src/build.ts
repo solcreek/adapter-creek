@@ -150,6 +150,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   const prerenderEntries = await collectPrerenderEntries(
     ctx.outputs,
     fallbackShellRoutes,
+    ctx.distDir,
   );
   if (prerenderEntries.length > 0) {
     console.log(`  [Creek Adapter] ${prerenderEntries.length} prerender entries for cache seeding`);
@@ -163,6 +164,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   const composableCacheSeedsByShell = await collectComposableCacheSeeds(
     ctx.outputs,
     fallbackShellRoutes,
+    ctx.distDir,
   );
   const composableCacheSeedEntries = Array.from(composableCacheSeedsByShell.entries());
   const composableCacheSeedCount = composableCacheSeedEntries.reduce(
@@ -1365,6 +1367,23 @@ async function collectFallbackShellRoutes(
   }
 }
 
+async function readAppRouteMeta(
+  distDir: string,
+  pathname: string,
+): Promise<any | null> {
+  try {
+    const metaPath = path.join(
+      distDir,
+      "server",
+      "app",
+      pathname.replace(/^\/+/, "") + ".meta",
+    );
+    return JSON.parse(await fs.readFile(metaPath, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Collect prerender entries from build outputs for App Router PPR/cache seeding.
  * Pages Router prerenders are served from assets and don't need to be embedded
@@ -1373,6 +1392,7 @@ async function collectFallbackShellRoutes(
 async function collectPrerenderEntries(
   outputs: BuildContext["outputs"],
   fallbackShellRoutes: Set<string> | null,
+  distDir: string,
 ): Promise<PrerenderEntry[]> {
   const entries: PrerenderEntry[] = [];
   // The Next adapter emits one \`prerenders\` entry per output file — including
@@ -1383,9 +1403,20 @@ async function collectPrerenderEntries(
   for (const prerender of outputs.prerenders) {
     const fallback = prerender.fallback;
     if (!fallback?.filePath || !fallback.filePath.endsWith(".html")) continue;
-    const hasPostponedState =
+    const metaPath = fallback.filePath.replace(/\.(html|body)$/, ".meta");
+    const meta = await fs.readFile(metaPath, "utf-8")
+      .then((raw) => JSON.parse(raw))
+      .catch(() => null);
+    const postponedState =
       typeof fallback.postponedState === "string" &&
-      fallback.postponedState.length > 0;
+      fallback.postponedState.length > 0
+        ? fallback.postponedState
+        : typeof meta?.postponed === "string" && meta.postponed.length > 0
+          ? meta.postponed
+          : undefined;
+    const hasPostponedState =
+      typeof postponedState === "string" &&
+      postponedState.length > 0;
     const hasPprHeaders = !!prerender.pprChain?.headers;
     const isPprChain = hasPostponedState || hasPprHeaders;
     // Skip bracket-form fallback shells — they're handled via the
@@ -1394,10 +1425,6 @@ async function collectPrerenderEntries(
 
     try {
       const stat = await fs.stat(fallback.filePath).catch(() => null);
-      const metaPath = fallback.filePath.replace(/\.(html|body)$/, ".meta");
-      const meta = await fs.readFile(metaPath, "utf-8")
-        .then((raw) => JSON.parse(raw))
-        .catch(() => null);
       // Never inline HTML into the worker bundle — it can be multi-MB
       // (e.g. memory-pressure pages are ~2MB each). \`__creekSeededAppPageEntry\`
       // fetches HTML and RSC from the assets bucket at request time. The seed
@@ -1405,7 +1432,7 @@ async function collectPrerenderEntries(
       entries.push({
         pathname: prerender.pathname,
         html: "",
-        postponedState: fallback.postponedState,
+        postponedState,
         allowsFallbackShellResume:
           prerender.config?.partialFallback === true &&
           (fallbackShellRoutes
@@ -1425,6 +1452,35 @@ async function collectPrerenderEntries(
       });
     } catch {
       // Skip prerenders whose fallback file can't be read
+    }
+  }
+
+  // Some App Router fallback shells (notably cacheComponents routes without
+  // generateStaticParams) are present in prerender-manifest + .meta but are not
+  // surfaced with fallback.postponedState in the adapter outputs. Add minimal
+  // entries from .meta so the worker can still inject requestMeta.postponed.
+  if (fallbackShellRoutes) {
+    const existing = new Set(entries.map((entry) => entry.pathname));
+    for (const pathname of fallbackShellRoutes) {
+      if (existing.has(pathname)) continue;
+      const meta = await readAppRouteMeta(distDir, pathname);
+      if (typeof meta?.postponed !== "string" || meta.postponed.length === 0) continue;
+      entries.push({
+        pathname,
+        html: "",
+        postponedState: meta.postponed,
+        allowsFallbackShellResume: true,
+        initialStatus: typeof meta.status === "number" ? meta.status : undefined,
+        initialHeaders:
+          meta.headers && typeof meta.headers === "object"
+            ? meta.headers
+            : undefined,
+        segmentPaths: Array.isArray(meta.segmentPaths) ? meta.segmentPaths : undefined,
+        metaHeaders:
+          meta.headers && typeof meta.headers === "object"
+            ? meta.headers
+            : undefined,
+      });
     }
   }
 
@@ -1466,6 +1522,7 @@ export interface ComposableCacheSeed {
 async function collectComposableCacheSeeds(
   outputs: BuildContext["outputs"],
   fallbackShellRoutes: Set<string> | null,
+  distDir: string,
 ): Promise<Map<string, ComposableCacheSeed[]>> {
   const zlib = await import("node:zlib");
   // Map bracket-form pathname → its cache entries. Gating by shell prevents
@@ -1473,29 +1530,20 @@ async function collectComposableCacheSeeds(
   // unrelated requests (e.g. \`/with-suspense/*\`'s build-time "buildtime"
   // leaking into \`/without-suspense/*\` where the test expects "runtime").
   const byShell = new Map<string, ComposableCacheSeed[]>();
-  for (const prerender of outputs.prerenders) {
-    const isPartialFallback = prerender.config?.partialFallback === true;
-    if (
-      prerender.pathname.includes("[") &&
-      (!isPartialFallback ||
-        (fallbackShellRoutes && !fallbackShellRoutes.has(prerender.pathname)))
-    ) {
-      continue;
-    }
-    const postponed = prerender.fallback?.postponedState;
-    if (typeof postponed !== "string" || postponed.length === 0) continue;
+
+  const extractSeedsFromPostponed = (postponed: string): ComposableCacheSeed[] | null => {
     const m = postponed.match(/^(\d+):/);
-    if (!m) continue;
+    if (!m) return null;
     const prefixLen = m[0].length;
     const postponedLen = parseInt(m[1], 10);
     const cacheBlob = postponed.slice(prefixLen + postponedLen);
-    if (!cacheBlob || cacheBlob === "null") continue;
+    if (!cacheBlob || cacheBlob === "null") return null;
     try {
       const buf = Buffer.from(cacheBlob, "base64");
       const inflated = zlib.inflateSync(buf, { maxOutputLength: 200 * 1024 * 1024 });
       const json = JSON.parse(inflated.toString("utf-8"));
       const cacheStore = json?.store?.cache;
-      if (!cacheStore || typeof cacheStore !== "object") continue;
+      if (!cacheStore || typeof cacheStore !== "object") return null;
       const shellSeeds: ComposableCacheSeed[] = [];
       for (const [key, serialized] of Object.entries<any>(cacheStore)) {
         if (!serialized?.entry) continue;
@@ -1510,9 +1558,50 @@ async function collectComposableCacheSeeds(
           revalidate: typeof e.revalidate === "number" ? e.revalidate : Number.MAX_SAFE_INTEGER,
         });
       }
-      if (shellSeeds.length > 0) byShell.set(prerender.pathname, shellSeeds);
-    } catch {}
+      return shellSeeds.length > 0 ? shellSeeds : null;
+    } catch {
+      return null;
+    }
+  };
+
+  for (const prerender of outputs.prerenders) {
+    const isPartialFallback = prerender.config?.partialFallback === true;
+    if (
+      prerender.pathname.includes("[") &&
+      (!isPartialFallback ||
+        (fallbackShellRoutes && !fallbackShellRoutes.has(prerender.pathname)))
+    ) {
+      continue;
+    }
+    let postponed = prerender.fallback?.postponedState;
+    if (
+      (typeof postponed !== "string" || postponed.length === 0) &&
+      prerender.fallback?.filePath
+    ) {
+      const metaPath = prerender.fallback.filePath.replace(/\.(html|body)$/, ".meta");
+      const metaPostponed = await fs.readFile(metaPath, "utf-8")
+        .then((raw) => JSON.parse(raw)?.postponed)
+        .catch(() => null);
+      if (typeof metaPostponed === "string" && metaPostponed.length > 0) {
+        postponed = metaPostponed;
+      }
+    }
+    if (typeof postponed !== "string" || postponed.length === 0) continue;
+    const shellSeeds = extractSeedsFromPostponed(postponed);
+    if (shellSeeds) byShell.set(prerender.pathname, shellSeeds);
   }
+
+  if (fallbackShellRoutes) {
+    for (const pathname of fallbackShellRoutes) {
+      if (byShell.has(pathname)) continue;
+      const meta = await readAppRouteMeta(distDir, pathname);
+      const postponed = meta?.postponed;
+      if (typeof postponed !== "string" || postponed.length === 0) continue;
+      const shellSeeds = extractSeedsFromPostponed(postponed);
+      if (shellSeeds) byShell.set(pathname, shellSeeds);
+    }
+  }
+
   return byShell;
 }
 

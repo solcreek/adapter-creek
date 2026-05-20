@@ -2204,6 +2204,7 @@ function __creekGetIncrementalCache(requestHeaders) {
 class CreekComposableCacheHandler {
   constructor() {
     if (!globalThis.__CREEK_CC_STORE) globalThis.__CREEK_CC_STORE = new Map();
+    if (!globalThis.__CREEK_CC_PENDING) globalThis.__CREEK_CC_PENDING = new Map();
     if (!globalThis.__CREEK_CC_TAG_STATE) globalThis.__CREEK_CC_TAG_STATE = new Map();
   }
 
@@ -2248,7 +2249,13 @@ class CreekComposableCacheHandler {
       }
     } catch {}
 
-    const entry = globalThis.__CREEK_CC_STORE.get(cacheKey);
+    let entry = globalThis.__CREEK_CC_STORE.get(cacheKey);
+    if (!entry) {
+      const pending = globalThis.__CREEK_CC_PENDING.get(cacheKey);
+      if (pending) {
+        try { entry = await pending; } catch {}
+      }
+    }
     if (!entry) return undefined;
 
     // Tag staleness check: an entry is stale iff a tag it depends on was
@@ -2316,31 +2323,43 @@ class CreekComposableCacheHandler {
   }
 
   async set(cacheKey, pendingEntry) {
-    const entry = await pendingEntry;
-    // Drain the ReadableStream into a Uint8Array for storage.
-    const reader = entry.value.getReader();
-    const chunks = [];
-    let total = 0;
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      total += value.byteLength;
+    const pending = (async () => {
+      const entry = await pendingEntry;
+      // Drain the ReadableStream into a Uint8Array for storage.
+      const reader = entry.value.getReader();
+      const chunks = [];
+      let total = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        total += value.byteLength;
+      }
+      const buf = new Uint8Array(total);
+      let offset = 0;
+      for (const chunk of chunks) {
+        buf.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      const stored = {
+        value: buf,
+        tags: entry.tags || [],
+        stale: entry.stale,
+        timestamp: entry.timestamp != null ? entry.timestamp : Date.now(),
+        expire: entry.expire,
+        revalidate: entry.revalidate,
+      };
+      globalThis.__CREEK_CC_STORE.set(cacheKey, stored);
+      return stored;
+    })();
+    globalThis.__CREEK_CC_PENDING.set(cacheKey, pending);
+    try {
+      await pending;
+    } finally {
+      if (globalThis.__CREEK_CC_PENDING.get(cacheKey) === pending) {
+        globalThis.__CREEK_CC_PENDING.delete(cacheKey);
+      }
     }
-    const buf = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      buf.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    globalThis.__CREEK_CC_STORE.set(cacheKey, {
-      value: buf,
-      tags: entry.tags || [],
-      stale: entry.stale,
-      timestamp: entry.timestamp != null ? entry.timestamp : Date.now(),
-      expire: entry.expire,
-      revalidate: entry.revalidate,
-    });
   }
 
   async refreshTags() {
@@ -3446,6 +3465,28 @@ async function __withMinimalWorkStore(pagePath, ctx, fn) {
 }
 
 const __INTERNAL_FETCH_CONTEXT = new AsyncLocalStorage();
+const __CREEK_NATIVE_DATE = globalThis.Date;
+function __creekRequestNow() {
+  try {
+    const frozenNow = __INTERNAL_FETCH_CONTEXT.getStore()?.frozenNow;
+    if (typeof frozenNow === "number") return frozenNow;
+  } catch {}
+  return __CREEK_NATIVE_DATE.now();
+}
+function __CreekDate(...args) {
+  if (new.target) {
+    return args.length === 0
+      ? new __CREEK_NATIVE_DATE(__creekRequestNow())
+      : new __CREEK_NATIVE_DATE(...args);
+  }
+  return new __CREEK_NATIVE_DATE(__creekRequestNow()).toString();
+}
+Object.setPrototypeOf(__CreekDate, __CREEK_NATIVE_DATE);
+__CreekDate.prototype = __CREEK_NATIVE_DATE.prototype;
+__CreekDate.now = __creekRequestNow;
+__CreekDate.parse = __CREEK_NATIVE_DATE.parse;
+__CreekDate.UTC = __CREEK_NATIVE_DATE.UTC;
+globalThis.Date = __CreekDate;
 globalThis.fetch = function(input, init) {
   // workerd rejects every standard Fetch API cache mode except
   // \`no-store\` with \`TypeError: Unsupported cache mode\` (including
@@ -3810,6 +3851,7 @@ async function __handleRequestInner(request, env, ctx) {
       // semantics (JSON response, x-nextjs-data header) are preserved
       // by checking BASE_PATH-aware url.pathname later.
       let staticPagesDataRoutePath = null;
+      let pagesFallbackDataRoutePath = null;
       if (assetPath.startsWith("/_next/data/")) {
         const dataMatch = assetPath.match(/^\\/_next\\/data\\/([^/]+)\\/(.+)\\.json$/);
         if (dataMatch && dataMatch[1] === BUILD_ID) {
@@ -3839,6 +3881,18 @@ async function __handleRequestInner(request, env, ctx) {
           nextDataAppRouterPath = candidate;
           if (handler && (handler.type === "PAGES" || handler.type === "PAGES_API")) {
             staticPagesDataRoutePath = handler.pathname || lookup;
+          } else {
+            const dyn = __matchDynamicRoute(candidate);
+            const dynHandler = dyn ? HANDLERS[dyn.page] : null;
+            if (dynHandler && dynHandler.type === "PAGES") {
+              try {
+                const prerenderManifest = __getPrerenderManifest();
+                const dynamicRoute = prerenderManifest?.dynamicRoutes?.[dyn.page];
+                if (typeof dynamicRoute?.fallback === "string" && dynamicRoute.fallback.endsWith(".html")) {
+                  pagesFallbackDataRoutePath = dynHandler.pathname || dyn.page;
+                }
+              } catch {}
+            }
           }
           // For purely static Pages Router pages (no getStaticProps /
           // getServerSideProps), Next.js doesn't register a handler — the
@@ -5448,11 +5502,67 @@ async function __handleRequestInner(request, env, ctx) {
           // response) instead of serving the neutral build-time shell —
           // breaking app-prefetch "should not unintentionally modify the
           // requested prefetch by escaping the uri encoded query params".
-          const baseAssetPath = staticAssetPath === "/index.html"
-            ? "/index"
-            : staticAssetPath.endsWith("/index.html")
-              ? staticAssetPath.replace(/\\/index\\.html$/, "")
-              : staticAssetPath.replace(/\\.html$/, "");
+          const staticBaseFromAssetPath = (assetPath) => {
+            if (assetPath === "/index.html") return "/index";
+            return assetPath.endsWith("/index.html")
+              ? assetPath.replace(/\\/index\\.html$/, "")
+              : assetPath.replace(/\\.html$/, "");
+          };
+          const rscBaseAssetPaths = [];
+          const addRscBaseAssetPath = (basePath) => {
+            if (typeof basePath === "string" && basePath && !rscBaseAssetPaths.includes(basePath)) {
+              rscBaseAssetPaths.push(basePath);
+            }
+          };
+          if (staticEntry?.routerType === "APP") {
+            try {
+              const prerenderManifest = __getPrerenderManifest();
+              const routeCandidates = [];
+              const addRouteCandidate = (pathname) => {
+                if (typeof pathname !== "string" || !pathname.startsWith("/")) return;
+                if (!routeCandidates.includes(pathname)) routeCandidates.push(pathname);
+                if (pathname !== "/" && pathname.endsWith("/")) {
+                  const stripped = pathname.slice(0, -1);
+                  if (!routeCandidates.includes(stripped)) routeCandidates.push(stripped);
+                }
+                try {
+                  const decoded = decodeURIComponent(pathname);
+                  if (!routeCandidates.includes(decoded)) routeCandidates.push(decoded);
+                } catch {}
+                if (BASE_PATH && (pathname === BASE_PATH || pathname.startsWith(BASE_PATH + "/"))) {
+                  const withoutBase = pathname.slice(BASE_PATH.length) || "/";
+                  if (!routeCandidates.includes(withoutBase)) routeCandidates.push(withoutBase);
+                }
+              };
+              addRouteCandidate(servePath);
+              addRouteCandidate(url.pathname);
+              addRouteCandidate(decodedPathname);
+              if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+                for (const pathname of [...routeCandidates]) {
+                  const firstSeg = pathname.split("/")[1] || "";
+                  if (!I18N.locales.includes(firstSeg)) {
+                    addRouteCandidate("/" + (I18N.defaultLocale || I18N.locales[0]) + (pathname === "/" ? "" : pathname));
+                  }
+                }
+              }
+              for (const pathname of routeCandidates) {
+                const routeEntry = prerenderManifest?.routes?.[pathname];
+                if (!routeEntry) continue;
+                const dataRoute =
+                  typeof routeEntry.prefetchDataRoute === "string"
+                    ? routeEntry.prefetchDataRoute
+                    : typeof routeEntry.dataRoute === "string"
+                      ? routeEntry.dataRoute
+                      : null;
+                if (dataRoute?.endsWith(".rsc")) {
+                  addRscBaseAssetPath(dataRoute.slice(0, -4));
+                } else {
+                  addRscBaseAssetPath(pathname === "/" ? "/index" : pathname);
+                }
+              }
+            } catch {}
+          }
+          addRscBaseAssetPath(staticBaseFromAssetPath(staticAssetPath));
           // Segment prefetch — Next.js client sends
           // \`next-router-segment-prefetch: /blog/[author]/__PAGE__\` during
           // Link-driven partial prefetches and expects just THAT segment,
@@ -5473,38 +5583,40 @@ async function __handleRequestInner(request, env, ctx) {
               .replace(/\\[([^\\]]+)\\]/g, "$d$$$1");         // [slug] → $d$slug
             // \`segmentHeader\` starts with "/", strip leading slash for path join.
             const segmentTail = normalizedSegment.replace(/^\\//, "");
-            const segmentAssetPath = baseAssetPath + ".segments/" + segmentTail + ".segment.rsc";
-            const segmentRes = await env.ASSETS.fetch(
-              new Request(new URL(segmentAssetPath, url.origin), { headers: request.headers })
-            );
-            if (segmentRes.status === 304) return segmentRes;
-            if (segmentRes.ok) {
-              const headers = new Headers(segmentRes.headers);
-              headers.set("content-type", "text/x-component");
-              headers.set("Vary", "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch");
-              headers.set("x-nextjs-postponed", "2");
-              headers.set("x-nextjs-prerender", "1");
-              headers.set("x-nextjs-deployment-id", DEPLOYMENT_ID);
-              // Match vanilla's \`Cache-Control: s-maxage=31536000\` for
-              // prerendered RSC segments. The Workers Assets default of
-              // \`public, max-age=0, must-revalidate\` makes the browser
-              // revalidate on every reuse, which bypasses the Next client's
-              // segment cache on some transitions.
-              headers.set("cache-control", "s-maxage=31536000");
-              if (staticEntry?.cacheTags) {
-                headers.set("x-next-cache-tags", String(staticEntry.cacheTags));
+            for (const baseAssetPath of rscBaseAssetPaths) {
+              const segmentAssetPath = baseAssetPath + ".segments/" + segmentTail + ".segment.rsc";
+              const segmentRes = await env.ASSETS.fetch(
+                new Request(new URL(segmentAssetPath, url.origin), { headers: request.headers })
+              );
+              if (segmentRes.status === 304) return segmentRes;
+              if (segmentRes.ok) {
+                const headers = new Headers(segmentRes.headers);
+                headers.set("content-type", "text/x-component");
+                headers.set("Vary", "rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch");
+                headers.set("x-nextjs-postponed", "2");
+                headers.set("x-nextjs-prerender", "1");
+                headers.set("x-nextjs-deployment-id", DEPLOYMENT_ID);
+                // Match vanilla's \`Cache-Control: s-maxage=31536000\` for
+                // prerendered RSC segments. The Workers Assets default of
+                // \`public, max-age=0, must-revalidate\` makes the browser
+                // revalidate on every reuse, which bypasses the Next client's
+                // segment cache on some transitions.
+                headers.set("cache-control", "s-maxage=31536000");
+                if (staticEntry?.cacheTags) {
+                  headers.set("x-next-cache-tags", String(staticEntry.cacheTags));
+                }
+                return new Response(segmentRes.body, {
+                  status: segmentRes.status,
+                  statusText: segmentRes.statusText,
+                  headers,
+                });
               }
-              return new Response(segmentRes.body, {
-                status: segmentRes.status,
-                statusText: segmentRes.statusText,
-                headers,
-              });
             }
             // Fall through to full RSC if the segment file isn't there.
           }
 
-          const rscAssetPath = baseAssetPath + ".rsc";
-          if (rscAssetPath !== staticAssetPath) {
+          for (const baseAssetPath of rscBaseAssetPaths) {
+            const rscAssetPath = baseAssetPath + ".rsc";
             const rscRes = await env.ASSETS.fetch(
               new Request(new URL(rscAssetPath, url.origin), { headers: request.headers })
             );
@@ -5905,13 +6017,6 @@ async function __handleRequestInner(request, env, ctx) {
             // unmatched paths must invoke pages/404 so _app props are present.
             resolvedPathname = "/404";
             if (!result.status) result = { ...result, status: 404 };
-          } else if (HANDLERS["/_error"]) {
-            // Apps without a user pages/404 still have Next's generated
-            // pages/_error handler in pages-manifest.json. Invoke it for
-            // unmatched Pages Router URLs so _app.getInitialProps and the
-            // default client error behavior match Next.
-            resolvedPathname = "/_error";
-            if (!result.status) result = { ...result, status: 404 };
           } else {
             // Try static 404 page from assets. For basePath apps the
             // 404 HTML is at /docs/404/index.html — prepend BASE_PATH
@@ -5953,10 +6058,20 @@ async function __handleRequestInner(request, env, ctx) {
                 }
               }
             } catch {}
-            if (!fallbackHeaders.has("content-type")) {
-              fallbackHeaders.set("content-type", "text/plain; charset=utf-8");
+            if (HANDLERS["/_error"]) {
+              // Apps without a user pages/404 still have Next's generated
+              // pages/_error handler in pages-manifest.json. Invoke it only
+              // after static /404 lookup fails; static custom 404 pages are
+              // emitted as assets and otherwise get shadowed by generated
+              // /_error.
+              resolvedPathname = "/_error";
+              if (!result.status) result = { ...result, status: 404 };
+            } else {
+              if (!fallbackHeaders.has("content-type")) {
+                fallbackHeaders.set("content-type", "text/plain; charset=utf-8");
+              }
+              return new Response("Not Found", { status: 404, headers: fallbackHeaders });
             }
-            return new Response("Not Found", { status: 404, headers: fallbackHeaders });
           }
         }
       }
@@ -6293,10 +6408,10 @@ async function __handleRequestInner(request, env, ctx) {
         __invokedResponse &&
         __invokedResponse.status === 200 &&
         handler.type === "PAGES" &&
-        staticPagesDataRoutePath &&
+        (staticPagesDataRoutePath || pagesFallbackDataRoutePath) &&
         handler.pathname.includes("[")
       ) {
-        __creekMarkGeneratedFallbackPath(staticPagesDataRoutePath);
+        __creekMarkGeneratedFallbackPath(staticPagesDataRoutePath || pagesFallbackDataRoutePath);
       }
       // For Pages Router page errors (status 500 from getServerSideProps
       // throwing) on a NON-data URL navigation, replace our generic JSON
@@ -7899,6 +8014,14 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   // re-running every \`'use cache'\` function — which is what was leaking
   // runtime timestamps into layouts and producing hydration mismatches.
   const __postponedForThisPath = __creekPostponedForPathname(url.pathname);
+  if (__postponedForThisPath) {
+    try {
+      const store = __INTERNAL_FETCH_CONTEXT.getStore();
+      if (store && typeof store.frozenNow !== "number") {
+        store.frozenNow = __CREEK_NATIVE_DATE.now();
+      }
+    } catch {}
+  }
   req[NEXT_REQUEST_META] = {
     initURL: request.url,
     initProtocol: url.protocol.replace(/:+$/, ""),
@@ -8192,13 +8315,17 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       return origAddListener(event, listener);
     };
     res.once = function(event, listener) {
+      // Do not run one-shot close listeners during the synthetic pre-finish
+      // close. Next's pipeToNodeResponse installs its abort controller with
+      // once("close"); firing that early aborts React/Flight streaming and
+      // leaves metadata/Suspense placeholders unresolved.
       if (event !== "close") return origOnce(event, listener);
       if (typeof listener !== "function") return res;
       const wrapped = (...args) => {
         try { res.off("close", wrapped); } catch {}
         return listener.apply(res, args);
       };
-      return captureCloseListener(wrapped);
+      return origOn("close", wrapped);
     };
   }
   function runSyntheticCloseListeners() {
