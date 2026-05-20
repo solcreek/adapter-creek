@@ -727,6 +727,8 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       // to our shim that reads from embedded __MANIFESTS.
       "fs": path.join(adapterDir, "src", "shims", "fs.js"),
       "node:fs": path.join(adapterDir, "src", "shims", "fs.js"),
+      "fs/promises": path.join(adapterDir, "src", "shims", "fs.js"),
+      "node:fs/promises": path.join(adapterDir, "src", "shims", "fs.js"),
       "vm": path.join(adapterDir, "src", "shims", "vm.js"),
       "node:vm": path.join(adapterDir, "src", "shims", "vm.js"),
       // critters is bundled by Next.js for CSS inlining — not needed on Workers.

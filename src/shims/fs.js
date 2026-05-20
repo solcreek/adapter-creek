@@ -234,6 +234,15 @@ export const promises = {
   rm: async () => {},
 };
 
+export const readFile = promises.readFile;
+export const writeFile = promises.writeFile;
+export const mkdir = promises.mkdir;
+export const readdir = promises.readdir;
+export const stat = promises.stat;
+export const access = promises.access;
+export const unlink = promises.unlink;
+export const rm = promises.rm;
+
 export default {
   existsSync, readFileSync, readAll, writeFileSync, mkdirSync, unlinkSync,
   readdirSync, realpathSync, statSync, accessSync, createReadStream, createWriteStream,

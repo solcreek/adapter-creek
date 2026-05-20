@@ -2898,6 +2898,17 @@ function __creekActionHasWorkerForPage(actionId, pageName) {
   }
 }
 
+function __creekActionExists(actionId) {
+  if (!actionId) return false;
+  try {
+    const manifests = globalThis[Symbol.for("next.server.manifests")];
+    const manifest = manifests?.serverActionsManifest;
+    return !!(manifest?.node?.[actionId] || manifest?.edge?.[actionId]);
+  } catch {
+    return false;
+  }
+}
+
 
 const HANDLERS = {
 ${handlerEntries}
@@ -3072,12 +3083,18 @@ import * as __middleware_mod from ${JSON.stringify(opts.outputs.middleware.fileP
 import { NextRequest as __CreekNextRequest } from "next/server";
 const middlewareHandler = async (mwCtx) => {
   try {
-    const handler =
-      __middleware_mod.proxy ||
-      __middleware_mod.middleware ||
-      __middleware_mod.handler ||
-      __middleware_mod.default;
-    if (typeof handler !== "function") return {};
+    const compiledHandler = typeof __middleware_mod.handler === "function"
+      ? __middleware_mod.handler
+      : null;
+    const userlandHandler =
+      typeof __middleware_mod.proxy === "function"
+        ? __middleware_mod.proxy
+        : typeof __middleware_mod.middleware === "function"
+          ? __middleware_mod.middleware
+          : (!compiledHandler && typeof __middleware_mod.default === "function"
+            ? __middleware_mod.default
+            : null);
+    if (!compiledHandler && !userlandHandler) return {};
     // Mirror the edge middleware path: strip flight headers and the _rsc
     // search param so middleware sees a clean request.
     const FLIGHT_HEADERS = [
@@ -3119,10 +3136,14 @@ const middlewareHandler = async (mwCtx) => {
         }
       } catch {}
     }
-    const mwReq = new __CreekNextRequest(mwUrlClean, {
+    const requestInit = {
       method: mwCtx.method || (mwBodyBuffer ? "POST" : "GET"),
       headers: mwHeaders,
       body: mwCtx.method === "GET" || mwCtx.method === "HEAD" ? undefined : mwBodyBuffer,
+      ...(mwCtx.method !== "GET" && mwCtx.method !== "HEAD" && mwBodyBuffer ? { duplex: "half" } : {}),
+    };
+    const mwReq = compiledHandler ? new Request(mwUrlClean, requestInit) : new __CreekNextRequest(mwUrlClean, {
+      ...requestInit,
       nextConfig: {
         basePath: BASE_PATH || undefined,
         i18n: I18N || undefined,
@@ -3139,7 +3160,23 @@ const middlewareHandler = async (mwCtx) => {
         } catch {}
       },
     };
-    const response = await __withNodeMiddlewareEnv(() => handler(mwReq, mwInvokeCtx));
+    const response = await __withNodeMiddlewareEnv(() => {
+      if (compiledHandler) {
+        return compiledHandler(mwReq, {
+          waitUntil: mwInvokeCtx.waitUntil,
+          signal: undefined,
+          requestMeta: {
+            initProtocol: mwUrlClean.protocol.replace(/:$/, ""),
+            initURL: mwUrlClean.toString(),
+          },
+        });
+      }
+      return userlandHandler(mwReq, mwInvokeCtx);
+    });
+    if (!response || !(response instanceof Response)) {
+      console.error("[creek-mw-node] handler returned non-Response:", typeof response, response);
+      return {};
+    }
     const mwResult = responseToMiddlewareResult(response, mwHeaders, mwCtx.url);
     mwResult.__mwResponse = response;
     // See edge variant for rationale: restore flight headers so the page
@@ -3151,7 +3188,8 @@ const middlewareHandler = async (mwCtx) => {
       }
     }
     return mwResult;
-  } catch {
+  } catch (err) {
+    console.error("[creek-mw-node] Error:", err instanceof Error ? err.stack || err.message : String(err));
     return {};
   }
 };
@@ -5074,13 +5112,22 @@ async function __handleRequestInner(request, env, ctx) {
             if (rp === "/") isRoot = true;
           } catch {}
         }
+        const basePathStaticRoot = BASE_PATH
+          ? (STATIC_PAGES[BASE_PATH] || STATIC_PAGES[BASE_PATH + "/index"])
+          : null;
         if (
           isRoot &&
           BASE_PATH &&
           (url.pathname === BASE_PATH || url.pathname === BASE_PATH + "/") &&
-          (STATIC_PAGES["/"] || HANDLERS["/index"] || HANDLERS["/"])
+          (STATIC_PAGES["/"] || basePathStaticRoot || HANDLERS["/index"] || HANDLERS["/"])
         ) {
-          resolvedPathname = HANDLERS["/index"] ? "/index" : "/";
+          resolvedPathname = HANDLERS["/index"]
+            ? "/index"
+            : HANDLERS["/"]
+              ? "/"
+              : STATIC_PAGES["/"]
+                ? "/"
+                : (STATIC_PAGES[BASE_PATH] ? BASE_PATH : BASE_PATH + "/index");
           result = {
             ...result,
             resolvedPathname,
@@ -6193,6 +6240,9 @@ async function __handleRequestInner(request, env, ctx) {
 
       const actionId = request.headers.get("next-action");
       if (actionId && handler.type === "APP_PAGE") {
+        if (!__creekActionExists(actionId)) {
+          return __creekActionNotFoundResponse();
+        }
         const rewritePath = typeof result?.mwRewrite === "string"
           ? result.mwRewrite.split("?")[0]
           : "";
