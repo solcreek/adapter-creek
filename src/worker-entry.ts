@@ -305,6 +305,59 @@ if (typeof globalThis.Request === "function") {
   globalThis.Request = __PatchedRequest;
 }
 
+// Next.js Cache Components coordinates groups of timers by reading and
+// mutating Node's private Timer#_idleStart field. workerd exposes Web timers,
+// so provide a tiny Node-shaped handle while still delegating scheduling to the
+// native runtime.
+if (
+  typeof globalThis.setTimeout === "function" &&
+  typeof globalThis.clearTimeout === "function" &&
+  !globalThis.__CREEK_TIMER_COMPAT_INSTALLED
+) {
+  globalThis.__CREEK_TIMER_COMPAT_INSTALLED = true;
+  const __creekNativeSetTimeout = globalThis.setTimeout.bind(globalThis);
+  const __creekNativeClearTimeout = globalThis.clearTimeout.bind(globalThis);
+  let __creekTimerIdleStart = 1;
+  const __creekTimerNativeHandle = Symbol("creek.timer.nativeHandle");
+  const __creekNextIdleStart = () => __creekTimerIdleStart++;
+  const __creekEnsureIdleStart = (timer) => {
+    try {
+      if (!timer || typeof timer !== "object") return timer;
+      if (!("_idleStart" in timer) || typeof timer._idleStart !== "number") {
+        timer._idleStart = __creekNextIdleStart();
+      }
+      return timer;
+    } catch {
+      return timer;
+    }
+  };
+  globalThis.setTimeout = function __creekSetTimeout(callback, delay, ...args) {
+    const nativeHandle = __creekNativeSetTimeout(callback, delay, ...args);
+    if (nativeHandle && typeof nativeHandle === "object") {
+      return __creekEnsureIdleStart(nativeHandle);
+    }
+    const handle = {
+      [__creekTimerNativeHandle]: nativeHandle,
+      _idleStart: __creekNextIdleStart(),
+      ref() { return this; },
+      unref() { return this; },
+      hasRef() { return true; },
+      refresh() { return this; },
+      valueOf() { return nativeHandle; },
+      toString() { return String(nativeHandle); },
+      [Symbol.toPrimitive]() { return nativeHandle; },
+    };
+    return handle;
+  };
+  globalThis.clearTimeout = function __creekClearTimeout(timer) {
+    const nativeHandle =
+      timer && typeof timer === "object" && __creekTimerNativeHandle in timer
+        ? timer[__creekTimerNativeHandle]
+        : timer;
+    return __creekNativeClearTimeout(nativeHandle);
+  };
+}
+
 // Align Headers.prototype[Symbol.iterator] with \`entries\` so that its
 // \`.name\` reads \`"entries"\`. Node's undici (which Next.js bundles for
 // server-side fetch on Node) implements \`Headers\` with
@@ -6382,7 +6435,10 @@ async function __handleRequestInner(request, env, ctx) {
         const __applyMwResponseHeaders = (edgeRes) => {
           if (!(edgeRes instanceof Response)) return edgeRes;
           let status = edgeRes.status;
-          if (edgeRes.headers.get("x-action-redirect")) {
+          if (
+            edgeRes.headers.get("x-action-redirect") &&
+            request.headers.get("x-action-forwarded") !== "1"
+          ) {
             status = 303;
           } else if (edgeRes.headers.get("x-nextjs-action-not-found") === "1") {
             status = 404;
@@ -8557,10 +8613,11 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     // text/x-component, the client tries to apply an empty/invalid RSC stream
     // and lands in the App Router error UI instead of hard-navigating.
     const actionRedirect = h.get("x-action-redirect");
-    if (actionRedirect) {
+    if (actionRedirect && request.headers.get("x-action-forwarded") !== "1") {
       status = 303;
     } else if (h.get("x-nextjs-action-not-found") === "1") {
       status = 404;
+      h.set("content-type", "text/plain; charset=utf-8");
     }
     if (actionRedirect) {
       const redirectTarget = actionRedirect.split(";")[0] || "";
@@ -8762,7 +8819,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     if (doctypeIdx === -1) {
       // Still no doctype — buffer and wait for the next chunk.
       __preDoctypeBuffer = __preDoctypeBuffer
-        ? __mergeBytes(__preDoctypeBuffer, chunk)
+        ? __mergeBytes(__preDoctypeBuffer, chunk.slice())
         : chunk.slice();
       return null;
     }
