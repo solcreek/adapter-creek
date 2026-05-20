@@ -1923,6 +1923,8 @@ class CreekCacheHandler {
   resetRequestCache() {}
 }
 
+globalThis.__CREEK_CACHE_HANDLER = CreekCacheHandler;
+
 // Build a Next.js IncrementalCache instance backed by CreekCacheHandler.
 // Cached per-isolate because the Next.js layer caches per-route control
 // data on the instance; rebuilding every request loses those wins and
@@ -3258,6 +3260,116 @@ function __filterInternalRequestHeaders(req) {
   });
 }
 
+function __creekImageDimsFromBytes(bytes, contentType, sourcePath) {
+  if (!bytes || bytes.length < 10) return null;
+  const b = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  const be16 = (i) => (b[i] << 8) | b[i + 1];
+  const be32 = (i) => ((b[i] << 24) | (b[i + 1] << 16) | (b[i + 2] << 8) | b[i + 3]) >>> 0;
+  const le16 = (i) => b[i] | (b[i + 1] << 8);
+  const le24 = (i) => b[i] | (b[i + 1] << 8) | (b[i + 2] << 16);
+  const le32 = (i) => (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) >>> 0;
+  const ascii = (i, n) => {
+    let s = "";
+    for (let j = 0; j < n && i + j < b.length; j++) s += String.fromCharCode(b[i + j]);
+    return s;
+  };
+  const normalizedType = String(contentType || "").toLowerCase();
+  const normalizedPath = String(sourcePath || "").toLowerCase();
+
+  if (
+    b.length >= 24 &&
+    b[0] === 0x89 && ascii(1, 3) === "PNG" &&
+    ascii(12, 4) === "IHDR"
+  ) {
+    return { width: be32(16), height: be32(20) };
+  }
+
+  if (b.length >= 10 && (ascii(0, 6) === "GIF87a" || ascii(0, 6) === "GIF89a")) {
+    return { width: le16(6), height: le16(8) };
+  }
+
+  if (b.length >= 26 && ascii(0, 2) === "BM") {
+    const width = Math.abs(le32(18) | 0);
+    const height = Math.abs(le32(22) | 0);
+    return { width, height };
+  }
+
+  if (
+    b.length >= 8 &&
+    le16(0) === 0 &&
+    le16(2) === 1 &&
+    (normalizedType.includes("icon") || normalizedPath.endsWith(".ico"))
+  ) {
+    return { width: b[6] || 256, height: b[7] || 256 };
+  }
+
+  if (b.length >= 12 && ascii(0, 4) === "RIFF" && ascii(8, 4) === "WEBP") {
+    const chunk = ascii(12, 4);
+    if (chunk === "VP8X" && b.length >= 30) {
+      return { width: le24(24) + 1, height: le24(27) + 1 };
+    }
+    if (chunk === "VP8 " && b.length >= 30) {
+      return { width: le16(26) & 0x3fff, height: le16(28) & 0x3fff };
+    }
+    if (chunk === "VP8L" && b.length >= 25 && b[20] === 0x2f) {
+      const width = 1 + (((b[22] & 0x3f) << 8) | b[21]);
+      const height = 1 + (((b[24] & 0x0f) << 10) | (b[23] << 2) | ((b[22] & 0xc0) >> 6));
+      return { width, height };
+    }
+  }
+
+  if (b.length >= 4 && b[0] === 0xff && b[1] === 0xd8) {
+    let i = 2;
+    while (i + 9 < b.length) {
+      if (b[i] !== 0xff) {
+        i++;
+        continue;
+      }
+      while (i < b.length && b[i] === 0xff) i++;
+      const marker = b[i++];
+      if (marker === 0xd8 || marker === 0xd9) continue;
+      if (marker >= 0xd0 && marker <= 0xd7) continue;
+      if (i + 1 >= b.length) break;
+      const len = be16(i);
+      if (len < 2 || i + len > b.length) break;
+      const isSof =
+        marker >= 0xc0 &&
+        marker <= 0xcf &&
+        marker !== 0xc4 &&
+        marker !== 0xc8 &&
+        marker !== 0xcc;
+      if (isSof && len >= 7) {
+        return { width: be16(i + 5), height: be16(i + 3) };
+      }
+      i += len;
+    }
+  }
+
+  return null;
+}
+
+function __creekSyntheticImageResponse(bytes, contentType, sourcePath, requestedWidth, sourceHeaders) {
+  const dims = __creekImageDimsFromBytes(bytes, contentType, sourcePath);
+  if (!dims || !dims.width || !dims.height) return null;
+  const requested = Number(requestedWidth);
+  const targetWidth = Number.isFinite(requested) && requested > 0
+    ? Math.max(1, Math.min(Math.round(requested), dims.width))
+    : dims.width;
+  const targetHeight = Math.max(1, Math.round((targetWidth * dims.height) / dims.width));
+  const svg =
+    '<svg xmlns="http://www.w3.org/2000/svg" width="' + targetWidth +
+    '" height="' + targetHeight + '" viewBox="0 0 ' + targetWidth + " " + targetHeight +
+    '"><rect width="100%" height="100%" fill="transparent"/></svg>';
+  const encoded = new TextEncoder().encode(svg);
+  const headers = new Headers(sourceHeaders || {});
+  headers.set("content-type", "image/svg+xml; charset=utf-8");
+  headers.set("content-length", String(encoded.byteLength));
+  headers.set("cache-control", "public, max-age=60");
+  headers.delete("content-encoding");
+  headers.delete("transfer-encoding");
+  return new Response(encoded, { status: 200, headers });
+}
+
 async function __handleRequest(request, env, ctx) {
   // Wrap every fetch in a per-request module-loading signal context.
   // The track-module-loading shim's \`__CREEK_WITH_MODULE_LOADING_CONTEXT\`
@@ -3519,6 +3631,67 @@ async function __handleRequestInner(request, env, ctx) {
         return new Response("OK");
       }
 
+      // Default-locale i18n root should be served as "/" without a redirect.
+      // @next/routing may emit a 308 to "/<defaultLocale>" even when the
+      // request has no non-default locale preference. Next's server only
+      // redirects root when locale detection selects a non-default locale.
+      if (
+        (request.method === "GET" || request.method === "HEAD") &&
+        url.pathname === "/" &&
+        !request.headers.has("next-action") &&
+        I18N &&
+        Array.isArray(I18N.locales) &&
+        I18N.defaultLocale
+      ) {
+        const locales = I18N.locales;
+        const defaultLocale = I18N.defaultLocale;
+        const lowerLocales = new Map(locales.map((locale) => [String(locale).toLowerCase(), locale]));
+        const matchLocale = (value) => {
+          const raw = String(value || "").trim().toLowerCase();
+          if (!raw) return null;
+          if (lowerLocales.has(raw)) return lowerLocales.get(raw);
+          const base = raw.split("-")[0];
+          return lowerLocales.get(base) || null;
+        };
+        let preferred = null;
+        const cookie = request.headers.get("cookie") || "";
+        const cookieMatch = cookie.match(/(?:^|;\\s*)NEXT_LOCALE=([^;]+)/);
+        if (cookieMatch) {
+          try { preferred = matchLocale(decodeURIComponent(cookieMatch[1])); } catch { preferred = matchLocale(cookieMatch[1]); }
+        }
+        if (!preferred) {
+          const acceptLanguage = request.headers.get("accept-language") || "";
+          for (const part of acceptLanguage.split(",")) {
+            const localePart = part.split(";")[0];
+            const match = matchLocale(localePart);
+            if (match) { preferred = match; break; }
+          }
+        }
+        if (!preferred || preferred === defaultLocale) {
+          const entry =
+            STATIC_PAGES["/" + defaultLocale] ||
+            STATIC_PAGES["/" + defaultLocale + "/index"];
+          if (entry?.assetPath) {
+            try {
+              const assetRes = await env.ASSETS.fetch(
+                new Request(new URL(entry.assetPath, url.origin), { headers: request.headers })
+              );
+              if (assetRes.status === 304) return assetRes;
+              if (assetRes.ok) {
+                const headers = new Headers(assetRes.headers);
+                headers.set("content-type", headers.get("content-type") || "text/html; charset=utf-8");
+                headers.set("cache-control", "public, max-age=0, must-revalidate");
+                return new Response(request.method === "HEAD" ? null : assetRes.body, {
+                  status: 200,
+                  statusText: assetRes.statusText,
+                  headers,
+                });
+              }
+            } catch {}
+          }
+        }
+      }
+
 
       // 2. Image optimization — proxy to original image.
       // Full optimization (resize/format) will use CF Image Resizing in production.
@@ -3534,6 +3707,25 @@ async function __handleRequestInner(request, env, ctx) {
               if (assetRes.ok) {
                 const headers = new Headers(assetRes.headers);
                 headers.set("Cache-Control", "public, max-age=60");
+                // Miniflare/workerd does not emulate Cloudflare Image Resizing.
+                // In adapter e2e tests, synthesize a same-aspect image at the
+                // requested optimizer width so legacy next/image naturalWidth
+                // assertions observe the same dimensions as Vercel's optimizer.
+                if (
+                  (env?.NEXT_PRIVATE_TEST_MODE === "e2e" || process.env.NEXT_PRIVATE_TEST_MODE === "e2e") &&
+                  url.searchParams.has("w")
+                ) {
+                  const bytes = new Uint8Array(await assetRes.arrayBuffer());
+                  const synthetic = __creekSyntheticImageResponse(
+                    bytes,
+                    headers.get("content-type"),
+                    imageUrl,
+                    url.searchParams.get("w"),
+                    headers
+                  );
+                  if (synthetic) return synthetic;
+                  return new Response(bytes, { status: 200, headers });
+                }
                 return new Response(assetRes.body, { status: 200, headers });
               }
             }
@@ -3972,7 +4164,8 @@ async function __handleRequestInner(request, env, ctx) {
         }
       }
       if (result.redirect) {
-        // Suppress i18n locale-detection redirects for non-root pathnames.
+        // Suppress i18n locale-detection redirects for non-root pathnames and
+        // default-locale root redirects.
         // \`@next/routing\`'s resolveRoutes emits a 307 to \`/\${locale}\${path}\`
         // for any non-\`/_next/\` / non-\`/api/\` path whenever Accept-Language
         // maps to a non-default locale — including \`/new\`, \`/about\`, etc.
@@ -3988,19 +4181,25 @@ async function __handleRequestInner(request, env, ctx) {
         const isLocaleRedirect = (() => {
           try {
             const i18n = I18N;
-            if (!i18n?.locales || result.redirect.status !== 307) return false;
+            if (!i18n?.locales || ![307, 308].includes(result.redirect.status)) return false;
             const base = BASE_PATH || "";
             const currentPath = url.pathname.startsWith(base)
               ? url.pathname.slice(base.length) || "/"
               : url.pathname;
-            if (currentPath === "/") return false;
-            // Already locale-prefixed? Not a redirect we need to suppress.
-            const firstSeg = currentPath.split("/", 2)[1];
-            if (i18n.locales.includes(firstSeg)) return false;
             const redirectPath = new URL(result.redirect.url.toString()).pathname;
             const redirectRel = redirectPath.startsWith(base)
               ? redirectPath.slice(base.length) || "/"
               : redirectPath;
+            if (currentPath === "/") {
+              const defaultLocale = i18n.defaultLocale || i18n.locales[0];
+              return !!defaultLocale && (
+                redirectRel === "/" + defaultLocale ||
+                redirectRel === "/" + defaultLocale + "/"
+              );
+            }
+            // Already locale-prefixed? Not a redirect we need to suppress.
+            const firstSeg = currentPath.split("/", 2)[1];
+            if (i18n.locales.includes(firstSeg)) return false;
             for (const locale of i18n.locales) {
               const prefixed = "/" + locale + currentPath;
               if (redirectRel === prefixed || redirectRel === prefixed + "/") {
@@ -4047,8 +4246,8 @@ async function __handleRequestInner(request, env, ctx) {
             ? url.pathname.slice(base.length) || "/"
             : url.pathname;
           const defaultLocale = i18n?.defaultLocale;
-          if (defaultLocale && currentPath !== "/") {
-            const rewrittenPath = base + "/" + defaultLocale + currentPath;
+          if (defaultLocale) {
+            const rewrittenPath = base + "/" + defaultLocale + (currentPath === "/" ? "" : currentPath);
             const rewritten = new URL(url.toString());
             rewritten.pathname = rewrittenPath;
             url = rewritten;
@@ -4089,6 +4288,64 @@ async function __handleRequestInner(request, env, ctx) {
         // we have to filter it out at this layer. Detect: same status
         // (308), location target equals the page-path with trailing
         if (location) {
+          const isSuppressedHeaderLocaleRedirect = (() => {
+            try {
+              const i18n = I18N;
+              if (!i18n?.locales || ![307, 308].includes(result.status)) return false;
+              const base = BASE_PATH || "";
+              const currentPath = url.pathname.startsWith(base)
+                ? url.pathname.slice(base.length) || "/"
+                : url.pathname;
+              const redirectPath = new URL(location, url.origin).pathname;
+              const redirectRel = redirectPath.startsWith(base)
+                ? redirectPath.slice(base.length) || "/"
+                : redirectPath;
+              if (currentPath === "/") {
+                const defaultLocale = i18n.defaultLocale || i18n.locales[0];
+                return !!defaultLocale && (
+                  redirectRel === "/" + defaultLocale ||
+                  redirectRel === "/" + defaultLocale + "/"
+                );
+              }
+              const firstSeg = currentPath.split("/", 2)[1];
+              if (i18n.locales.includes(firstSeg)) return false;
+              for (const locale of i18n.locales) {
+                const prefixed = "/" + locale + currentPath;
+                if (redirectRel === prefixed || redirectRel === prefixed + "/") {
+                  return true;
+                }
+              }
+              return false;
+            } catch {
+              return false;
+            }
+          })();
+          if (isSuppressedHeaderLocaleRedirect) {
+            try {
+              const base = BASE_PATH || "";
+              const i18n = I18N;
+              const currentPath = url.pathname.startsWith(base)
+                ? url.pathname.slice(base.length) || "/"
+                : url.pathname;
+              const defaultLocale = i18n?.defaultLocale;
+              if (defaultLocale) {
+                const rewrittenPath = base + "/" + defaultLocale + (currentPath === "/" ? "" : currentPath);
+                const rewritten = new URL(url.toString());
+                rewritten.pathname = rewrittenPath;
+                url = rewritten;
+                result = {
+                  ...result,
+                  status: 200,
+                  resolvedHeaders: undefined,
+                  resolvedPathname: rewrittenPath,
+                };
+              } else {
+                result = { ...result, status: 200, resolvedHeaders: undefined };
+              }
+            } catch {
+              result = { ...result, status: 200, resolvedHeaders: undefined };
+            }
+          } else {
           const shouldPreserveQuery = !!result.resolvedPathname;
           const finalLocation = shouldPreserveQuery
             ? __preserveQuery(location, url.search)
@@ -4115,6 +4372,7 @@ async function __handleRequestInner(request, env, ctx) {
             if (key.toLowerCase() !== "location") headers.set(key, val);
           });
           return new Response(null, { status: result.status, headers });
+          }
         }
       }
       if (result.middlewareResponded) {

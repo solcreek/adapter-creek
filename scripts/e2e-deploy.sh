@@ -108,14 +108,10 @@ if (code.includes('failed to find source route') && !code.includes('const _pr = 
 
 # Build with adapter
 export NEXT_ADAPTER_PATH="${ADAPTER_PATH}"
-# Worker request log — emits one `[creek-req]` line per fetch with status,
-# content-type, content-length, and the `x-nextjs-action-not-found` header.
-# Surfaced via .adapter-server.log (then dumped by e2e-cleanup.sh) so
-# silent-failure tests (empty body, action POST returning the wrong status)
-# leave a paper trail in CI. No-op for production users — gated on this
-# env in worker-entry's request handler. Forwarded to the worker via
-# worker-dev-server-miniflare.mjs's binding allowlist.
-export CREEK_DEBUG_REQUESTS=1
+# Worker request logging is useful when diagnosing CI failures, but it is also
+# replayed into `next.cliOutput` by the deploy harness. Keep it opt-in so tests
+# that assert route logging is disabled do not see adapter diagnostic lines.
+export CREEK_DEBUG_REQUESTS="${CREEK_DEBUG_REQUESTS:-}"
 # The test harness writes a custom \`build\` script into package.json when the
 # test fixture configures a setup step (e.g. middleware-general copies a mock
 # workspace package into ./node_modules via a \`setup\` script before calling

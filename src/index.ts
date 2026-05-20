@@ -1,6 +1,6 @@
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { existsSync } from "node:fs";
+import { copyFileSync, existsSync } from "node:fs";
 import type { NextAdapter } from "next";
 import { applyBaseModifyConfig } from "@solcreek/adapter-core";
 import { handleBuild } from "./build.js";
@@ -18,6 +18,25 @@ const fallbackCacheHandlerPath = existsSync(fileURLToPath(coreEntryUrl))
   ? fileURLToPath(coreEntryUrl)
   : path.join(process.cwd(), "node_modules", "@solcreek", "adapter-core", "dist", "cache-handler.js");
 
+function mirrorCacheHandlerIntoProject(cacheHandlerPath: string): string {
+  if (!existsSync(cacheHandlerPath)) return cacheHandlerPath;
+
+  const localPath = path.join(process.cwd(), ".solcreek-cache-handler.mjs");
+  if (path.resolve(cacheHandlerPath) === path.resolve(localPath)) return localPath;
+
+  try {
+    copyFileSync(cacheHandlerPath, localPath);
+    return localPath;
+  } catch (err) {
+    console.warn(
+      `  [Creek Adapter] Failed to mirror cache-handler into project (${
+        err instanceof Error ? err.message : String(err)
+      }); falling back to ${cacheHandlerPath}`,
+    );
+    return cacheHandlerPath;
+  }
+}
+
 const adapter: NextAdapter = {
   name: "adapter-creek",
 
@@ -34,8 +53,18 @@ const adapter: NextAdapter = {
     // for other phases, so guarding here matches its behaviour.
     if (ctx.phase !== "phase-production-build") return baseConfig;
 
+    const cacheHandlerPath =
+      typeof baseConfig.cacheHandler === "string"
+        ? mirrorCacheHandlerIntoProject(baseConfig.cacheHandler)
+        : mirrorCacheHandlerIntoProject(fallbackCacheHandlerPath);
+
     return {
       ...baseConfig,
+      // Next may dynamically import this cache handler on error/404 render
+      // paths. Keep it as a project-local sentinel path instead of a pnpm
+      // node_modules realpath; the Workers bundler redirects that sentinel
+      // to the inline CreekCacheHandler.
+      cacheHandler: cacheHandlerPath,
       // Disable memory cache — CF Workers doesn't have persistent fs.
       // The runtime cache handler is inlined in the worker entry (CreekCacheHandler).
       cacheMaxMemorySize: 0,

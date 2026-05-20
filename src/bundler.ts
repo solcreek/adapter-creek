@@ -717,11 +717,10 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
         path.join(adapterDir, "src", "shims", "fast-set-immediate.js"),
       // NOTE: load-manifest shim exists in src/shims/ but is handled by the
       // fs shim (manifest loading), so no alias needed.
-      // CF Workers does NOT provide node:http / node:https / node:net even
-      // with nodejs_compat. TCP-server-shaped APIs have no Workers equivalent.
-      // Our shim provides IncomingMessage + ServerResponse stubs.
-      "http": path.join(adapterDir, "src", "shims", "http.js"),
-      "node:http": path.join(adapterDir, "src", "shims", "http.js"),
+      // Keep http/node:http on workerd's nodejs_compat implementation. The
+      // worker entry extends the built-in IncomingMessage and ServerResponse;
+      // aliasing those imports to our minimal shim makes POST body flushing
+      // re-buffer chunks into itself and can OOM server-action requests.
       "https": path.join(adapterDir, "src", "shims", "http.js"),
       "node:https": path.join(adapterDir, "src", "shims", "http.js"),
       // net: Socket class needed by Next.js http bridge.
@@ -879,6 +878,19 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     );
 
     workerCode = patchBundledManifestSingleton(workerCode);
+
+    // Next's Pages Router error/404 path may dynamically import the configured
+    // cacheHandler via `file:/.solcreek-cache-handler.mjs`. workerd cannot load
+    // arbitrary file: modules at runtime, and the worker already ships the
+    // target-specific CreekCacheHandler inline. Redirect only that generated
+    // cache-handler import to the inline class.
+    workerCode = workerCode.replace(
+      /__name\(\((\w+)\)\s*=>\s*import\(\1\)\.then\(\((\w+)\)\s*=>\s*\2\.default\s*\|\|\s*\2\),\s*"([^"]+)"\)/g,
+      (_match, specifierVar: string, moduleVar: string, functionName: string) =>
+        `__name((${specifierVar}) => String(${specifierVar}).includes(".solcreek-cache-handler.mjs") ` +
+        `? Promise.resolve(globalThis.__CREEK_CACHE_HANDLER) ` +
+        `: import(${specifierVar}).then((${moduleVar}) => ${moduleVar}.default || ${moduleVar}), ${JSON.stringify(functionName)})`,
+    );
 
     // depd (via raw-body) uses `eval("(function ("+args+") {...})")` to build a
     // deprecation-wrapping thunk. workerd + CF Workers block code generation
