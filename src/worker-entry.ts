@@ -915,6 +915,38 @@ function __creekPathnameAliases(pathname) {
   return aliases;
 }
 
+function __creekMarkGeneratedFallbackPath(key) {
+  if (!globalThis.__CREEK_GENERATED_FALLBACK_PATHS) {
+    globalThis.__CREEK_GENERATED_FALLBACK_PATHS = new Set();
+  }
+  const add = (pathname) => {
+    if (typeof pathname !== "string" || !pathname.startsWith("/")) return;
+    for (const alias of __creekPathnameAliases(pathname)) {
+      globalThis.__CREEK_GENERATED_FALLBACK_PATHS.add(alias);
+    }
+  };
+  add(key);
+  try {
+    const reqUrl = __INTERNAL_FETCH_CONTEXT.getStore()?.request?.url;
+    if (reqUrl) {
+      const pathname = new URL(reqUrl).pathname;
+      const dataMatch = pathname.match(/^\\/_next\\/data\\/[^/]+\\/(.+)\\.json$/);
+      if (dataMatch) {
+        const pagePath = "/" + dataMatch[1].replace(/\\/index$/, "");
+        add(pagePath || "/");
+      } else {
+        add(pathname);
+      }
+    }
+  } catch {}
+}
+
+function __creekHasGeneratedFallbackPath(pathname) {
+  const set = globalThis.__CREEK_GENERATED_FALLBACK_PATHS;
+  if (!set || typeof pathname !== "string") return false;
+  return __creekPathnameAliases(pathname).some((alias) => set.has(alias));
+}
+
 // Prerender entries for ISR cache seeding (PPR shells + static prerenders)
 const __PRERENDER_ENTRIES = ${JSON.stringify(opts.prerenderEntries)};
 const __CREEK_PRERENDER_ENTRY_BY_PATH = (() => {
@@ -2048,6 +2080,9 @@ class CreekCacheHandler {
       tags,
       revalidate,
     };
+    if (ctx?.isFallback) {
+      __creekMarkGeneratedFallbackPath(key);
+    }
 
     // L1: always update in-memory
     globalThis.__CREEK_CACHE.set(key, entry);
@@ -4966,9 +5001,10 @@ async function __handleRequestInner(request, env, ctx) {
               }
             }
             const hasConcretePrerender = pathCandidates.some((p) => prerenderManifest?.routes?.[p] != null);
+            const hasGeneratedFallback = __creekHasGeneratedFallbackPath(url.pathname);
             const ua = request.headers.get("user-agent") || "";
             const isCrawler = /bot|spider|crawler|slurp|ia_archiver|facebookexternalhit/i.test(ua);
-            if (!hasConcretePrerender && !isCrawler) {
+            if (!hasConcretePrerender && !hasGeneratedFallback && !isCrawler) {
               const assetCandidates = [
                 STATIC_PAGES[resolvedPathname]?.assetPath,
                 __creekInternalStaticPageAssetPath(resolvedPathname),
@@ -5178,7 +5214,7 @@ async function __handleRequestInner(request, env, ctx) {
         if (staticDyn && STATIC_PAGES[staticDyn.page]) {
           const prerenderManifest = __getPrerenderManifest();
           const dynamicRoute = prerenderManifest?.dynamicRoutes?.[staticDyn.page];
-          if (dynamicRoute?.fallback !== false) {
+          if (dynamicRoute?.fallback !== false && !__creekHasGeneratedFallbackPath(url.pathname)) {
             resolvedPathname = staticDyn.page;
             servePath = staticDyn.page;
             staticEntry = STATIC_PAGES[staticDyn.page];
