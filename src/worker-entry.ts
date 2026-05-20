@@ -4865,6 +4865,21 @@ async function __handleRequestInner(request, env, ctx) {
           if (HANDLERS["/index"]) resolvedPathname = "/index";
         }
       }
+      if (BASE_PATH && resolvedPathname) {
+        const hasBasePathPrefix =
+          url.pathname === BASE_PATH ||
+          url.pathname.startsWith(BASE_PATH + "/");
+        if (!hasBasePathPrefix) {
+          resolvedPathname = undefined;
+          result = {
+            ...result,
+            resolvedPathname: undefined,
+            invocationTarget: undefined,
+            routeMatches: undefined,
+            resolvedQuery: undefined,
+          };
+        }
+      }
       // Trailing-slash normalization. \`@next/routing\` does exact pathname
       // matching and is unaware of Next.js's \`trailingSlash\` config. When
       // the config is \`trailingSlash: true\`, Next.js redirects \`/foo\` →
@@ -7130,11 +7145,22 @@ class IncomingMessage extends _IM {
   }
   resume() { this._startFlowing(); return super.resume(); }
   pipe(dest, opts) {
-    if (dest?.__isRequestRequest) {
+    const looksLikeOutgoingRequest =
+      dest?.__isRequestRequest ||
+      dest?.uri ||
+      dest?.href;
+    if (looksLikeOutgoingRequest) {
       if (this.method && !dest.explicitMethod) dest.method = this.method;
       if (this.headers) {
         for (const key of Object.keys(this.headers)) {
-          if (!dest.hasHeader?.(key)) dest.setHeader?.(key, this.headers[key]);
+          if (!dest.hasHeader?.(key)) {
+            if (typeof dest.setHeader === "function") {
+              dest.setHeader(key, this.headers[key]);
+            } else {
+              dest.headers = dest.headers || {};
+              dest.headers[key] = this.headers[key];
+            }
+          }
         }
       }
     }
@@ -7230,6 +7256,8 @@ class CreekFetchClientRequest extends EventEmitter {
     this.url = url;
     this.options = options || {};
     this.method = String(this.options.method || "GET").toUpperCase();
+    this.explicitMethod = this.options.method != null;
+    this.__isRequestRequest = true;
     this.headers = new Headers(this.options.headers || {});
     this.chunks = [];
     this.finished = false;
