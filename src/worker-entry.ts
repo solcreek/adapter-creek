@@ -320,41 +320,30 @@ if (
   let __creekTimerIdleStart = 1;
   const __creekTimerNativeHandle = Symbol("creek.timer.nativeHandle");
   const __creekNextIdleStart = () => __creekTimerIdleStart++;
-  const __creekEnsureIdleStart = (timer) => {
-    try {
-      if (!timer || typeof timer !== "object") return timer;
-      if (!("_idleStart" in timer) || typeof timer._idleStart !== "number") {
-        timer._idleStart = __creekNextIdleStart();
-      }
-      return timer;
-    } catch {
-      return timer;
-    }
-  };
-  globalThis.setTimeout = function __creekSetTimeout(callback, delay, ...args) {
-    const nativeHandle = __creekNativeSetTimeout(callback, delay, ...args);
-    if (nativeHandle && typeof nativeHandle === "object") {
-      return __creekEnsureIdleStart(nativeHandle);
-    }
+  const __creekGetNativeTimerHandle = (timer) =>
+    timer && typeof timer === "object" && __creekTimerNativeHandle in timer
+      ? timer[__creekTimerNativeHandle]
+      : timer;
+  const __creekCreateTimerHandle = (nativeHandle) => {
     const handle = {
       [__creekTimerNativeHandle]: nativeHandle,
       _idleStart: __creekNextIdleStart(),
-      ref() { return this; },
-      unref() { return this; },
-      hasRef() { return true; },
-      refresh() { return this; },
+      ref() { nativeHandle?.ref?.(); return this; },
+      unref() { nativeHandle?.unref?.(); return this; },
+      hasRef() { return nativeHandle?.hasRef?.() ?? true; },
+      refresh() { nativeHandle?.refresh?.(); return this; },
+      [Symbol.dispose]() { __creekNativeClearTimeout(nativeHandle); },
       valueOf() { return nativeHandle; },
       toString() { return String(nativeHandle); },
       [Symbol.toPrimitive]() { return nativeHandle; },
     };
     return handle;
   };
+  globalThis.setTimeout = function __creekSetTimeout(callback, delay, ...args) {
+    return __creekCreateTimerHandle(__creekNativeSetTimeout(callback, delay, ...args));
+  };
   globalThis.clearTimeout = function __creekClearTimeout(timer) {
-    const nativeHandle =
-      timer && typeof timer === "object" && __creekTimerNativeHandle in timer
-        ? timer[__creekTimerNativeHandle]
-        : timer;
-    return __creekNativeClearTimeout(nativeHandle);
+    return __creekNativeClearTimeout(__creekGetNativeTimerHandle(timer));
   };
 }
 
