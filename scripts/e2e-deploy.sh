@@ -41,16 +41,23 @@ log() {
 
 # Install the adapter — use tarball if available (faster, avoids symlink issues),
 # otherwise fall back to file: dependency.
+#
+# The tarball path is written as `file:/abs/path/to/foo.tgz`. Bare absolute
+# paths get parsed differently by pnpm in workspace contexts (Next.js
+# fixtures live inside the Next.js pnpm workspace) — the explicit `file:`
+# protocol forces tarball-extraction semantics rather than directory-link.
 log "pwd=${PWD}"
 log "Installing adapter..."
 if [ -n "${ADAPTER_TARBALL:-}" ] && [ -f "${ADAPTER_TARBALL}" ]; then
+  log "Using tarball: ${ADAPTER_TARBALL}"
   node -e "
 const pkg = JSON.parse(require('fs').readFileSync('package.json','utf8'));
 pkg.dependencies = pkg.dependencies || {};
-pkg.dependencies['@solcreek/adapter-creek'] = '${ADAPTER_TARBALL}';
+pkg.dependencies['@solcreek/adapter-creek'] = 'file:${ADAPTER_TARBALL}';
 require('fs').writeFileSync('package.json', JSON.stringify(pkg, null, 2));
 " >&2
 else
+  log "ADAPTER_TARBALL missing or unreadable (=${ADAPTER_TARBALL:-<unset>}); falling back to file:${ADAPTER_DIR} (symlinks may escape project tree)"
   node -e "
 const pkg = JSON.parse(require('fs').readFileSync('package.json','utf8'));
 pkg.dependencies = pkg.dependencies || {};

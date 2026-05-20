@@ -45,7 +45,7 @@
   },
   "dependencies": {
     "@next/routing": "16.2.3",
-    "@solcreek/adapter-core": "^0.1.0",
+    "@solcreek/adapter-core": "^0.1.2",
     "sql.js": "^1.14.1",
     "wrangler": "^4.82.2"
   },
