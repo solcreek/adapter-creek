@@ -3222,22 +3222,22 @@ async function __creekFetchAndStoreEdgeAppFetch(
   return out;
 }
 
-function __creekWrapEdgeAppFetchCache(patchedFetch) {
+function __creekWrapAppPageFetchCache(patchedFetch) {
   if (typeof patchedFetch !== "function") return patchedFetch;
-  if (patchedFetch.__creekEdgeAppFetchCacheShim) return patchedFetch;
+  if (patchedFetch.__creekAppPageFetchCacheShim) return patchedFetch;
   const originalFetch = patchedFetch._nextOriginalFetch;
   if (typeof originalFetch !== "function") return patchedFetch;
 
   const shimFetch = async function fetch(input, init) {
     let store = null;
     try { store = __INTERNAL_FETCH_CONTEXT.getStore(); } catch {}
-    const isEdgeAppPage =
-      store?.handlerRuntime === "edge" &&
-      store?.handlerType === "APP_PAGE";
+    const isShimmedAppPage =
+      store?.handlerType === "APP_PAGE" &&
+      (store?.handlerRuntime === "edge" || store?.handlerRuntime === "nodejs");
     const nextConfig = init?.next || (input && typeof input === "object" ? input.next : undefined);
     const revalidate = nextConfig?.revalidate;
     if (
-      !isEdgeAppPage ||
+      !isShimmedAppPage ||
       nextConfig?.internal === true ||
       typeof revalidate !== "number" ||
       !Number.isFinite(revalidate) ||
@@ -3318,17 +3318,17 @@ function __creekWrapEdgeAppFetchCache(patchedFetch) {
       }
     }
   }
-  Object.defineProperty(shimFetch, "__creekEdgeAppFetchCacheShim", { value: true });
+  Object.defineProperty(shimFetch, "__creekAppPageFetchCacheShim", { value: true });
   Object.defineProperty(shimFetch, "__creekWrappedFetch", { value: patchedFetch });
   try { Object.defineProperty(shimFetch, "name", { value: "fetch", writable: false }); } catch {}
   return shimFetch;
 }
 
-function __creekInstallEdgeAppFetchCacheShim() {
+function __creekInstallAppPageFetchCacheShim() {
   const currentFetch = globalThis.fetch;
-  const wrappedFetch = __creekWrapEdgeAppFetchCache(currentFetch);
+  const wrappedFetch = __creekWrapAppPageFetchCache(currentFetch);
   const restore = () => {
-    delete globalThis.__CREEK_EDGE_APP_FETCH_CACHE_TRAP;
+    delete globalThis.__CREEK_APP_PAGE_FETCH_CACHE_TRAP;
     try {
       Object.defineProperty(globalThis, "fetch", {
         configurable: true,
@@ -3344,23 +3344,23 @@ function __creekInstallEdgeAppFetchCacheShim() {
     globalThis.fetch = wrappedFetch;
     return restore;
   }
-  if (globalThis.__CREEK_EDGE_APP_FETCH_CACHE_TRAP) return null;
+  if (globalThis.__CREEK_APP_PAGE_FETCH_CACHE_TRAP) return null;
 
   let activeFetch = currentFetch;
   const getter = function() {
     return activeFetch;
   };
   try {
-    Object.defineProperty(getter, "__creekEdgeAppFetchCacheTrap", { value: true });
+    Object.defineProperty(getter, "__creekAppPageFetchCacheTrap", { value: true });
   } catch {}
   Object.defineProperty(globalThis, "fetch", {
     configurable: true,
     get: getter,
     set(value) {
-      activeFetch = __creekWrapEdgeAppFetchCache(value);
+      activeFetch = __creekWrapAppPageFetchCache(value);
     },
   });
-  globalThis.__CREEK_EDGE_APP_FETCH_CACHE_TRAP = true;
+  globalThis.__CREEK_APP_PAGE_FETCH_CACHE_TRAP = true;
   return restore;
 }
 
@@ -8351,12 +8351,12 @@ async function __handleRequestInner(request, env, ctx) {
       } catch {}
 
       if (handler.runtime === "edge") {
-        const __restoreEdgeAppFetchCacheShim =
+        const __restoreAppPageFetchCacheShim =
           handler.type === "APP_PAGE"
-            ? __creekInstallEdgeAppFetchCacheShim()
+            ? __creekInstallAppPageFetchCacheShim()
             : null;
-        const __cleanupEdgeAppFetchCacheShim = () => {
-          try { __restoreEdgeAppFetchCacheShim?.(); } catch {}
+        const __cleanupAppPageFetchCacheShim = () => {
+          try { __restoreAppPageFetchCacheShim?.(); } catch {}
         };
         // CF Workers IS edge — try _ENTRIES first, then fall through to Node.js.
         // (Per opennext research: edge runtime is redundant on CF Workers.)
@@ -8527,7 +8527,7 @@ async function __handleRequestInner(request, env, ctx) {
               );
               if (edgeResult instanceof Response) {
                 const edgeResponse = __applyMwResponseHeaders(edgeResult);
-                __cleanupEdgeAppFetchCacheShim();
+                __cleanupAppPageFetchCacheShim();
                 return edgeResponse;
               }
               if (edgeResult?.response instanceof Response) {
@@ -8535,7 +8535,7 @@ async function __handleRequestInner(request, env, ctx) {
                   ctx.waitUntil(Promise.resolve(edgeResult.waitUntil).catch(() => {}));
                 }
                 const edgeResponse = __applyMwResponseHeaders(edgeResult.response);
-                __cleanupEdgeAppFetchCacheShim();
+                __cleanupAppPageFetchCacheShim();
                 return edgeResponse;
               }
             }
@@ -8550,7 +8550,7 @@ async function __handleRequestInner(request, env, ctx) {
                 );
                 if (edgeResult instanceof Response) {
                   const edgeResponse = __applyMwResponseHeaders(edgeResult);
-                  __cleanupEdgeAppFetchCacheShim();
+                  __cleanupAppPageFetchCacheShim();
                   return edgeResponse;
                 }
                 if (edgeResult?.response instanceof Response) {
@@ -8558,14 +8558,14 @@ async function __handleRequestInner(request, env, ctx) {
                     ctx.waitUntil(Promise.resolve(edgeResult.waitUntil).catch(() => {}));
                   }
                   const edgeResponse = __applyMwResponseHeaders(edgeResult.response);
-                  __cleanupEdgeAppFetchCacheShim();
+                  __cleanupAppPageFetchCacheShim();
                   return edgeResponse;
                 }
               }
             }
           } catch {}
         }
-        __cleanupEdgeAppFetchCacheShim();
+        __cleanupAppPageFetchCacheShim();
         // Fall through to Node.js handler bridge
       }
 
@@ -10727,6 +10727,13 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   const res = new ServerResponse(req);
   const syntheticCloseListeners = [];
   let syntheticCloseFired = false;
+  let __restoreAppPageFetchCacheShim = null;
+  let __appPageFetchCacheShimCleaned = false;
+  const __cleanupAppPageFetchCacheShim = () => {
+    if (__appPageFetchCacheShimCleaned) return;
+    __appPageFetchCacheShimCleaned = true;
+    try { __restoreAppPageFetchCacheShim?.(); } catch {}
+  };
   if (handlerType === "APP_PAGE") {
     const origOn = res.on.bind(res);
     const origOnce = res.once.bind(res);
@@ -11256,6 +11263,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
         res.finished = true;
         res.emit("finish");
         res.emit("close");
+        __cleanupAppPageFetchCacheShim();
         if (cb) cb();
       });
     return res;
@@ -11318,6 +11326,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       streamClosed = true;
       streamController.close();
     }
+    __cleanupAppPageFetchCacheShim();
     throw new Error("No handler function found on module (keys: " + Object.keys(mod).join(",") + ")");
   }
 
@@ -11332,12 +11341,16 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
             streamClosed = true;
             streamController.close();
           }
+          __cleanupAppPageFetchCacheShim();
         })
         .catch(() => {});
     }
   }, 30000);
 
   try {
+    if (handlerType === "APP_PAGE") {
+      __restoreAppPageFetchCacheShim = __creekInstallAppPageFetchCacheShim();
+    }
     // Do NOT set \`query\` here. Next.js's RouteModule.prepare() falls back to
     // parsedUrl.query (parsed from req.url) when requestMeta.query is unset,
     // and its own internal logic strips nxtP-prefixed route params from
@@ -11449,6 +11462,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
             runSyntheticCloseListeners();
             res.emit("finish");
             res.emit("close");
+            __cleanupAppPageFetchCacheShim();
           }).catch(() => {});
         }, IDLE_MS);
       };
@@ -11482,6 +11496,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
         streamClosed = true;
         streamController.close();
       }
+      __cleanupAppPageFetchCacheShim();
       reject(new Error("SSR timeout: no response headers within 60s"));
     }, 60000)),
   ]);
