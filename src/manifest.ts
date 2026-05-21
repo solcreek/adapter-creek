@@ -7,16 +7,13 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { createRequire } from "node:module";
+import type { DeployManifestBase } from "@solcreek/adapter-core";
 
-export interface DeployManifest {
-  /** Manifest schema version */
-  version: 1;
-  /** Next.js build ID */
-  buildId: string;
-  /** Next.js version used */
-  nextVersion: string;
-  /** Framework identifier */
-  framework: "nextjs";
+const require = createRequire(import.meta.url);
+const adapterPackage = require("../package.json") as { name?: string; version?: string };
+
+export interface DeployManifest extends DeployManifestBase {
   /** Main worker entry file name (relative to server/) */
   entrypoint: string;
   /** All files in server/ directory */
@@ -50,6 +47,10 @@ export async function writeManifest(
     buildId: opts.buildId,
     nextVersion: opts.nextVersion,
     framework: "nextjs",
+    adapter: {
+      name: adapterPackage.name ?? "@solcreek/adapter-creek",
+      version: adapterPackage.version ?? "0.0.0",
+    },
     entrypoint: opts.entrypoint,
     serverFiles: opts.serverFiles,
     assetDir: "assets",
