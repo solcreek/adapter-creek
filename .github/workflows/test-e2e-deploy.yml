@@ -4,15 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       nextjsRef:
-        # Follow Next.js's official adapter-testing guidance
-        # (https://nextjs.org/docs/app/api-reference/adapters/testing-adapters):
-        # the example workflow uses \`canary\` as the default. Vercel's own
-        # adapter-vercel / adapter-bun are tested against canary, so canary
-        # is the ref where test-only fixes land first (stable release lines
-        # don't back-port them). If we ever need to pin to a specific SHA
-        # for reproducibility, override this input.
+        # Keep the default reproducible. The moving canary ref can change
+        # under a single adapter commit and make regressions impossible to
+        # attribute. Override manually when intentionally testing a newer
+        # Next.js canary.
         description: 'Next.js repo ref (branch/tag/SHA)'
-        default: 'canary'
+        default: '493fba50f36ff8dd98cb5dd46306a701da080329'
         type: string
   # Uncomment for nightly runs:
   # schedule:
@@ -34,6 +31,12 @@ jobs:
           ref: ${{ inputs.nextjsRef || 'canary' }}
           path: nextjs
           fetch-depth: 25
+
+      - name: Show Next.js ref
+        working-directory: nextjs
+        run: |
+          git rev-parse HEAD
+          git log -1 --oneline
 
       - name: Apply upstream test patches
         # Idempotent cherry-pick mechanism for any test-only fixes we need
