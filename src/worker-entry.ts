@@ -6282,6 +6282,7 @@ async function __handleRequestInner(request, env, ctx) {
         }
       }
       let staticEntry = null;
+      let staticEntryFromConfigRewrite = false;
       if (resolvedIsBracketShell) {
         // Try concrete prerenders before the shell.
         for (const cand of concreteCandidates) {
@@ -6387,6 +6388,7 @@ async function __handleRequestInner(request, env, ctx) {
                 if (!STATIC_PAGES[candidatePath]) continue;
                 servePath = candidatePath;
                 staticEntry = STATIC_PAGES[candidatePath];
+                staticEntryFromConfigRewrite = true;
                 break;
               }
               if (staticEntry) break;
@@ -6625,6 +6627,7 @@ async function __handleRequestInner(request, env, ctx) {
         !request.headers.has("next-action") &&
         !isAppRouterRSCRequest &&
         !nextDataAppRouterPath &&
+        !staticEntryFromConfigRewrite &&
         __creekIsFallbackFalseMiss(resolvedPathname, url.pathname)
       ) {
         return await __creekStaticNotFoundResponse(env, url, result, request.method);
