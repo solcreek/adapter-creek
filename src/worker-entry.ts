@@ -2234,6 +2234,54 @@ async function __creekMaxRevalidatedAt(tags) {
   return max;
 }
 
+function __creekTagState(tag) {
+  const out = {};
+  try {
+    const state = __nextTagsManifest.get(tag);
+    if (state && typeof state === "object") {
+      if (typeof state.stale === "number") out.stale = state.stale;
+      if (typeof state.expired === "number") out.expired = state.expired;
+    }
+  } catch {}
+  try {
+    const state = globalThis.__CREEK_CC_TAG_STATE?.get(tag);
+    if (state && typeof state === "object") {
+      if (typeof state.stale === "number" && state.stale > (out.stale || 0)) {
+        out.stale = state.stale;
+      }
+      if (typeof state.expired === "number" && state.expired > (out.expired || 0)) {
+        out.expired = state.expired;
+      }
+    }
+  } catch {}
+  return out;
+}
+
+function __creekTagsExpiredSince(tags, timestamp) {
+  if (!Array.isArray(tags) || tags.length === 0) return false;
+  const now = __CREEK_NATIVE_DATE.now();
+  for (const tag of tags) {
+    if (typeof tag !== "string") continue;
+    const expiredAt = __creekTagState(tag).expired;
+    if (typeof expiredAt === "number" && expiredAt <= now && expiredAt > timestamp) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function __creekTagsStaleSince(tags, timestamp) {
+  if (!Array.isArray(tags) || tags.length === 0) return false;
+  for (const tag of tags) {
+    if (typeof tag !== "string") continue;
+    const staleAt = __creekTagState(tag).stale;
+    if (typeof staleAt === "number" && staleAt > timestamp) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function __creekRevalidatedTags(tags, since = 0) {
   const out = [];
   const byTag = await __creekRevalidatedAtByTag(tags);
@@ -2244,7 +2292,25 @@ async function __creekRevalidatedTags(tags, since = 0) {
   return out;
 }
 
-async function __creekWriteRevalidatedTags(tags) {
+function __creekExpiredTags(tags, since = 0) {
+  const out = [];
+  const now = __CREEK_NATIVE_DATE.now();
+  for (const tag of tags || []) {
+    if (typeof tag !== "string") continue;
+    const expiredAt = __creekTagState(tag).expired;
+    if (
+      typeof expiredAt === "number" &&
+      expiredAt <= now &&
+      expiredAt > since &&
+      !out.includes(tag)
+    ) {
+      out.push(tag);
+    }
+  }
+  return out;
+}
+
+async function __creekWriteRevalidatedTags(tags, durations) {
   if (!Array.isArray(tags) || tags.length === 0) return;
   const normalizedTags = [];
   for (const tag of tags) {
@@ -2255,6 +2321,20 @@ async function __creekWriteRevalidatedTags(tags) {
   }
   if (normalizedTags.length === 0) return;
   const now = __CREEK_NATIVE_DATE.now();
+  if (!globalThis.__CREEK_CC_TAG_STATE) globalThis.__CREEK_CC_TAG_STATE = new Map();
+  const ccTagState = globalThis.__CREEK_CC_TAG_STATE;
+  for (const t of normalizedTags) {
+    const existing = ccTagState.get(t) || {};
+    if (durations) {
+      const updates = Object.assign({}, existing, { stale: now });
+      if (durations.expire !== undefined) {
+        updates.expired = now + durations.expire * 1000;
+      }
+      ccTagState.set(t, updates);
+    } else {
+      ccTagState.set(t, Object.assign({}, existing, { expired: now }));
+    }
+  }
   // Always update in-memory (fast, covers same-isolate subsequent reads).
   const mem = globalThis.__CREEK_TAG_INVALIDATED_AT;
   if (mem) {
@@ -2271,7 +2351,15 @@ async function __creekWriteRevalidatedTags(tags) {
   try {
     for (const t of normalizedTags) {
       const existing = __nextTagsManifest.get(t) || {};
-      __nextTagsManifest.set(t, Object.assign({}, existing, { stale: now, expired: now }));
+      if (durations) {
+        const updates = Object.assign({}, existing, { stale: now });
+        if (durations.expire !== undefined) {
+          updates.expired = now + durations.expire * 1000;
+        }
+        __nextTagsManifest.set(t, updates);
+      } else {
+        __nextTagsManifest.set(t, Object.assign({}, existing, { expired: now }));
+      }
     }
   } catch {}
   // Also persist to DO shards so other isolates / future requests see it.
@@ -2376,11 +2464,14 @@ async function __creekSeededAppPageEntry(key, ctx) {
 
   const headers = seed.initialHeaders && typeof seed.initialHeaders === "object"
     ? Object.assign({}, seed.initialHeaders)
-    : undefined;
-  const tagsHeader = headers?.["x-next-cache-tags"];
+    : {};
+  const tagsHeader = seed.metaHeaders?.["x-next-cache-tags"] ?? headers["x-next-cache-tags"];
   const tags = typeof tagsHeader === "string"
     ? tagsHeader.split(",").map((t) => t.trim()).filter(Boolean)
     : [];
+  if (tags.length > 0 && !headers["x-next-cache-tags"]) {
+    headers["x-next-cache-tags"] = tags.join(",");
+  }
 
   // Populate \`rscData\` for the cache entry. Next's app-page template
   // serves this for RSC requests (prefetch + RSC navigation).
@@ -2452,15 +2543,15 @@ async function __creekSeededAppPageEntry(key, ctx) {
   }
 
   return {
-    value: {
+    value: __creekValueWithCacheTags({
       kind: "APP_PAGE",
       html,
       rscData,
       postponed: seed.postponedState,
-      headers,
+      headers: Object.keys(headers).length > 0 ? headers : undefined,
       status: seed.initialStatus,
       segmentData,
-    },
+    }, tags),
     lastModified: typeof seed.lastModified === "number" ? seed.lastModified : __CREEK_NATIVE_DATE.now(),
     tags,
     revalidate: typeof seed.initialRevalidate === "number" ? seed.initialRevalidate : undefined,
@@ -2538,6 +2629,24 @@ function __creekPatchVisibleHtmlFromFlight(html) {
     }
   }
   return patched;
+}
+
+function __creekValueWithCacheTags(value, tags) {
+  if (
+    !value ||
+    (value.kind !== "APP_PAGE" && value.kind !== "APP_ROUTE") ||
+    !Array.isArray(tags) ||
+    tags.length === 0
+  ) {
+    return value;
+  }
+  const headers = value.headers && typeof value.headers === "object"
+    ? Object.assign({}, value.headers)
+    : {};
+  if (!headers["x-next-cache-tags"]) {
+    headers["x-next-cache-tags"] = tags.join(",");
+  }
+  return Object.assign({}, value, { headers });
 }
 
 class CreekCacheHandler {
@@ -2670,7 +2779,7 @@ class CreekCacheHandler {
         : typeof ctx?.cacheControl?.revalidate === "number"
           ? ctx.cacheControl.revalidate
           : undefined;
-    let value = data;
+    let value = __creekValueWithCacheTags(data, tags);
     if (value?.kind === "APP_PAGE" && typeof value.html === "string") {
       const patchedHtml = __creekPatchVisibleHtmlFromFlight(value.html);
       if (patchedHtml !== value.html) {
@@ -2734,9 +2843,9 @@ class CreekCacheHandler {
     }
   }
 
-  async revalidateTag(tag) {
+  async revalidateTag(tag, durations) {
     const tags = Array.isArray(tag) ? tag : [tag];
-    await __creekWriteRevalidatedTags(tags);
+    await __creekWriteRevalidatedTags(tags, durations);
   }
 
   resetRequestCache() {}
@@ -2836,9 +2945,9 @@ class CreekComposableCacheHandler {
         if (seeds) {
           const seed = seeds.get(cacheKey);
           if (seed) {
-            const seedInvalidated =
-              (await __creekMaxRevalidatedAt([...(seed.tags || []), ...implicitTagList])) > seed.timestamp;
-            if (!seedInvalidated) {
+            const seedTags = [...(seed.tags || []), ...implicitTagList];
+            if (!__creekTagsExpiredSince(seedTags, seed.timestamp)) {
+              const seedIsStale = __creekTagsStaleSince(seedTags, seed.timestamp);
               return {
                 value: new ReadableStream({
                   start(c) { c.enqueue(seed.value); c.close(); },
@@ -2847,7 +2956,7 @@ class CreekComposableCacheHandler {
                 stale: seed.stale,
                 timestamp: seed.timestamp,
                 expire: seed.expire,
-                revalidate: seed.revalidate,
+                revalidate: seedIsStale ? -1 : seed.revalidate,
               };
             }
           }
@@ -2864,18 +2973,11 @@ class CreekComposableCacheHandler {
     }
     if (!entry) return undefined;
 
-    // Tag staleness check: an entry is stale iff a tag it depends on was
-    // invalidated AFTER the entry was written. Compare against \`state.stale\`
-    // (the wall-clock timestamp of the invalidation call) — not
-    // \`state.expire\`, which tracks how long the stale signal itself lives,
-    // not the cutoff between "pre-invalidation" and "post-invalidation"
-    // entries. Using \`expire\` here made every entry written within a profile's
-    // expiry window (e.g. \`'minutes'\` → 3600s) look stale forever after one
-    // \`revalidateTag\` call, so the handler re-ran on every read even after a
-    // fresh entry was produced — blowing cache hit rates to zero.
-    if ((await __creekMaxRevalidatedAt([...(entry.tags || []), ...implicitTagList])) > entry.timestamp) {
+    const entryTags = [...(entry.tags || []), ...implicitTagList];
+    if (__creekTagsExpiredSince(entryTags, entry.timestamp)) {
       return undefined;
     }
+    const entryIsStale = __creekTagsStaleSince(entryTags, entry.timestamp);
 
     // Time-based staleness (narrow — only for aggressive \`cacheLife\`): return
     // undefined when the user explicitly requested small revalidate (≤10s) and
@@ -2921,7 +3023,7 @@ class CreekComposableCacheHandler {
       stale: entry.stale,
       timestamp: entry.timestamp,
       expire: entry.expire,
-      revalidate: entry.revalidate,
+      revalidate: entryIsStale ? -1 : entry.revalidate,
     };
   }
 
@@ -3018,7 +3120,15 @@ class CreekComposableCacheHandler {
       }
       for (const t of normalizedTags) {
         const existing = __nextTagsManifest.get(t) || {};
-        __nextTagsManifest.set(t, Object.assign({}, existing, { stale: now, expired: now }));
+        if (durations) {
+          const updates = Object.assign({}, existing, { stale: now });
+          if (durations.expire !== undefined) {
+            updates.expired = now + durations.expire * 1000;
+          }
+          __nextTagsManifest.set(t, updates);
+        } else {
+          __nextTagsManifest.set(t, Object.assign({}, existing, { expired: now }));
+        }
       }
     } catch {}
     const env = __creekCurrentEnv();
@@ -3225,6 +3335,12 @@ async function __creekRevalidatedTagsForPathname(pathname) {
   const entry = __creekPrerenderEntryForPathname(pathname);
   const tags = __creekCacheTagsForPrerenderEntry(entry);
   return tags.length > 0 ? __creekRevalidatedTags(tags, 0) : [];
+}
+
+function __creekExpiredTagsForPathname(pathname) {
+  const entry = __creekPrerenderEntryForPathname(pathname);
+  const tags = __creekCacheTagsForPrerenderEntry(entry);
+  return tags.length > 0 ? __creekExpiredTags(tags, 0) : [];
 }
 
 function __creekHasPostponedPrerenderForPathname(...pathnames) {
@@ -6899,7 +7015,9 @@ async function __handleRequestInner(request, env, ctx) {
         ? servePath
         : url.pathname;
       const isFallbackFalseMiss =
-        !!hasHandler && __creekIsFallbackFalseMiss(resolvedPathname, fallbackFalseCheckPathname);
+        !isDraftModeRequest &&
+        !!hasHandler &&
+        __creekIsFallbackFalseMiss(resolvedPathname, fallbackFalseCheckPathname);
       const dynamicParamCacheKeys = __creekDynamicParamCacheKeysForPathname(
         resolvedPathname,
         url.pathname
@@ -9435,9 +9553,13 @@ function __creekDynamicParamCacheKeysForPathname(routePattern, rawPathname) {
     return null;
   }
 
+  const rawPathnameOnly = rawPathname.split("?")[0];
+  if (!rawPathnameOnly.includes("%")) {
+    return null;
+  }
+
   const patternSegments = routePattern.split("?")[0].split("/").filter(Boolean);
-  const pathSegments = __creekStripBasePathFromRawPathname(rawPathname)
-    .split("?")[0]
+  const pathSegments = __creekStripBasePathFromRawPathname(rawPathnameOnly)
     .split("/")
     .filter(Boolean);
   const keys = {};
@@ -9710,15 +9832,15 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   const req = new IncomingMessage();
   req.method = request.method;
   const __requestHeadersForCache = Object.fromEntries(request.headers);
-  const __revalidatedTagsForThisPath = await __creekRevalidatedTagsForPathname(url.pathname);
-  if (__revalidatedTagsForThisPath.length > 0) {
+  const __expiredTagsForThisPath = __creekExpiredTagsForPathname(url.pathname);
+  if (__expiredTagsForThisPath.length > 0) {
     const previewModeId = __getPrerenderManifest()?.preview?.previewModeId;
     if (previewModeId) {
       const existingTags = (__requestHeadersForCache["x-next-revalidated-tags"] || "")
         .split(",")
         .map((tag) => tag.trim())
         .filter(Boolean);
-      for (const tag of __revalidatedTagsForThisPath) {
+      for (const tag of __expiredTagsForThisPath) {
         if (!existingTags.includes(tag)) existingTags.push(tag);
       }
       __requestHeadersForCache["x-next-revalidated-tags"] = existingTags.join(",");
