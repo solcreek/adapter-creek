@@ -3240,7 +3240,11 @@ function __creekWrapAppPageFetchCache(patchedFetch) {
       store?.handlerType === "APP_PAGE" &&
       (
         store?.handlerRuntime === "edge" ||
-        (store?.handlerRuntime === "nodejs" && method !== "GET" && method !== "HEAD")
+        (
+          store?.enableNodeAppPageFetchCacheShim === true &&
+          method !== "GET" &&
+          method !== "HEAD"
+        )
       );
     const nextConfig = init?.next || (input && typeof input === "object" ? input.next : undefined);
     const revalidate = nextConfig?.revalidate;
@@ -11381,6 +11385,13 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       handlerType === "APP_PAGE" &&
       __creekShouldInstallNodeAppPageFetchCacheShim(handlerPathname, request)
     ) {
+      try {
+        const store = __INTERNAL_FETCH_CONTEXT.getStore();
+        // Some Next route manifests leave the node runtime implicit. Use an
+        // explicit request flag so cached POST fetches in node App Pages do not
+        // depend on handler.runtime being serialized as "nodejs".
+        if (store) store.enableNodeAppPageFetchCacheShim = true;
+      } catch {}
       __restoreAppPageFetchCacheShim = __creekInstallAppPageFetchCacheShim();
     }
     // Do NOT set \`query\` here. Next.js's RouteModule.prepare() falls back to
