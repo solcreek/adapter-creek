@@ -3368,6 +3368,59 @@ function __creekMoveFlightStaticCompletionBeforeBoundary(text, staticId, boundar
   );
 }
 
+function __creekMoveFlightSuspenseRowsAfterBoundary(text, boundaryId) {
+  if (!boundaryId) return text;
+
+  const boundary = __creekFindFlightLineRange(
+    text,
+    boundaryId,
+    __creekIsFlightBoundaryLengthLine
+  );
+  if (!boundary) return text;
+
+  const suspenseIds = [];
+  const seen = new Set();
+  const fallbackChildPattern = /"fallback":[^\\n]*?"children":"\\$L([0-9a-z]+)"/g;
+  let match;
+  while ((match = fallbackChildPattern.exec(text)) !== null) {
+    const id = match[1];
+    if (!seen.has(id)) {
+      seen.add(id);
+      suspenseIds.push(id);
+    }
+  }
+  if (suspenseIds.length === 0) return text;
+
+  const ranges = [];
+  for (const id of suspenseIds) {
+    const range = __creekFindFlightLineRange(text, id);
+    if (range && range.start < boundary.start) {
+      ranges.push(range);
+    }
+  }
+  if (ranges.length === 0) return text;
+
+  ranges.sort((a, b) => a.start - b.start);
+  const compact = [];
+  const moved = [];
+  let offset = 0;
+  for (const range of ranges) {
+    compact.push(text.slice(offset, range.start));
+    moved.push(text.slice(range.start, range.end));
+    offset = range.end;
+  }
+  compact.push(text.slice(offset));
+
+  const movedLength = ranges.reduce((total, range) => total + range.end - range.start, 0);
+  const insertionPoint = boundary.end - movedLength;
+  const withoutMoved = compact.join("");
+  return (
+    withoutMoved.slice(0, insertionPoint) +
+    moved.join("") +
+    withoutMoved.slice(insertionPoint)
+  );
+}
+
 function __creekPatchFlightStaticBoundaryStream(stream) {
   if (!stream) return stream;
 
@@ -3424,6 +3477,14 @@ function __creekPatchFlightStaticBoundaryStream(stream) {
               prefixText = movedText;
               prefix = encoder.encode(prefixText);
             }
+          }
+          const movedSuspenseText = __creekMoveFlightSuspenseRowsAfterBoundary(
+            prefixText,
+            boundaryId
+          );
+          if (movedSuspenseText !== prefixText) {
+            prefixText = movedSuspenseText;
+            prefix = encoder.encode(prefixText);
           }
 
           const boundary = __creekFindFlightLineRange(
@@ -3558,6 +3619,15 @@ function __creekPatchHtmlFlightStaticBoundaryStream(stream) {
       );
       if (movedPayload !== payload) {
         payload = movedPayload;
+        rawPayload = JSON.stringify(payload).slice(1, -1);
+        payloadChanged = true;
+      }
+      const movedSuspensePayload = __creekMoveFlightSuspenseRowsAfterBoundary(
+        payload,
+        boundaryId
+      );
+      if (movedSuspensePayload !== payload) {
+        payload = movedSuspensePayload;
         rawPayload = JSON.stringify(payload).slice(1, -1);
         payloadChanged = true;
       }
@@ -4171,7 +4241,12 @@ async function __handleRequestInner(request, env, ctx) {
             staticDataCandidates.push(withBasePath, lookupWithBasePath);
           }
           const staticDataEntry = staticDataCandidates.find((p) => STATIC_PAGES[p]);
-          if (staticDataEntry) {
+          if (
+            staticDataEntry &&
+            !handler &&
+            !staticPagesDataRoutePath &&
+            !pagesFallbackDataRoutePath
+          ) {
             const headers = new Headers();
             headers.set("content-type", "application/json; charset=utf-8");
             headers.set("x-nextjs-matched-path", candidate);
