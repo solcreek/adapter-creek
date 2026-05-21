@@ -679,7 +679,7 @@ export class DOShardedTagCache extends DurableObject {
     // Cap input to defend against pathological inputs from malicious workers
     // in the shared WfP namespace.
     const capped = tags.slice(0, 256);
-    const ts = typeof timestamp === "number" ? timestamp : Date.now();
+    const ts = typeof timestamp === "number" ? timestamp : __CREEK_NATIVE_DATE.now();
     for (const tag of capped) {
       if (typeof tag !== "string" || tag.length > 1024) continue;
       this.sql.exec(
@@ -743,7 +743,7 @@ export class BucketCachePurge extends DurableObject {
     if (!Array.isArray(keys) || keys.length === 0) return;
     const capped = keys.slice(0, 512).filter((k) => typeof k === "string" && k.length <= 2048);
     if (capped.length === 0) return;
-    const now = Date.now();
+    const now = __CREEK_NATIVE_DATE.now();
     for (const key of capped) {
       this.sql.exec(
         "INSERT INTO purge_queue (key, queued_at) VALUES (?, ?) " +
@@ -755,7 +755,7 @@ export class BucketCachePurge extends DurableObject {
     }
     const existing = await this.ctx.storage.getAlarm();
     if (existing === null) {
-      await this.ctx.storage.setAlarm(Date.now() + 5000);
+      await this.ctx.storage.setAlarm(__CREEK_NATIVE_DATE.now() + 5000);
     }
   }
 
@@ -772,7 +772,7 @@ export class BucketCachePurge extends DurableObject {
     this.sql.exec("DELETE FROM purge_queue WHERE key IN (" + placeholders + ")", ...keys);
     const remaining = this.sql.exec("SELECT COUNT(*) AS c FROM purge_queue").one();
     if (remaining && remaining.c > 0) {
-      await this.ctx.storage.setAlarm(Date.now() + 5000);
+      await this.ctx.storage.setAlarm(__CREEK_NATIVE_DATE.now() + 5000);
     }
   }
 }
@@ -1904,30 +1904,90 @@ function __creekImplicitTagsForKey(key) {
 
 async function __creekTagsInvalidatedSince(tags, since) {
   if (!Array.isArray(tags) || tags.length === 0) return false;
+  return (await __creekMaxRevalidatedAt(tags)) > since;
+}
+
+async function __creekRevalidatedAtByTag(tags) {
+  const out = new Map();
+  if (!Array.isArray(tags) || tags.length === 0) return out;
+  const validTags = tags.filter((tag) => typeof tag === "string" && tag.length > 0);
+  if (validTags.length === 0) return out;
   const env = __creekCurrentEnv();
   if (env && env.NEXT_TAG_CACHE_DO_SHARDED) {
-    const buckets = __creekBucketTagsByShard(tags);
-    // Parallel fan-out across shards; short-circuit on first hit.
+    const buckets = __creekBucketTagsByShard(validTags);
     const checks = [];
     for (const [shardKey, shardTags] of buckets) {
       const stub = __creekShardStub(env, shardKey);
       if (!stub) continue;
-      checks.push(stub.hasBeenRevalidated(shardTags, since).catch(() => false));
+      checks.push(stub.getRevalidatedAt(shardTags).catch(() => ({})));
     }
     try {
       const results = await Promise.all(checks);
-      if (results.some(Boolean)) return true;
+      for (const result of results) {
+        if (!result || typeof result !== "object") continue;
+        for (const [tag, at] of Object.entries(result)) {
+          if (typeof at !== "number") continue;
+          const prev = out.get(tag) || 0;
+          if (at > prev) out.set(tag, at);
+        }
+      }
     } catch {
-      // DO failure — degrade to in-memory check below.
+      // DO failure — degrade to in-memory checks below.
     }
   }
   const mem = globalThis.__CREEK_TAG_INVALIDATED_AT;
-  if (!mem) return false;
-  for (const tag of tags) {
-    const at = mem.get(tag);
-    if (typeof at === "number" && at > since) return true;
+  if (mem) {
+    for (const tag of validTags) {
+      const at = mem.get(tag);
+      if (typeof at !== "number") continue;
+      const prev = out.get(tag) || 0;
+      if (at > prev) out.set(tag, at);
+    }
   }
-  return false;
+  try {
+    for (const tag of validTags) {
+      const state = __nextTagsManifest.get(tag);
+      if (!state || typeof state !== "object") continue;
+      const at =
+        typeof state.stale === "number"
+          ? state.stale
+          : typeof state.expired === "number"
+            ? state.expired
+            : 0;
+      if (at > (out.get(tag) || 0)) out.set(tag, at);
+    }
+  } catch {}
+  try {
+    const cc = globalThis.__CREEK_CC_TAG_STATE;
+    if (cc) {
+      for (const tag of validTags) {
+        const state = cc.get(tag);
+        if (!state || typeof state !== "object") continue;
+        const at = typeof state.stale === "number" ? state.stale : 0;
+        if (at > (out.get(tag) || 0)) out.set(tag, at);
+      }
+    }
+  } catch {}
+  return out;
+}
+
+async function __creekMaxRevalidatedAt(tags) {
+  let max = 0;
+  const byTag = await __creekRevalidatedAtByTag(tags);
+  for (const at of byTag.values()) {
+    if (typeof at === "number" && at > max) max = at;
+  }
+  return max;
+}
+
+async function __creekRevalidatedTags(tags, since = 0) {
+  const out = [];
+  const byTag = await __creekRevalidatedAtByTag(tags);
+  for (const tag of tags || []) {
+    const at = byTag.get(tag);
+    if (typeof at === "number" && at > since && !out.includes(tag)) out.push(tag);
+  }
+  return out;
 }
 
 async function __creekWriteRevalidatedTags(tags) {
@@ -1940,7 +2000,7 @@ async function __creekWriteRevalidatedTags(tags) {
     if (!normalizedTags.includes(encoded)) normalizedTags.push(encoded);
   }
   if (normalizedTags.length === 0) return;
-  const now = Date.now();
+  const now = __CREEK_NATIVE_DATE.now();
   // Always update in-memory (fast, covers same-isolate subsequent reads).
   const mem = globalThis.__CREEK_TAG_INVALIDATED_AT;
   if (mem) {
@@ -2101,8 +2161,28 @@ async function __creekSeededAppPageEntry(key, ctx) {
   // so we don't pin 2MB-per-page HTML into isolate memory.
   let html = seed.html;
   if (!html) {
-    const htmlAssetKey = assetBasePath === "/" ? "/index.html" : assetBasePath + ".html";
-    const htmlBuf = await __creekFetchAssetBuffer(htmlAssetKey);
+    const htmlAssetKeys = [];
+    const addHtmlAssetKey = (assetKey) => {
+      if (typeof assetKey !== "string" || !assetKey || htmlAssetKeys.includes(assetKey)) return;
+      htmlAssetKeys.push(assetKey);
+    };
+    const htmlPathnameAliases = __creekPathnameAliases(assetBasePath);
+    for (const candidate of htmlPathnameAliases) {
+      addHtmlAssetKey(STATIC_PAGES[candidate]?.assetPath);
+    }
+    for (const candidate of htmlPathnameAliases) {
+      if (candidate === "/") {
+        addHtmlAssetKey("/index.html");
+      } else {
+        addHtmlAssetKey(candidate + ".html");
+        addHtmlAssetKey(candidate + "/index.html");
+      }
+    }
+    let htmlBuf = null;
+    for (const htmlAssetKey of htmlAssetKeys) {
+      htmlBuf = await __creekFetchAssetBuffer(htmlAssetKey);
+      if (htmlBuf) break;
+    }
     html = htmlBuf ? htmlBuf.toString("utf-8") : "";
   }
 
@@ -2127,11 +2207,83 @@ async function __creekSeededAppPageEntry(key, ctx) {
       status: seed.initialStatus,
       segmentData,
     },
-    lastModified: typeof seed.lastModified === "number" ? seed.lastModified : Date.now(),
+    lastModified: typeof seed.lastModified === "number" ? seed.lastModified : __CREEK_NATIVE_DATE.now(),
     tags,
     revalidate: typeof seed.initialRevalidate === "number" ? seed.initialRevalidate : undefined,
     __creekSeeded: true,
   };
+}
+
+function __creekDecodeJsStringFragment(value) {
+  if (typeof value !== "string") return value;
+  try {
+    return JSON.parse('"' + value.replace(/"/g, '\\"') + '"');
+  } catch {
+    return value
+      .replace(/\\u([0-9a-fA-F]{4})/g, (_m, hex) => String.fromCharCode(parseInt(hex, 16)))
+      .replace(/\\"/g, '"')
+      .replace(/\\\\/g, "\\\\");
+  }
+}
+
+function __creekPatchVisibleHtmlFromFlight(html) {
+  if (typeof html !== "string" || !html.includes("id") || !html.includes("children")) {
+    return html;
+  }
+  const replacements = new Map();
+  const bs = String.fromCharCode(92);
+  const dq = String.fromCharCode(34);
+  const quoted = (value) => bs + dq + value + bs + dq;
+  const idNeedle = quoted("id") + ":" + bs + dq;
+  const childrenNeedle = quoted("children") + ":" + bs + dq;
+  let searchFrom = 0;
+  while (true) {
+    const idNeedleIndex = html.indexOf(idNeedle, searchFrom);
+    if (idNeedleIndex === -1) break;
+    const idStart = idNeedleIndex + idNeedle.length;
+    const idEnd = html.indexOf(bs + dq, idStart);
+    if (idEnd === -1) break;
+    const childrenNeedleIndex = html.indexOf(childrenNeedle, idEnd + 2);
+    if (childrenNeedleIndex === -1 || childrenNeedleIndex - idEnd > 400) {
+      searchFrom = idEnd + 2;
+      continue;
+    }
+    const textStart = childrenNeedleIndex + childrenNeedle.length;
+    const textEnd = html.indexOf(bs + dq, textStart);
+    if (textEnd === -1) break;
+    const id = __creekDecodeJsStringFragment(html.slice(idStart, idEnd));
+    const text = __creekDecodeJsStringFragment(html.slice(textStart, textEnd));
+    if (typeof id === "string" && id.length > 0 && typeof text === "string") {
+      replacements.set(id, text);
+    }
+    searchFrom = textEnd + 2;
+  }
+  if (replacements.size === 0) return html;
+
+  let patched = html;
+  for (const [id, text] of replacements) {
+    const idAttr = 'id="' + id + '"';
+    let from = 0;
+    while (true) {
+      const idIndex = patched.indexOf(idAttr, from);
+      if (idIndex === -1) break;
+      const openStart = patched.lastIndexOf("<", idIndex);
+      const openEnd = patched.indexOf(">", idIndex);
+      if (openStart === -1 || openEnd === -1) {
+        from = idIndex + idAttr.length;
+        continue;
+      }
+      const closeStart = patched.indexOf("</", openEnd + 1);
+      const closeEnd = closeStart === -1 ? -1 : patched.indexOf(">", closeStart);
+      if (closeStart === -1 || closeEnd === -1 || patched.slice(openEnd + 1, closeStart).includes("<")) {
+        from = openEnd + 1;
+        continue;
+      }
+      patched = patched.slice(0, openEnd + 1) + text + patched.slice(closeStart);
+      from = openEnd + text.length + 1;
+    }
+  }
+  return patched;
 }
 
 class CreekCacheHandler {
@@ -2174,7 +2326,7 @@ class CreekCacheHandler {
 
     if (!entry) return null;
 
-    const age = (Date.now() - entry.lastModified) / 1000;
+    const age = (__CREEK_NATIVE_DATE.now() - entry.lastModified) / 1000;
 
     // Stale by tag invalidation — checks DO shards first (cross-isolate),
     // falls back to the in-memory map.
@@ -2190,6 +2342,22 @@ class CreekCacheHandler {
     const implicitPathTags = __creekImplicitTagsForKey(key);
     const expiredByImplicitPathTag = await __creekTagsInvalidatedSince(implicitPathTags, entry.lastModified);
     if (expiredByImplicitPathTag) {
+      // For App PPR/cacheComponents pages, the existing cache entry carries
+      // the build-time shell + postponed state that Next needs to resume the
+      // revalidation render. Treat it as stale instead of a hard miss;
+      // otherwise Next attempts a full static render and trips dynamic data
+      // such as connection() outside the captured Suspense boundary.
+      if (
+        entry.value?.kind === "APP_PAGE" &&
+        typeof entry.value?.postponed === "string"
+      ) {
+        return {
+          value: entry.value,
+          lastModified: entry.lastModified,
+          age: Math.floor(age),
+          cacheState: "stale",
+        };
+      }
       return null;
     }
     const staleByTag = await __creekTagsInvalidatedSince(explicitTags, entry.lastModified);
@@ -2248,18 +2416,31 @@ class CreekCacheHandler {
         : typeof ctx?.cacheControl?.revalidate === "number"
           ? ctx.cacheControl.revalidate
           : undefined;
+    let value = data;
+    if (value?.kind === "APP_PAGE" && typeof value.html === "string") {
+      const patchedHtml = __creekPatchVisibleHtmlFromFlight(value.html);
+      if (patchedHtml !== value.html) {
+        value = { ...value, html: patchedHtml };
+      }
+    }
     const entry = {
-      value: data,
-      lastModified: Date.now(),
+      value,
+      lastModified: __CREEK_NATIVE_DATE.now(),
       tags,
       revalidate,
     };
     if (ctx?.isFallback) {
       __creekMarkGeneratedFallbackPath(key);
     }
+    const cacheKeys =
+      value?.kind === "APP_PAGE" || value?.kind === "PAGES"
+        ? __creekPathnameAliases(key)
+        : [key];
 
     // L1: always update in-memory
-    globalThis.__CREEK_CACHE.set(key, entry);
+    for (const cacheKey of cacheKeys) {
+      globalThis.__CREEK_CACHE.set(cacheKey, entry);
+    }
 
     // L2: persist to KV (fire-and-forget)
     const kv = __creekKV();
@@ -2277,7 +2458,9 @@ class CreekCacheHandler {
         let serialized;
         try { serialized = JSON.stringify(entry); } catch { return; }
         if (!serialized || serialized.length > 24_000_000) return; // KV 25MB limit
-        const p = kv.put(__CREEK_KV_PREFIX + key, serialized, { expirationTtl });
+        const p = Promise.all(
+          cacheKeys.map((cacheKey) => kv.put(__CREEK_KV_PREFIX + cacheKey, serialized, { expirationTtl })),
+        );
         if (kvCtx && typeof kvCtx.waitUntil === "function") {
           try { kvCtx.waitUntil(p.catch(() => {})); } catch { await p.catch(() => {}); }
         } else {
@@ -2293,7 +2476,7 @@ class CreekCacheHandler {
         keys = new Set();
         globalThis.__CREEK_TAG_TO_KEYS.set(tag, keys);
       }
-      keys.add(key);
+      for (const cacheKey of cacheKeys) keys.add(cacheKey);
     }
   }
 
@@ -2317,8 +2500,33 @@ globalThis.__CREEK_CACHE_HANDLER = CreekCacheHandler;
 // private key from requestMeta injection so Next.js never falls back
 // to its filesystem-backed cache (which 500s under workerd's read-only
 // fs).
+function __creekHeaderValue(headers, name) {
+  if (!headers) return undefined;
+  if (typeof headers.get === "function") return headers.get(name) ?? undefined;
+  const lower = name.toLowerCase();
+  return headers[lower] ?? headers[name] ?? undefined;
+}
+
+function __creekPreviouslyRevalidatedTagsFromHeaders(headers) {
+  const token = __creekHeaderValue(headers, "x-next-revalidate-tag-token");
+  const tagsHeader = __creekHeaderValue(headers, "x-next-revalidated-tags");
+  const previewModeId = __getPrerenderManifest()?.preview?.previewModeId;
+  if (!previewModeId || token !== previewModeId || typeof tagsHeader !== "string") return [];
+  return tagsHeader.split(",").map((tag) => tag.trim()).filter(Boolean);
+}
+
+function __creekApplyRequestRevalidatedTags(cache, requestHeaders) {
+  if (!cache || requestHeaders == null) return cache;
+  const revalidatedTags = __creekPreviouslyRevalidatedTagsFromHeaders(requestHeaders);
+  cache.revalidatedTags = revalidatedTags;
+  if (cache.cacheHandler) cache.cacheHandler.revalidatedTags = revalidatedTags;
+  return cache;
+}
+
 function __creekGetIncrementalCache(requestHeaders) {
-  if (globalThis.__CREEK_INCREMENTAL_CACHE) return globalThis.__CREEK_INCREMENTAL_CACHE;
+  if (globalThis.__CREEK_INCREMENTAL_CACHE) {
+    return __creekApplyRequestRevalidatedTags(globalThis.__CREEK_INCREMENTAL_CACHE, requestHeaders);
+  }
   try {
     globalThis.__CREEK_INCREMENTAL_CACHE = new IncrementalCache({
       dev: false,
@@ -2334,7 +2542,7 @@ function __creekGetIncrementalCache(requestHeaders) {
     // and that's visible in the test suite.
     console.error("[creek-cache] failed to construct IncrementalCache:", err?.message);
   }
-  return globalThis.__CREEK_INCREMENTAL_CACHE;
+  return __creekApplyRequestRevalidatedTags(globalThis.__CREEK_INCREMENTAL_CACHE, requestHeaders);
 }
 
 // =====================================================================
@@ -2359,7 +2567,8 @@ class CreekComposableCacheHandler {
     if (!globalThis.__CREEK_CC_TAG_STATE) globalThis.__CREEK_CC_TAG_STATE = new Map();
   }
 
-  async get(cacheKey) {
+  async get(cacheKey, implicitTags) {
+    const implicitTagList = Array.isArray(implicitTags) ? implicitTags : [];
     // Check the request-scoped shell seeds first. These are build-time
     // \`'use cache'\` values extracted from the matching fallback shell's
     // postponedState — they take precedence over any runtime-populated
@@ -2373,16 +2582,8 @@ class CreekComposableCacheHandler {
         if (seeds) {
           const seed = seeds.get(cacheKey);
           if (seed) {
-            let seedInvalidated = false;
-            for (const tag of seed.tags) {
-              const state = globalThis.__CREEK_CC_TAG_STATE.get(tag);
-              if (state && state.stale !== undefined && state.stale > seed.timestamp) {
-                // Seed invalidated by a runtime tag flip — fall through to
-                // normal handler path so a fresh render happens.
-                seedInvalidated = true;
-                break;
-              }
-            }
+            const seedInvalidated =
+              (await __creekMaxRevalidatedAt([...(seed.tags || []), ...implicitTagList])) > seed.timestamp;
             if (!seedInvalidated) {
               return {
                 value: new ReadableStream({
@@ -2418,11 +2619,8 @@ class CreekComposableCacheHandler {
     // expiry window (e.g. \`'minutes'\` → 3600s) look stale forever after one
     // \`revalidateTag\` call, so the handler re-ran on every read even after a
     // fresh entry was produced — blowing cache hit rates to zero.
-    for (const tag of entry.tags) {
-      const state = globalThis.__CREEK_CC_TAG_STATE.get(tag);
-      if (state && state.stale !== undefined && state.stale > entry.timestamp) {
-        return undefined;
-      }
+    if ((await __creekMaxRevalidatedAt([...(entry.tags || []), ...implicitTagList])) > entry.timestamp) {
+      return undefined;
     }
 
     // Time-based staleness (narrow — only for aggressive \`cacheLife\`): return
@@ -2449,7 +2647,7 @@ class CreekComposableCacheHandler {
       typeof entry.revalidate === "number" &&
       entry.revalidate >= 0 &&
       entry.revalidate <= 10 &&
-      Date.now() > entry.timestamp + entry.revalidate * 1000
+      __CREEK_NATIVE_DATE.now() > entry.timestamp + entry.revalidate * 1000
     ) {
       return undefined;
     }
@@ -2496,7 +2694,7 @@ class CreekComposableCacheHandler {
         value: buf,
         tags: entry.tags || [],
         stale: entry.stale,
-        timestamp: entry.timestamp != null ? entry.timestamp : Date.now(),
+        timestamp: entry.timestamp != null ? entry.timestamp : __CREEK_NATIVE_DATE.now(),
         expire: entry.expire,
         revalidate: entry.revalidate,
       };
@@ -2524,12 +2722,7 @@ class CreekComposableCacheHandler {
    */
   async getExpiration(...tags) {
     const flat = tags.flat();
-    let max = 0;
-    for (const tag of flat) {
-      const state = globalThis.__CREEK_CC_TAG_STATE.get(tag);
-      if (state && state.stale != null && state.stale > max) max = state.stale;
-    }
-    return max;
+    return __creekMaxRevalidatedAt(flat);
   }
 
   /** Pre-Next-16 path. Forwarded to updateTags with no duration. */
@@ -2552,7 +2745,7 @@ class CreekComposableCacheHandler {
    * after() + revalidatePath had no effect on node-side cache entries.
    */
   async updateTags(tags, durations) {
-    const now = Date.now();
+    const now = __CREEK_NATIVE_DATE.now();
     const expire = durations && durations.expire !== undefined ? now + durations.expire * 1000 : now;
     const normalizedTags = [];
     for (const tag of tags) {
@@ -2574,6 +2767,29 @@ class CreekComposableCacheHandler {
         __nextTagsManifest.set(t, Object.assign({}, existing, { stale: now, expired: now }));
       }
     } catch {}
+    const env = __creekCurrentEnv();
+    if (env && env.NEXT_TAG_CACHE_DO_SHARDED) {
+      const buckets = __creekBucketTagsByShard(normalizedTags);
+      const writes = [];
+      for (const [shardKey, shardTags] of buckets) {
+        const stub = __creekShardStub(env, shardKey);
+        if (!stub) continue;
+        writes.push(stub.writeTags(shardTags, now).catch(() => {}));
+      }
+      const ctx = (() => {
+        try {
+          return __INTERNAL_FETCH_CONTEXT.getStore()?.ctx ?? null;
+        } catch {
+          return null;
+        }
+      })();
+      if (ctx && typeof ctx.waitUntil === "function") {
+        try { ctx.waitUntil(Promise.all(writes).catch(() => {})); }
+        catch { await Promise.all(writes).catch(() => {}); }
+      } else {
+        await Promise.all(writes).catch(() => {});
+      }
+    }
   }
 }
 
@@ -2706,6 +2922,25 @@ const __CREEK_POSTPONED_BY_SHELL = (() => {
 })();
 
 function __creekPostponedForPathname(pathname) {
+  if (!pathname) return null;
+  // Concrete cacheComponents/PPR prerenders produced by generateStaticParams
+  // can also carry postponed state. When a tag/path invalidation bypasses
+  // the static HTML fast-path, the handler must resume that concrete
+  // prerender; otherwise a full prerender hits runtime data such as
+  // connection() and throws NEXT_STATIC_GEN_BAILOUT.
+  const concrete = __creekPrerenderEntryForPathname(pathname);
+  if (typeof concrete?.postponedState === "string" && concrete.postponedState.length > 0) {
+    return concrete.postponedState;
+  }
+  if (__CREEK_POSTPONED_BY_SHELL.length === 0) return null;
+  const pathnameAliases = __creekPathnameAliases(pathname);
+  for (const shell of __CREEK_POSTPONED_BY_SHELL) {
+    if (pathnameAliases.some((candidate) => shell.regex.test(candidate))) return shell.postponedState;
+  }
+  return null;
+}
+
+function __creekFallbackShellPostponedForPathname(pathname) {
   if (!pathname || __CREEK_POSTPONED_BY_SHELL.length === 0) return null;
   const pathnameAliases = __creekPathnameAliases(pathname);
   for (const shell of __CREEK_POSTPONED_BY_SHELL) {
@@ -2721,6 +2956,21 @@ function __creekPrerenderEntryForPathname(pathname) {
     if (entry) return entry;
   }
   return null;
+}
+
+function __creekCacheTagsForPrerenderEntry(entry) {
+  const raw =
+    entry?.metaHeaders?.["x-next-cache-tags"] ??
+    entry?.initialHeaders?.["x-next-cache-tags"];
+  return typeof raw === "string"
+    ? raw.split(",").map((tag) => tag.trim()).filter(Boolean)
+    : [];
+}
+
+async function __creekRevalidatedTagsForPathname(pathname) {
+  const entry = __creekPrerenderEntryForPathname(pathname);
+  const tags = __creekCacheTagsForPrerenderEntry(entry);
+  return tags.length > 0 ? __creekRevalidatedTags(tags, 0) : [];
 }
 
 function __creekHasPostponedPrerenderForPathname(...pathnames) {
@@ -6182,27 +6432,66 @@ async function __handleRequestInner(request, env, ctx) {
       // assets because the handler needs to manage the fresh → stale → SWR
       // lifecycle via IncrementalCache. Serving from assets would freeze the
       // build-time snapshot forever, skipping time-based revalidation.
+      // Concrete App PPR/cacheComponents prerenders are the exception: their
+      // static HTML is the deploy-time hard-navigation shell, and stale tags
+      // / on-demand revalidation below already bypass it when it is invalid.
       // When a handler exists for an ISR page, we let it run so getStaticProps
       // executes with the correct revalidateReason ('stale' after TTL expires,
       // 'on-demand' after res.revalidate()). Fixes revalidate-reason "stale",
       // trailingslash revalidation, and stale-cache-serving tests.
       const isISRPage = staticEntry?.initialRevalidate != null && staticEntry.initialRevalidate > 0;
+      const staticEntryHandlerPathname = (() => {
+        if (resolvedPathname && HANDLERS[resolvedPathname]) return resolvedPathname;
+        const candidates = [];
+        const addCandidate = (pathname) => {
+          if (typeof pathname !== "string" || !pathname.startsWith("/")) return;
+          if (!candidates.includes(pathname)) candidates.push(pathname);
+          if (BASE_PATH && (pathname === BASE_PATH || pathname.startsWith(BASE_PATH + "/"))) {
+            const withoutBase = pathname.slice(BASE_PATH.length) || "/";
+            if (!candidates.includes(withoutBase)) candidates.push(withoutBase);
+          }
+          if (pathname !== "/" && pathname.endsWith("/")) {
+            const stripped = pathname.slice(0, -1);
+            if (!candidates.includes(stripped)) candidates.push(stripped);
+          }
+          try {
+            const decoded = decodeURIComponent(pathname);
+            if (!candidates.includes(decoded)) candidates.push(decoded);
+          } catch {}
+        };
+        addCandidate(servePath);
+        addCandidate(url.pathname);
+        addCandidate(decodedPathname);
+        addCandidate(result?.invocationTarget?.pathname);
+        for (const candidate of candidates) {
+          if (HANDLERS[candidate]) return candidate;
+          const dyn = __matchDynamicRoute(candidate);
+          if (dyn?.page && HANDLERS[dyn.page]) return dyn.page;
+        }
+        return null;
+      })();
+      if (staticEntryHandlerPathname && (!resolvedPathname || !HANDLERS[resolvedPathname])) {
+        resolvedPathname = staticEntryHandlerPathname;
+      }
       const hasHandler = resolvedPathname && HANDLERS[resolvedPathname];
       const isAppRouterBracketShell =
         staticEntry?.routerType === "APP" && isServingBracketShell && !!hasHandler;
+      const isConcreteAppPPRPage =
+        staticEntry?.routerType === "APP" &&
+        !!hasHandler &&
+        !isServingBracketShell &&
+        __creekHasPostponedPrerenderForPathname(url.pathname, decodedPathname, servePath);
+      const shouldBypassStaticForISR = isISRPage && hasHandler && !isConcreteAppPPRPage;
       // Any tag on this prerender invalidated since build? If yes the static
       // HTML is stale — skip the fast-path and let the handler rebuild so the
       // server-action-side updateTag/revalidateTag actually takes effect.
       // Uses \`__CREEK_TAG_INVALIDATED_AT\` which server actions write via
       // \`CreekCacheHandler.revalidateTag\` / \`CreekComposableCacheHandler.updateTags\`.
       let staleByTag = false;
+      let staleByTagTags = [];
       if (staticEntry?.cacheTags && hasHandler) {
-        const mem = globalThis.__CREEK_TAG_INVALIDATED_AT;
-        if (mem) {
-          for (const tag of staticEntry.cacheTags) {
-            if (mem.has(tag)) { staleByTag = true; break; }
-          }
-        }
+        staleByTagTags = await __creekRevalidatedTags(staticEntry.cacheTags, 0);
+        staleByTag = staleByTagTags.length > 0;
       }
       // \`res.revalidate(path)\` in a Pages Router API route sends a HEAD
       // to the target path with \`x-prerender-revalidate: <previewModeId>\`.
@@ -6245,7 +6534,7 @@ async function __handleRequestInner(request, env, ctx) {
         !isAppRouterBracketShell &&
         (!isRewritten || !hasHandlerForTarget) &&
         // ISR pages bypass static assets when a handler exists.
-        !(isISRPage && hasHandler) &&
+        !shouldBypassStaticForISR &&
         // A previous revalidateTag/updateTag marked one of this page's
         // tags stale — fall through to handler so the fresh render runs.
         !staleByTag &&
@@ -6292,7 +6581,9 @@ async function __handleRequestInner(request, env, ctx) {
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
         !nextDataAppRouterPath &&
-        !(isISRPage && hasHandler) &&
+        !shouldBypassStaticForISR &&
+        !staleByTag &&
+        !staleByOnDemand &&
         (!isRewritten || !hasHandlerForTarget)
       ) {
         try {
@@ -7515,10 +7806,32 @@ async function __handleRequestInner(request, env, ctx) {
           if (!globalThis.__CREEK_PATH_REVALIDATED_AT) {
             globalThis.__CREEK_PATH_REVALIDATED_AT = new Map();
           }
-          const now = Date.now();
+          const now = __CREEK_NATIVE_DATE.now();
           const keys = [resolvedPathname, url.pathname, servePath].filter(Boolean);
           for (const k of keys) {
             globalThis.__CREEK_PATH_REVALIDATED_AT.set(k, now);
+          }
+        }
+      } catch {}
+      try {
+        if (
+          __invokedResponse &&
+          __invokedResponse.status === 200 &&
+          handler?.type === "APP_PAGE" &&
+          request.method !== "HEAD" &&
+          (__invokedResponse.headers.get("content-type") || "").includes("text/html") &&
+          __invokedResponse.headers.get("x-nextjs-cache") === "PRERENDER"
+        ) {
+          const text = await __invokedResponse.clone().text();
+          const patchedText = __creekPatchVisibleHtmlFromFlight(text);
+          if (patchedText !== text) {
+            const headers = new Headers(__invokedResponse.headers);
+            headers.delete("content-length");
+            __invokedResponse = new Response(patchedText, {
+              status: __invokedResponse.status,
+              statusText: __invokedResponse.statusText,
+              headers,
+            });
           }
         }
       } catch {}
@@ -7671,7 +7984,7 @@ async function __handleRequestWithLog(request, env, ctx) {
   // trail. Without this, POSTs that wedge in workerd never log anything
   // and look indistinguishable from "request never arrived".
   console.error("[creek-req] >>>", reqMethod, reqUrl, "ct=" + reqCT, "next-action=" + reqAID);
-  const t0 = Date.now();
+  const t0 = __CREEK_NATIVE_DATE.now();
   let res;
   try {
     res = await __handleRequest(request, env, ctx);
@@ -7679,7 +7992,7 @@ async function __handleRequestWithLog(request, env, ctx) {
     console.error("[creek-req] THROW", reqMethod, reqUrl, err instanceof Error ? (err.stack || err.message) : String(err));
     throw err;
   }
-  const dt = Date.now() - t0;
+  const dt = __CREEK_NATIVE_DATE.now() - t0;
   const status = res && typeof res.status === "number" ? res.status : "?";
   const ct = res && res.headers && typeof res.headers.get === "function" ? (res.headers.get("content-type") || "-") : "-";
   const cl = res && res.headers && typeof res.headers.get === "function" ? (res.headers.get("content-length") || "-") : "-";
@@ -8165,9 +8478,13 @@ function collectStaticPageMap(
   for (const prerender of outputs.prerenders) {
     if (!prerender.fallback?.filePath) continue;
     if (prerender.pathname.startsWith("/_next/")) continue;
-    // PPR/postponed prerenders need the route handler so the shell can
+    // Bracket-form PPR fallback shells need the route handler so the shell can
     // stream and later resolve its dynamic segments. Serving their fallback
     // HTML directly from assets leaves the client stuck on the loading shell.
+    // Concrete PPR prerenders from generateStaticParams are different: their
+    // HTML file is the hard-navigation shell and includes the bootstrap needed
+    // to hydrate forms and reveal streamed segments, so those must stay in
+    // STATIC_PAGES until a tag/path invalidation makes the shell stale.
     // Exception: a concrete Server Action page with PPR headers but no
     // postponed state is fully static HTML whose form carries build-time
     // encrypted bound args. Serve that HTML from assets so action POST resume
@@ -8177,7 +8494,13 @@ function collectStaticPageMap(
       !!prerender.pprChain?.headers &&
       serverActionPages.has(prerender.pathname) &&
       prerenderHtmlHasBoundServerAction(prerender.fallback.filePath);
-    if (prerender.fallback.postponedState || (prerender.pprChain?.headers && !staticServerActionPpr)) continue;
+    const isBracketFallbackShell = prerender.pathname.includes("[");
+    if (
+      isBracketFallbackShell &&
+      (prerender.fallback.postponedState || (prerender.pprChain?.headers && !staticServerActionPpr))
+    ) {
+      continue;
+    }
 
     const routerType = classifyRouterType(prerender.pathname);
     const entry: StaticPageEntry = {
@@ -8851,6 +9174,23 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   // Build IncomingMessage with body already buffered
   const req = new IncomingMessage();
   req.method = request.method;
+  const __requestHeadersForCache = Object.fromEntries(request.headers);
+  const __revalidatedTagsForThisPath = await __creekRevalidatedTagsForPathname(url.pathname);
+  if (__revalidatedTagsForThisPath.length > 0) {
+    const previewModeId = __getPrerenderManifest()?.preview?.previewModeId;
+    if (previewModeId) {
+      const existingTags = (__requestHeadersForCache["x-next-revalidated-tags"] || "")
+        .split(",")
+        .map((tag) => tag.trim())
+        .filter(Boolean);
+      for (const tag of __revalidatedTagsForThisPath) {
+        if (!existingTags.includes(tag)) existingTags.push(tag);
+      }
+      __requestHeadersForCache["x-next-revalidated-tags"] = existingTags.join(",");
+      __requestHeadersForCache["x-next-revalidate-tag-token"] = previewModeId;
+    }
+  }
+  const __incrementalCacheForRequest = __creekGetIncrementalCache(__requestHeadersForCache);
   // Populate Next.js's private request metadata so the app-render layer
   // can reconstruct the caller's origin/protocol/host. Two consumers rely
   // on this:
@@ -8871,9 +9211,16 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   // Next.js resume the render from the captured prelude + RDC instead of
   // re-running every \`'use cache'\` function — which is what was leaking
   // runtime timestamps into layouts and producing hydration mismatches.
+  //
+  // Do not inject concrete PPR prerenders here. For hard navigations those
+  // must flow through IncrementalCache so Next can stream the build-time HTML
+  // shell first, then append the resumed dynamic tail. Supplying concrete
+  // postponed state as request meta makes Next return a resume-only stream,
+  // which is not parseable by deploy-mode render$ tests and leaves browsers
+  // with a blank first paint.
   const __postponedForThisPath = isRSCRequest
     ? null
-    : __creekPostponedForPathname(url.pathname);
+    : __creekFallbackShellPostponedForPathname(url.pathname);
   if (__postponedForThisPath) {
     try {
       const store = __INTERNAL_FETCH_CONTEXT.getStore();
@@ -8893,7 +9240,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     // globalThis.__incrementalCache — which is why earlier tries to
     // plumb the cache via workStore had zero effect. Injecting through
     // requestMeta is the upstream-supported override point.
-    incrementalCache: __creekGetIncrementalCache(),
+    incrementalCache: __incrementalCacheForRequest,
     ...(__postponedForThisPath ? { postponed: __postponedForThisPath } : {}),
     // \`res.revalidate(path)\` in Pages Router API routes reads
     // \`routerServerContext.revalidate\` which comes from
@@ -9125,6 +9472,10 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     routeResult.resolvedHeaders.forEach((val, key) => {
       req.headers[key.toLowerCase()] = val;
     });
+  }
+  if (__requestHeadersForCache["x-next-revalidated-tags"]) {
+    req.headers["x-next-revalidated-tags"] = __requestHeadersForCache["x-next-revalidated-tags"];
+    req.headers["x-next-revalidate-tag-token"] = __requestHeadersForCache["x-next-revalidate-tag-token"];
   }
   // Pages Router data-request marker: Next.js's render layer reads
   // \`req.headers["x-nextjs-data"]\` to decide whether to emit JSON or
@@ -9798,6 +10149,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       isDynamicRoute || Object.keys(normalizedRouteParams).length > 0
         ? normalizedRouteParams
         : undefined;
+    const internalRequestMeta = req[NEXT_REQUEST_META] || {};
     const requestMeta = {
       minimalMode: false,
       params: paramsForHandler,
@@ -9807,6 +10159,9 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       ...(isPrefetchRSCRequest ? { isPrefetchRSCRequest: true } : {}),
       ...(typeof segmentPrefetchRSCRequest === "string"
         ? { segmentPrefetchRSCRequest }
+        : {}),
+      ...(typeof internalRequestMeta.postponed === "string"
+        ? { postponed: internalRequestMeta.postponed }
         : {}),
     };
     const handlerResult = handlerFn(req, res, {
@@ -9824,8 +10179,8 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
         // Pages-api template calls \`setRequestMeta(req, ctx.requestMeta)\`
         // which REPLACES our \`req[NEXT_REQUEST_META]\` wholesale. Include
         // incrementalCache + revalidate here so they survive the overwrite.
-        incrementalCache: __creekGetIncrementalCache(),
-        revalidate: req[Symbol.for("NextInternalRequestMeta")]?.revalidate,
+        incrementalCache: __incrementalCacheForRequest,
+        revalidate: internalRequestMeta.revalidate,
       },
     });
 

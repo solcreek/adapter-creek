@@ -816,6 +816,60 @@ export function patchNullFallbackPartialShellBlocking(workerCode: string): strin
   );
 }
 
+export function patchAppPageRevalidationPostponedState(workerCode: string): string {
+  const readableNeedle = `        let postponed =
+          !isOnDemandRevalidate && !isRevalidating && minimalPostponed
+            ? minimalPostponed
+            : undefined
+
+        if (
+          // If this is a dynamic RSC request or a server action request, we should
+`;
+  const readableReplacement = `        let postponed =
+          !isOnDemandRevalidate && !isRevalidating && minimalPostponed
+            ? minimalPostponed
+            : undefined
+
+        if (
+          typeof postponed === 'undefined' &&
+          isRevalidating &&
+          previousIncrementalCacheEntry?.value?.kind === CachedRouteKind.APP_PAGE &&
+          typeof previousIncrementalCacheEntry.value.postponed === 'string'
+        ) {
+          postponed = previousIncrementalCacheEntry.value.postponed
+        }
+
+        if (
+          // If this is a dynamic RSC request or a server action request, we should
+`;
+  workerCode = workerCode.replace(readableNeedle, readableReplacement);
+
+  const minifiedPattern =
+    /(__name\(async\s*\(\{\s*hasResolved:\s*(\w+),\s*previousCacheEntry:\s*(\w+),\s*isRevalidating:\s*(\w+),\s*span:\s*(\w+),\s*forceStaticRender:\s*(\w+)\s*=\s*false\s*\}\)\s*=>\s*\{[\s\S]{0,6000}?)(let\s+(\w+)\s*=\s*(\w+)\s*\|\|\s*\4\s*\|\|\s*!(\w+)\s*\?\s*void 0\s*:\s*(\w+)\s*;)/g;
+
+  return workerCode.replace(
+    minifiedPattern,
+    (
+      match: string,
+      prefix: string,
+      _hasResolvedVar: string,
+      previousCacheEntryVar: string,
+      isRevalidatingVar: string,
+      _spanVar: string,
+      _forceStaticRenderVar: string,
+      declaration: string,
+      postponedVar: string,
+      _onDemandRevalidateVar: string,
+      minimalPostponedVar: string,
+      fallbackPostponedVar: string,
+    ) => {
+      if (match.includes("__creekRevalidationPostponedState")) return match;
+      if (minimalPostponedVar !== fallbackPostponedVar) return match;
+      return `${prefix}${declaration}/* __creekRevalidationPostponedState */if(void 0===${postponedVar}&&${isRevalidatingVar}&&${previousCacheEntryVar}&&${previousCacheEntryVar}.value&&${previousCacheEntryVar}.value.kind==="APP_PAGE"&&"string"==typeof ${previousCacheEntryVar}.value.postponed)${postponedVar}=${previousCacheEntryVar}.value.postponed;`;
+    },
+  );
+}
+
 export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   // Patch Turbopack runtime BEFORE wrangler bundles.
   // Turbopack's R.c() dynamically loads chunks from the filesystem.
@@ -1205,6 +1259,12 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     // bailout instead of completing the request. Keep these routes on the
     // blocking path and let the concrete request render/cache directly.
     workerCode = patchNullFallbackPartialShellBlocking(workerCode);
+    // During App PPR/cacheComponents background revalidation, Next 16 drops
+    // the existing APP_PAGE postponed state because it only resumes dynamic
+    // RSC and server-action requests. In Workers minimal output we need that
+    // postponed state to rerender the PPR shell; otherwise the revalidation
+    // becomes a full static render and hits dynamic APIs like connection().
+    workerCode = patchAppPageRevalidationPostponedState(workerCode);
 
     // Unify Next's `*AsyncStorageInstance` singletons across Turbopack
     // chunks via a `globalThis` key. Turbopack emits the `work-unit-async-
