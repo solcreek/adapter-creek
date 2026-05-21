@@ -147,10 +147,11 @@ export const existsSync = (filePath) => {
   if (findInUserFiles(filePath) !== undefined) return true;
   if (isUserFilesDirectory(filePath)) return true;
   if (typeof globalThis.__MANIFESTS === "undefined") return false;
+  const normalizedPath = normalizePath(filePath);
   for (const key of Object.keys(globalThis.__MANIFESTS)) {
-    if (key === filePath || key.endsWith(filePath)) return true;
-    if (filePath.includes(".next/")) {
-      const tail = ".next/" + filePath.split(".next/").pop();
+    if (key === normalizedPath || key.endsWith(normalizedPath)) return true;
+    if (normalizedPath.includes(".next/")) {
+      const tail = ".next/" + normalizedPath.split(".next/").pop();
       const keyTail = key.includes(".next/") ? ".next/" + key.split(".next/").pop() : "";
       if (tail === keyTail) return true;
     }
@@ -158,19 +159,20 @@ export const existsSync = (filePath) => {
   return false;
 };
 export const readFileSync = (filePath, enc) => {
+  const normalizedPath = normalizePath(filePath);
   // Try reading from embedded manifests
   if (typeof globalThis.__MANIFESTS !== "undefined") {
     for (const [key, val] of Object.entries(globalThis.__MANIFESTS)) {
-      if (key === filePath || key.endsWith(filePath)) return val;
+      if (key === normalizedPath || key.endsWith(normalizedPath)) return val;
       // Match by .next/ relative tail — handles different path prefixes
       // e.g. /bundle/.next/routes-manifest.json → .next/routes-manifest.json
-      if (filePath.includes(".next/")) {
-        const tail = ".next/" + filePath.split(".next/").pop();
+      if (normalizedPath.includes(".next/")) {
+        const tail = ".next/" + normalizedPath.split(".next/").pop();
         const keyTail = key.includes(".next/") ? ".next/" + key.split(".next/").pop() : "";
         if (tail === keyTail) return val;
       }
       // Last resort: match by filename
-      if (filePath.split("/").pop() === key.split("/").pop()) return val;
+      if (normalizedPath.split("/").pop() === key.split("/").pop()) return val;
     }
   }
   // Then try user-side data files (data.json, fixtures, fonts, etc.).
@@ -180,7 +182,7 @@ export const readFileSync = (filePath, enc) => {
   if (userContent !== undefined) return maybeDecodeBinary(userContent, enc);
   // Throw ENOENT like real fs — Next.js loadManifest relies on this
   // to distinguish between missing and empty files.
-  const err = new Error(`ENOENT: no such file or directory, open '${filePath}'`);
+  const err = new Error(`ENOENT: no such file or directory, open '${normalizedPath}'`);
   err.code = "ENOENT";
   throw err;
 };

@@ -620,10 +620,46 @@ function patchAfterContextRunCallbacksOnClose(workerCode: string): string {
 }
 
 function patchUseCachePrerenderDanglingPromiseBailout(workerCode: string): string {
+  const findHangingPromiseCall = (
+    followingCode: string,
+    workUnitStoreVar: string,
+  ): { callee: string; workStoreVar: string } | undefined => {
+    const namespaceCallPattern = new RegExp(
+      String.raw`\(0,\s*(\w+)\.makeHangingPromise\)\(\s*${workUnitStoreVar}\.renderSignal\s*,\s*(\w+)\.route`,
+    );
+    const namespaceCallMatch = namespaceCallPattern.exec(followingCode);
+    if (namespaceCallMatch) {
+      return {
+        callee: `(0, ${namespaceCallMatch[1]}.makeHangingPromise)`,
+        workStoreVar: namespaceCallMatch[2],
+      };
+    }
+
+    const directCallPattern = new RegExp(
+      String.raw`\b(makeHangingPromise)\(\s*${workUnitStoreVar}\.renderSignal\s*,\s*(\w+)\.route`,
+    );
+    const directCallMatch = directCallPattern.exec(followingCode);
+    if (directCallMatch) {
+      return {
+        callee: directCallMatch[1],
+        workStoreVar: directCallMatch[2],
+      };
+    }
+
+    return undefined;
+  };
+
+  const danglingBailout = (
+    serializedKeyVar: string,
+    workUnitStoreVar: string,
+    hangingCall: { callee: string; workStoreVar: string },
+  ): string =>
+    `if (("prerender" === ${workUnitStoreVar}.type || "prerender-runtime" === ${workUnitStoreVar}.type) && "string" == typeof ${serializedKeyVar}) { let __creekDanglingThenableStart = ${serializedKeyVar}.lastIndexOf("$@"); if (__creekDanglingThenableStart !== -1 && ${serializedKeyVar}.indexOf(":", __creekDanglingThenableStart) === -1) return ${hangingCall.callee}(${workUnitStoreVar}.renderSignal, ${hangingCall.workStoreVar}.route, 'dynamic "use cache"'); }`;
+
   const serializedKeyPattern =
     /let\s+(\w+)\s*=\s*"string"\s*==\s*typeof\s+(\w+)\s*\?\s*\2\s*:\s*await\s+(\w+)\(\2\),\s*(\w+)\s*=\s*(\w+)\.rootParams/g;
 
-  return workerCode.replace(
+  let patchedCode = workerCode.replace(
     serializedKeyPattern,
     (
       match: string,
@@ -636,18 +672,40 @@ function patchUseCachePrerenderDanglingPromiseBailout(workerCode: string): strin
       fullCode: string,
     ) => {
       const followingCode = fullCode.slice(offset, offset + 3000);
-      const hangingCallPattern = new RegExp(
-        String.raw`\(0,\s*(\w+)\.makeHangingPromise\)\(\s*${workUnitStoreVar}\.renderSignal\s*,\s*(\w+)\.route`,
-      );
-      const hangingCallMatch = hangingCallPattern.exec(followingCode);
-      if (!hangingCallMatch) return match;
+      const hangingCall = findHangingPromiseCall(followingCode, workUnitStoreVar);
+      if (!hangingCall) return match;
 
-      const makeHangingPromiseVar = hangingCallMatch[1];
-      const workStoreVar = hangingCallMatch[2];
-
-      return `let ${serializedKeyVar} = "string" == typeof ${encodedKeyVar} ? ${encodedKeyVar} : await ${encodeFnVar}(${encodedKeyVar}); if (("prerender" === ${workUnitStoreVar}.type || "prerender-runtime" === ${workUnitStoreVar}.type) && "string" == typeof ${serializedKeyVar}) { let __creekDanglingThenableStart = ${serializedKeyVar}.lastIndexOf("$@"); if (__creekDanglingThenableStart !== -1 && ${serializedKeyVar}.indexOf(":", __creekDanglingThenableStart) === -1) return (0, ${makeHangingPromiseVar}.makeHangingPromise)(${workUnitStoreVar}.renderSignal, ${workStoreVar}.route, 'dynamic "use cache"'); } let ${rootParamsVar} = ${workUnitStoreVar}.rootParams`;
+      return `let ${serializedKeyVar} = "string" == typeof ${encodedKeyVar} ? ${encodedKeyVar} : await ${encodeFnVar}(${encodedKeyVar}); ${danglingBailout(serializedKeyVar, workUnitStoreVar, hangingCall)} let ${rootParamsVar} = ${workUnitStoreVar}.rootParams`;
     },
   );
+
+  const readableSerializedKeyPattern =
+    /((?:const|let|var)\s+(\w+)\s*=\s*typeof\s+(\w+)\s*===\s*['"]string['"]\s*\?\s*(?:(?:\/\/[^\r\n]*(?:\r?\n))|\/\*[\s\S]*?\*\/|\s)*?\3\s*:\s*await\s+(\w+)\(\3\)\s*;\s*(?:(?:\/\/[^\r\n]*(?:\r?\n))|\/\*[\s\S]*?\*\/|\s)*?)(const|let|var)\s+(\w+)\s*=\s*(\w+)\.rootParams/g;
+
+  patchedCode = patchedCode.replace(
+    readableSerializedKeyPattern,
+    (
+      match: string,
+      prefix: string,
+      serializedKeyVar: string,
+      _encodedKeyVar: string,
+      _encodeFnVar: string,
+      rootParamsDecl: string,
+      rootParamsVar: string,
+      workUnitStoreVar: string,
+      offset: number,
+      fullCode: string,
+    ) => {
+      if (match.includes("__creekDanglingThenableStart")) return match;
+      const followingCode = fullCode.slice(offset, offset + 5000);
+      const hangingCall = findHangingPromiseCall(followingCode, workUnitStoreVar);
+      if (!hangingCall) return match;
+
+      return `${prefix}${danglingBailout(serializedKeyVar, workUnitStoreVar, hangingCall)} ${rootParamsDecl} ${rootParamsVar} = ${workUnitStoreVar}.rootParams`;
+    },
+  );
+
+  return patchedCode;
 }
 
 function patchNullFallbackPartialShellBlocking(workerCode: string): string {
