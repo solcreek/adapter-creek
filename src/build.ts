@@ -373,7 +373,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // handlers may read at runtime via fs.readFileSync. Next.js's adapter API
   // exposes these per-output as `output.assets` (the result of file tracing).
   // We embed them in __USER_FILES so the fs shim can serve them in workerd.
-  const userFiles = await collectUserFiles(ctx.outputs, ctx.distDir);
+  const userFiles = await collectUserFiles(ctx.outputs, ctx.distDir, ctx.projectDir);
   if (Object.keys(userFiles).length > 0) {
     console.log(`  [Creek Adapter] ${Object.keys(userFiles).length} user data files embedded`);
   }
@@ -1268,6 +1268,7 @@ async function collectManifests(distDir: string): Promise<Record<string, string>
 async function collectUserFiles(
   outputs: BuildContext["outputs"],
   distDir?: string,
+  projectDir?: string,
 ): Promise<Record<string, string>> {
   const TEXT_EXTENSIONS = new Set([
     ".json", ".txt", ".yaml", ".yml", ".md", ".csv", ".xml",
@@ -1286,12 +1287,15 @@ async function collectUserFiles(
   const files: Record<string, string> = {};
   let totalBytes = 0;
 
-  const allOutputs = [
+  const allOutputs: Array<{ assets?: Record<string, string> }> = [
     ...outputs.appPages,
     ...outputs.appRoutes,
     ...outputs.pages,
     ...outputs.pagesApi,
   ];
+  if (outputs.middleware) {
+    allOutputs.push(outputs.middleware);
+  }
 
   for (const output of allOutputs) {
     const assets = (output as { assets?: Record<string, string> }).assets;
@@ -1374,6 +1378,19 @@ async function collectUserFiles(
           if (totalBytes + encoded.length > MAX_TOTAL_BYTES) continue;
           files[embeddedPath] = encoded;
           totalBytes += encoded.length;
+        }
+      } catch {}
+    }
+  }
+
+  if (projectDir) {
+    const packageJsonPath = path.join(projectDir, "package.json");
+    if (!files["package.json"]) {
+      try {
+        const content = await fs.readFile(packageJsonPath, "utf-8");
+        if (totalBytes + content.length <= MAX_TOTAL_BYTES) {
+          files["package.json"] = content;
+          totalBytes += content.length;
         }
       } catch {}
     }

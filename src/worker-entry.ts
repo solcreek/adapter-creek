@@ -3018,6 +3018,24 @@ function __creekActionExists(actionId) {
   }
 }
 
+function __normalizeNextDataMatchedPath(pathname) {
+  if (typeof pathname !== "string" || pathname.length === 0) return pathname;
+  let out = pathname;
+  const basedDataPrefix = (BASE_PATH || "") + "/_next/data/" + BUILD_ID + "/";
+  const unbasedDataPrefix = "/_next/data/" + BUILD_ID + "/";
+  if (out.startsWith(basedDataPrefix)) {
+    out = "/" + out.slice(basedDataPrefix.length);
+  } else if (out.startsWith(unbasedDataPrefix)) {
+    out = "/" + out.slice(unbasedDataPrefix.length);
+  } else if (BASE_PATH && (out === BASE_PATH || out.startsWith(BASE_PATH + "/"))) {
+    out = out.slice(BASE_PATH.length) || "/";
+  }
+  if (out.endsWith(".json")) out = out.slice(0, -5);
+  if (out === "/index") out = "/";
+  if (out.length > 1 && out.endsWith("/index")) out = out.slice(0, -"/index".length) || "/";
+  return out || "/";
+}
+
 
 const HANDLERS = {
 ${handlerEntries}
@@ -3107,6 +3125,13 @@ const middlewareHandler = async (mwCtx) => {
       headers: mwHeaders,
       body: mwCtx.method === "GET" || mwCtx.method === "HEAD" ? undefined : mwBodyBuffer,
     });
+    if (mwHeaders.get("x-nextjs-data") === "1" || mwCtx.url.pathname.includes("/_next/data/")) {
+      try {
+        Object.defineProperty(mwReq, "__isData", { value: true, configurable: true });
+      } catch {
+        mwReq.__isData = true;
+      }
+    }
     let response;
     try {
       // Pass waitUntil into middleware so \`after()\` callbacks can extend
@@ -3277,6 +3302,13 @@ const middlewareHandler = async (mwCtx) => {
         trailingSlash: CONFIG.trailingSlash,
       },
     });
+    if (mwHeaders.get("x-nextjs-data") === "1" || mwCtx.url.pathname.includes("/_next/data/")) {
+      try {
+        Object.defineProperty(mwReq, "__isData", { value: true, configurable: true });
+      } catch {
+        mwReq.__isData = true;
+      }
+    }
     // Same rationale as edge middleware branch: forward waitUntil so
     // after() callbacks can extend the worker lifetime.
     const mwInvokeCtx = {
@@ -3316,8 +3348,19 @@ const middlewareHandler = async (mwCtx) => {
     }
     return mwResult;
   } catch (err) {
-    console.error("[creek-mw-node] Error:", err instanceof Error ? err.stack || err.message : String(err));
-    return {};
+    const errMsg = err instanceof Error ? (err.stack || err.message) : String(err);
+    console.error("[creek-mw-node] Error:", errMsg);
+    const errResponse = new Response(
+      "Internal Server Error: " + (err instanceof Error ? err.message : String(err)),
+      {
+        status: 500,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+      },
+    );
+    return {
+      bodySent: true,
+      __mwResponse: errResponse,
+    };
   }
 };
 ` : `const middlewareHandler = async () => ({});`}
@@ -4375,7 +4418,8 @@ async function __handleRequestInner(request, env, ctx) {
             staticDataEntry &&
             !handler &&
             !staticPagesDataRoutePath &&
-            !pagesFallbackDataRoutePath
+            !pagesFallbackDataRoutePath &&
+            !(HAS_MIDDLEWARE && __shouldRunMiddleware(url, request.headers))
           ) {
             const dataAssetCandidates = [];
             const addDataAssetCandidate = (pathname) => {
@@ -4910,10 +4954,17 @@ async function __handleRequestInner(request, env, ctx) {
       }
       if (mwCapturedResponseHeaders) {
         const resolvedHeaders = new Headers(result.resolvedHeaders || undefined);
+        const existingCookies =
+          typeof resolvedHeaders.getSetCookie === "function"
+            ? resolvedHeaders.getSetCookie()
+            : (resolvedHeaders.get("set-cookie") ? [resolvedHeaders.get("set-cookie")] : []);
         mwCapturedResponseHeaders.forEach((val, key) => {
           if (key.toLowerCase() === "set-cookie") {
-            resolvedHeaders.append(key, val);
-          } else {
+            if (!existingCookies.includes(val)) {
+              resolvedHeaders.append(key, val);
+              existingCookies.push(val);
+            }
+          } else if (!resolvedHeaders.has(key)) {
             resolvedHeaders.set(key, val);
           }
         });
@@ -5487,8 +5538,11 @@ async function __handleRequestInner(request, env, ctx) {
         if (result.mwRewrite) {
           mwPrefetchHeaders.set("x-nextjs-rewrite", result.mwRewrite);
         }
-        if (result.invocationTarget?.pathname) {
-          mwPrefetchHeaders.set("x-nextjs-matched-path", result.invocationTarget.pathname);
+        const matchedPath = __normalizeNextDataMatchedPath(
+          result.resolvedPathname || result.invocationTarget?.pathname
+        );
+        if (matchedPath) {
+          mwPrefetchHeaders.set("x-nextjs-matched-path", matchedPath);
         }
         if (result.resolvedHeaders) {
           result.resolvedHeaders.forEach((val, key) => {

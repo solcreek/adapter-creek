@@ -160,6 +160,10 @@ export const existsSync = (filePath) => {
 };
 export const readFileSync = (filePath, enc) => {
   const normalizedPath = normalizePath(filePath);
+  // User files should win over manifest basename fallbacks. A request for
+  // process.cwd()/package.json must resolve the app package, not .next/package.json.
+  const userContent = findInUserFiles(filePath);
+  if (userContent !== undefined) return maybeDecodeBinary(userContent, enc);
   // Try reading from embedded manifests
   if (typeof globalThis.__MANIFESTS !== "undefined") {
     for (const [key, val] of Object.entries(globalThis.__MANIFESTS)) {
@@ -175,11 +179,6 @@ export const readFileSync = (filePath, enc) => {
       if (normalizedPath.split("/").pop() === key.split("/").pop()) return val;
     }
   }
-  // Then try user-side data files (data.json, fixtures, fonts, etc.).
-  // Binary files are stored as base64 with a sentinel prefix — decode
-  // them lazily based on the caller's requested encoding.
-  const userContent = findInUserFiles(filePath);
-  if (userContent !== undefined) return maybeDecodeBinary(userContent, enc);
   // Throw ENOENT like real fs — Next.js loadManifest relies on this
   // to distinguish between missing and empty files.
   const err = new Error(`ENOENT: no such file or directory, open '${normalizedPath}'`);
@@ -236,7 +235,25 @@ export const promises = {
   rm: async () => {},
 };
 
-export const readFile = promises.readFile;
+export function readFile(filePath, enc, cb) {
+  let encoding = enc;
+  let callback = cb;
+  if (typeof enc === "function") {
+    callback = enc;
+    encoding = undefined;
+  }
+  if (typeof callback === "function") {
+    queueMicrotask(() => {
+      try {
+        callback(null, readFileSync(filePath, encoding));
+      } catch (err) {
+        callback(err);
+      }
+    });
+    return;
+  }
+  return promises.readFile(filePath, encoding);
+}
 export const writeFile = promises.writeFile;
 export const mkdir = promises.mkdir;
 export const readdir = promises.readdir;
