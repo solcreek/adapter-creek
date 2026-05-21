@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { patchUseCachePrerenderDanglingPromiseBailout } from "./bundler";
+import {
+  patchNullFallbackPartialShellBlocking,
+  patchUseCachePrerenderDanglingPromiseBailout,
+} from "./bundler";
 
 describe("patchUseCachePrerenderDanglingPromiseBailout", () => {
   it("patches readable Next use-cache wrapper output", () => {
@@ -41,5 +44,24 @@ describe("patchUseCachePrerenderDanglingPromiseBailout", () => {
     expect(output).toContain(
       "(0, f.makeHangingPromise)(e.renderSignal, g.route",
     );
+  });
+});
+
+describe("patchNullFallbackPartialShellBlocking", () => {
+  it("keeps generic null-fallback partial shells on the blocking path", () => {
+    const input = `
+      if ((prerenderInfo == null ? void 0 : prerenderInfo.fallback) === null && !hasOmittedConcreteFallbackParam && !hasUnresolvedRootFallbackParams && remainingPrerenderableParams.length > 0) {
+        // Generic source shells without unresolved root params don't have a
+        // concrete fallback file of their own.
+        fallbackMode = _fallback.FallbackMode.PRERENDER;
+      }
+    `;
+
+    const output = patchNullFallbackPartialShellBlocking(input);
+
+    expect(output).toContain(
+      "fallbackMode = _fallback.FallbackMode.BLOCKING_STATIC_RENDER;",
+    );
+    expect(output).not.toContain("fallbackMode = _fallback.FallbackMode.PRERENDER;");
   });
 });

@@ -3304,6 +3304,70 @@ function __creekHasCompleteRootFlightLine(text) {
   return false;
 }
 
+function __creekFindFlightLineRange(text, id, predicate) {
+  if (!id) return null;
+  const prefix = id + ":";
+  let searchFrom = 0;
+  while (searchFrom <= text.length) {
+    let start = -1;
+    if (text.startsWith(prefix, searchFrom)) {
+      start = searchFrom;
+    } else {
+      const marker = text.indexOf("\\n" + prefix, searchFrom);
+      if (marker === -1) return null;
+      start = marker + 1;
+    }
+
+    const newline = text.indexOf("\\n", start);
+    const end = newline === -1 ? text.length : newline + 1;
+    const contentEnd = newline === -1 ? text.length : newline;
+    const content = text.slice(start, contentEnd);
+    if (!predicate || predicate(content, id)) {
+      return { start, end, contentEnd, content };
+    }
+    if (end >= text.length) return null;
+    searchFrom = end;
+  }
+  return null;
+}
+
+function __creekIsFlightStaticCompletionLine(line, id) {
+  return line === id + ":C";
+}
+
+function __creekIsFlightBoundaryLengthLine(line, id) {
+  const digitStart = id.length + 1;
+  const code = line.charCodeAt(digitStart);
+  return code >= 48 && code <= 57;
+}
+
+function __creekMoveFlightStaticCompletionBeforeBoundary(text, staticId, boundaryId) {
+  if (!staticId || !boundaryId || staticId === boundaryId) return text;
+
+  const completion = __creekFindFlightLineRange(
+    text,
+    staticId,
+    __creekIsFlightStaticCompletionLine
+  );
+  const boundary = __creekFindFlightLineRange(
+    text,
+    boundaryId,
+    __creekIsFlightBoundaryLengthLine
+  );
+  if (!completion || !boundary || completion.start >= boundary.start) return text;
+  if (completion.end === boundary.start) return text;
+
+  const completionLine = text.slice(completion.start, completion.end);
+  const withoutCompletion =
+    text.slice(0, completion.start) + text.slice(completion.end);
+  const insertAt = boundary.start - completionLine.length;
+  return (
+    withoutCompletion.slice(0, insertAt) +
+    completionLine +
+    withoutCompletion.slice(insertAt)
+  );
+}
+
 function __creekPatchFlightStaticBoundaryStream(stream) {
   if (!stream) return stream;
 
@@ -3313,6 +3377,7 @@ function __creekPatchFlightStaticBoundaryStream(stream) {
   const chunks = [];
   let totalLength = 0;
   let boundaryId = null;
+  let staticId = null;
   let patched = false;
   const MAX_PREFIX_BYTES = 128 * 1024;
 
@@ -3330,12 +3395,14 @@ function __creekPatchFlightStaticBoundaryStream(stream) {
       }
 
       while (true) {
-        const prefix = __creekMergeBytes(chunks, totalLength);
+        let prefix = __creekMergeBytes(chunks, totalLength);
         if (boundaryId === null && totalLength > 0) {
           const prefixText = decoder.decode(prefix, { stream: false });
           const boundaryMatch = prefixText.match(/"l":"\\$@([0-9a-z]+)"/i);
           if (boundaryMatch) {
             boundaryId = boundaryMatch[1];
+            const staticMatch = prefixText.match(/"s":"\\$([0-9a-z]+)"/i);
+            if (staticMatch) staticId = staticMatch[1];
           } else if (__creekHasCompleteRootFlightLine(prefixText)) {
             controller.enqueue(prefix);
             chunks.length = 0;
@@ -3346,50 +3413,54 @@ function __creekPatchFlightStaticBoundaryStream(stream) {
         }
 
         if (boundaryId !== null) {
-          const lineNeedle = encoder.encode("\\n" + boundaryId + ":");
-          let lineStart = __creekIndexOfBytes(prefix, lineNeedle);
-          if (lineStart !== -1) {
-            lineStart += 1;
-          } else {
-            const startNeedle = encoder.encode(boundaryId + ":");
-            if (__creekIndexOfBytes(prefix.subarray(0, startNeedle.length), startNeedle) === 0) {
-              lineStart = 0;
+          let prefixText = decoder.decode(prefix, { stream: false });
+          if (staticId) {
+            const movedText = __creekMoveFlightStaticCompletionBeforeBoundary(
+              prefixText,
+              staticId,
+              boundaryId
+            );
+            if (movedText !== prefixText) {
+              prefixText = movedText;
+              prefix = encoder.encode(prefixText);
             }
           }
 
-          if (lineStart !== -1) {
-            let digitStart = lineStart + boundaryId.length + 1;
+          const boundary = __creekFindFlightLineRange(
+            prefixText,
+            boundaryId,
+            __creekIsFlightBoundaryLengthLine
+          );
+
+          if (boundary) {
+            const lineStart = encoder.encode(prefixText.slice(0, boundary.start)).length;
+            let digitStart = boundary.start + boundaryId.length + 1;
             let digitEnd = digitStart;
             while (
-              digitEnd < prefix.length &&
-              prefix[digitEnd] >= 48 &&
-              prefix[digitEnd] <= 57
+              digitEnd < prefixText.length &&
+              prefixText.charCodeAt(digitEnd) >= 48 &&
+              prefixText.charCodeAt(digitEnd) <= 57
             ) {
               digitEnd++;
             }
             if (digitEnd > digitStart) {
-              const originalBoundary = Number(
-                decoder.decode(prefix.subarray(digitStart, digitEnd))
-              );
+              const originalBoundary = Number(prefixText.slice(digitStart, digitEnd));
               if (
                 Number.isFinite(originalBoundary) &&
                 originalBoundary >= 0 &&
-                originalBoundary <= lineStart
+                originalBoundary === lineStart
               ) {
-                controller.enqueue(prefix);
+                controller.enqueue(encoder.encode(prefixText));
                 chunks.length = 0;
                 totalLength = 0;
                 patched = true;
                 return;
               }
-              const replacement = encoder.encode(String(lineStart));
-              const out = new Uint8Array(
-                prefix.length - (digitEnd - digitStart) + replacement.length
-              );
-              out.set(prefix.subarray(0, digitStart), 0);
-              out.set(replacement, digitStart);
-              out.set(prefix.subarray(digitEnd), digitStart + replacement.length);
-              controller.enqueue(out);
+              controller.enqueue(encoder.encode(
+                prefixText.slice(0, digitStart) +
+                String(lineStart) +
+                prefixText.slice(digitEnd)
+              ));
               chunks.length = 0;
               totalLength = 0;
               patched = true;
@@ -3432,7 +3503,6 @@ function __creekPatchHtmlFlightStaticBoundaryStream(stream) {
   let patched = false;
   const MAX_PREFIX_BYTES = 256 * 1024;
   const marker = 'self.__next_f.push([1,"';
-  const escapedNewline = String.fromCharCode(92, 110);
 
   function patchPrefix(prefix) {
     const text = decoder.decode(prefix);
@@ -3463,7 +3533,7 @@ function __creekPatchHtmlFlightStaticBoundaryStream(stream) {
 
       if (payloadEnd === -1) return null;
 
-      const rawPayload = text.slice(payloadStart, payloadEnd);
+      let rawPayload = text.slice(payloadStart, payloadEnd);
       let payload;
       try {
         payload = JSON.parse('"' + rawPayload + '"');
@@ -3479,37 +3549,38 @@ function __creekPatchHtmlFlightStaticBoundaryStream(stream) {
       }
 
       const boundaryId = boundaryMatch[1];
-      let lineStart = payload.indexOf("\\n" + boundaryId + ":");
-      if (lineStart !== -1) {
-        lineStart += 1;
-      } else if (payload.startsWith(boundaryId + ":")) {
-        lineStart = 0;
+      const staticId = payload.match(/"s":"\\$([0-9a-z]+)"/i)?.[1] || null;
+      let payloadChanged = false;
+      const movedPayload = __creekMoveFlightStaticCompletionBeforeBoundary(
+        payload,
+        staticId,
+        boundaryId
+      );
+      if (movedPayload !== payload) {
+        payload = movedPayload;
+        rawPayload = JSON.stringify(payload).slice(1, -1);
+        payloadChanged = true;
       }
 
-      if (lineStart === -1) {
+      const boundary = __creekFindFlightLineRange(
+        payload,
+        boundaryId,
+        __creekIsFlightBoundaryLengthLine
+      );
+      if (!boundary) {
         searchFrom = payloadEnd + 1;
         continue;
       }
 
+      const lineStart = boundary.start;
       const lineStartBytes = encoder.encode(payload.slice(0, lineStart)).length;
-      const escapedLineNeedle = escapedNewline + boundaryId + ":";
-      let rawLineStart = rawPayload.indexOf(escapedLineNeedle);
-      let digitStart;
-      if (rawLineStart !== -1) {
-        digitStart = rawLineStart + escapedLineNeedle.length;
-      } else if (rawPayload.startsWith(boundaryId + ":")) {
-        rawLineStart = 0;
-        digitStart = boundaryId.length + 1;
-      } else {
-        searchFrom = payloadEnd + 1;
-        continue;
-      }
+      let digitStart = boundary.start + boundaryId.length + 1;
 
       let digitEnd = digitStart;
       while (
-        digitEnd < rawPayload.length &&
-        rawPayload.charCodeAt(digitEnd) >= 48 &&
-        rawPayload.charCodeAt(digitEnd) <= 57
+        digitEnd < payload.length &&
+        payload.charCodeAt(digitEnd) >= 48 &&
+        payload.charCodeAt(digitEnd) <= 57
       ) {
         digitEnd++;
       }
@@ -3519,19 +3590,27 @@ function __creekPatchHtmlFlightStaticBoundaryStream(stream) {
         continue;
       }
 
-      const originalBoundary = Number(rawPayload.slice(digitStart, digitEnd));
+      const originalBoundary = Number(payload.slice(digitStart, digitEnd));
       if (
         Number.isFinite(originalBoundary) &&
         originalBoundary >= 0 &&
-        originalBoundary <= lineStartBytes
+        originalBoundary === lineStartBytes
       ) {
+        if (payloadChanged) {
+          return encoder.encode(
+            text.slice(0, payloadStart) +
+            rawPayload +
+            text.slice(payloadEnd)
+          );
+        }
         return prefix;
       }
 
-      const patchedRawPayload =
-        rawPayload.slice(0, digitStart) +
+      const patchedPayload =
+        payload.slice(0, digitStart) +
         String(lineStartBytes) +
-        rawPayload.slice(digitEnd);
+        payload.slice(digitEnd);
+      const patchedRawPayload = JSON.stringify(patchedPayload).slice(1, -1);
       return encoder.encode(
         text.slice(0, payloadStart) +
         patchedRawPayload +
@@ -4079,6 +4158,30 @@ async function __handleRequestInner(request, env, ctx) {
           // /new-home) follows up with a /new-home data fetch; without
           // this, the follow-up 404s and the navigation degrades to a
           // full reload (window.__SAME_PAGE → undefined).
+          const staticDataCandidates = [candidate, lookup];
+          if (BASE_PATH) {
+            const withBasePath =
+              candidate === "/"
+                ? BASE_PATH
+                : BASE_PATH + (candidate.startsWith("/") ? candidate : "/" + candidate);
+            const lookupWithBasePath =
+              lookup === "/index"
+                ? BASE_PATH + "/index"
+                : BASE_PATH + (lookup.startsWith("/") ? lookup : "/" + lookup);
+            staticDataCandidates.push(withBasePath, lookupWithBasePath);
+          }
+          const staticDataEntry = staticDataCandidates.find((p) => STATIC_PAGES[p]);
+          if (staticDataEntry) {
+            const headers = new Headers();
+            headers.set("content-type", "application/json; charset=utf-8");
+            headers.set("x-nextjs-matched-path", candidate);
+            headers.set("cache-control", "public, max-age=0, must-revalidate");
+            headers.set("x-nextjs-cache", "HIT");
+            return new Response(
+              request.method === "HEAD" ? null : JSON.stringify({ pageProps: {} }),
+              { status: 200, headers },
+            );
+          }
         }
       }
 
@@ -4669,7 +4772,10 @@ async function __handleRequestInner(request, env, ctx) {
         }
       }
       const duplicateRewriteQuery = __duplicateRewriteQueryForPath(url.pathname);
-      if (duplicateRewriteQuery && result.resolvedPathname) {
+      if (
+        duplicateRewriteQuery &&
+        (result.resolvedPathname || result.invocationTarget?.pathname)
+      ) {
         result = {
           ...result,
           resolvedQuery: {
@@ -5871,11 +5977,17 @@ async function __handleRequestInner(request, env, ctx) {
                 if (staticEntry?.cacheTags) {
                   headers.set("x-next-cache-tags", String(staticEntry.cacheTags));
                 }
-                return new Response(segmentRes.body, {
+                headers.delete("content-length");
+                return new Response(
+                  request.method === "HEAD"
+                    ? null
+                    : __creekPatchFlightStaticBoundaryStream(segmentRes.body),
+                  {
                   status: segmentRes.status,
                   statusText: segmentRes.statusText,
                   headers,
-                });
+                  }
+                );
               }
             }
             // Fall through to full RSC if the segment file isn't there.
@@ -5916,11 +6028,17 @@ async function __handleRequestInner(request, env, ctx) {
               if (staticEntry?.cacheTags) {
                 headers.set("x-next-cache-tags", String(staticEntry.cacheTags));
               }
-              return new Response(rscRes.body, {
+              headers.delete("content-length");
+              return new Response(
+                request.method === "HEAD"
+                  ? null
+                  : __creekPatchFlightStaticBoundaryStream(rscRes.body),
+                {
                 status: rscRes.status,
                 statusText: rscRes.statusText,
                 headers,
-              });
+                }
+              );
             }
           }
         } catch {}
@@ -5980,7 +6098,14 @@ async function __handleRequestInner(request, env, ctx) {
                 else headers.set(key, val);
               });
             }
-            return new Response(assetRes.body, {
+            const body =
+              request.method === "HEAD"
+                ? null
+                : headers.get("x-nextjs-postponed") === "1"
+                  ? __creekPatchHtmlFlightStaticBoundaryStream(assetRes.body)
+                  : assetRes.body;
+            if (body !== assetRes.body) headers.delete("content-length");
+            return new Response(body, {
               status: finalStatus,
               headers,
             });
@@ -8301,7 +8426,9 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   // Next.js resume the render from the captured prelude + RDC instead of
   // re-running every \`'use cache'\` function — which is what was leaking
   // runtime timestamps into layouts and producing hydration mismatches.
-  const __postponedForThisPath = __creekPostponedForPathname(url.pathname);
+  const __postponedForThisPath = isRSCRequest
+    ? null
+    : __creekPostponedForPathname(url.pathname);
   if (__postponedForThisPath) {
     try {
       const store = __INTERNAL_FETCH_CONTEXT.getStore();
@@ -8824,18 +8951,6 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       h.set("content-type", "text/x-component");
       h.delete("content-length");
       ctLower = "text/x-component";
-      if (
-        !h.has("x-nextjs-postponed") &&
-        !segmentPrefetchRSCRequest &&
-        __creekHasPostponedPrerenderForPathname(
-          url.pathname,
-          handlerPathname,
-          routeResult?.resolvedPathname,
-          routeResult?.invocationTarget?.pathname,
-        )
-      ) {
-        h.set("x-nextjs-postponed", "1");
-      }
     }
     if (ctLower.includes("text/html")) {
       h.delete("content-length");

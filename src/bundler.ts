@@ -770,11 +770,11 @@ export function patchUseCachePrerenderDanglingPromiseBailout(workerCode: string)
   return patchedCode;
 }
 
-function patchNullFallbackPartialShellBlocking(workerCode: string): string {
+export function patchNullFallbackPartialShellBlocking(workerCode: string): string {
   const minifiedPartialFallbackUpgradePattern =
     /true\s*!==\s*(\w+)\.experimental\.partialFallbacks\s*\|\|\s*\(null\s*==\s*(\w+)\s*\?\s*void\s*0\s*:\s*\2\.fallback\)\s*!==\s*null\s*\|\|\s*(\w+)\s*\|\|\s*(\w+)\s*\|\|\s*!\((\w+)\.length\s*>\s*0\)\s*\|\|\s*\((\w+)\s*=\s*(\w+)\.FallbackMode\.PRERENDER\)/g;
 
-  return workerCode.replace(
+  workerCode = workerCode.replace(
     minifiedPartialFallbackUpgradePattern,
     (
       _match: string,
@@ -787,6 +787,15 @@ function patchNullFallbackPartialShellBlocking(workerCode: string): string {
       fallbackEnumVar: string,
     ) =>
       `true !== ${nextConfigVar}.experimental.partialFallbacks || (null == ${prerenderInfoVar} ? void 0 : ${prerenderInfoVar}.fallback) !== null || ${omittedFallbackParamVar} || ${unresolvedRootParamsVar} || !(${remainingParamsVar}.length > 0) || (${fallbackModeVar} = ${fallbackEnumVar}.FallbackMode.BLOCKING_STATIC_RENDER)`,
+  );
+
+  const readableNullFallbackUpgradePattern =
+    /(if\s*\(\s*\(\s*(?:(?:null\s*==\s*\w+)|(?:\w+\s*==\s*null))\s*\?\s*void\s*0\s*:\s*\w+\.fallback\s*\)\s*={2,3}\s*null\s*&&\s*!\w+\s*&&\s*!\w+\s*&&\s*\w+\.length\s*>\s*0\s*\)\s*\{[\s\S]{0,1600}?)(\w+)\s*=\s*([\w$]+)\.FallbackMode\.PRERENDER\s*;/g;
+
+  return workerCode.replace(
+    readableNullFallbackUpgradePattern,
+    (_match: string, prefix: string, fallbackModeVar: string, fallbackEnumVar: string) =>
+      `${prefix}${fallbackModeVar} = ${fallbackEnumVar}.FallbackMode.BLOCKING_STATIC_RENDER;`,
   );
 }
 
