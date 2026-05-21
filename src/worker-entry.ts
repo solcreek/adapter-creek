@@ -1720,6 +1720,95 @@ function __matchDynamicRoute(pathname) {
   return null;
 }
 
+function __creekManifestPathCandidates(pathname) {
+  const candidates = [];
+  const add = (value) => {
+    if (typeof value !== "string" || !value.startsWith("/")) return;
+    for (const alias of __creekPathnameAliases(value)) {
+      if (!candidates.includes(alias)) candidates.push(alias);
+    }
+  };
+  add(pathname);
+  if (BASE_PATH && pathname.startsWith(BASE_PATH + "/")) {
+    add(pathname.slice(BASE_PATH.length) || "/");
+  } else if (BASE_PATH && pathname === BASE_PATH) {
+    add("/");
+  }
+  if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+    for (const candidate of [...candidates]) {
+      const firstSeg = candidate.split("/")[1] || "";
+      if (!I18N.locales.includes(firstSeg)) {
+        for (const locale of I18N.locales) add("/" + locale + candidate);
+      }
+    }
+  }
+  return candidates;
+}
+
+function __creekPrerenderDynamicRoute(routePage) {
+  const prerenderManifest = __getPrerenderManifest();
+  const dynamicRoutes = prerenderManifest?.dynamicRoutes || {};
+  if (dynamicRoutes[routePage]) return dynamicRoutes[routePage];
+  if (BASE_PATH && routePage.startsWith(BASE_PATH + "/")) {
+    const withoutBase = routePage.slice(BASE_PATH.length) || "/";
+    if (dynamicRoutes[withoutBase]) return dynamicRoutes[withoutBase];
+  }
+  if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+    const firstSeg = routePage.split("/")[1] || "";
+    if (I18N.locales.includes(firstSeg)) {
+      const withoutLocale = routePage.slice(firstSeg.length + 1) || "/";
+      if (dynamicRoutes[withoutLocale]) return dynamicRoutes[withoutLocale];
+    }
+  }
+  return null;
+}
+
+function __creekIsFallbackFalseMiss(routePage, pathname) {
+  try {
+    const dynamicRoute = __creekPrerenderDynamicRoute(routePage);
+    if (!dynamicRoute || dynamicRoute.fallback !== false) return false;
+    const prerenderedRoutes = __getPrerenderManifest()?.routes || {};
+    return !__creekManifestPathCandidates(pathname).some((candidate) => prerenderedRoutes[candidate] != null);
+  } catch {}
+  return false;
+}
+
+async function __creekStaticNotFoundResponse(env, url, result, method) {
+  const headers = new Headers();
+  if (result?.resolvedHeaders) {
+    result.resolvedHeaders.forEach((val, key) => {
+      if (key.toLowerCase() === "set-cookie") headers.append(key, val);
+      else headers.set(key, val);
+    });
+  }
+  headers.set("content-type", "text/html; charset=utf-8");
+  const candidates = [];
+  const add = (value) => {
+    if (typeof value === "string" && value && !candidates.includes(value)) candidates.push(value);
+  };
+  add(STATIC_PAGES["/404"]?.assetPath);
+  if (BASE_PATH) add(BASE_PATH + "/404/index.html");
+  if (I18N?.defaultLocale) {
+    const locale = I18N.defaultLocale;
+    if (BASE_PATH) add(BASE_PATH + "/" + locale + "/404/index.html");
+    add("/" + locale + "/404/index.html");
+  }
+  add("/404/index.html");
+  try {
+    for (const candidate of candidates) {
+      const res404 = await env.ASSETS.fetch(new Request(new URL(candidate, url.origin)));
+      if (res404.ok) {
+        res404.headers.forEach((val, key) => {
+          if (!headers.has(key)) headers.set(key, val);
+        });
+        return new Response(method === "HEAD" ? null : res404.body, { status: 404, headers });
+      }
+    }
+  } catch {}
+  headers.set("content-type", "text/plain; charset=utf-8");
+  return new Response(method === "HEAD" ? null : "Not Found", { status: 404, headers });
+}
+
 // Merge the original request's query string into a redirect Location when
 // the Location is a path-only template (e.g. the trailingSlash: true
 // \`beforeMiddleware\` rule declares \`headers: { Location: "/$1/" }\` — no
@@ -6482,6 +6571,17 @@ async function __handleRequestInner(request, env, ctx) {
         !isServingBracketShell &&
         __creekHasPostponedPrerenderForPathname(url.pathname, decodedPathname, servePath);
       const shouldBypassStaticForISR = isISRPage && hasHandler && !isConcreteAppPPRPage;
+      if (
+        hasHandler &&
+        HANDLERS[resolvedPathname]?.type === "PAGES" &&
+        (request.method === "GET" || request.method === "HEAD") &&
+        !request.headers.has("next-action") &&
+        !isAppRouterRSCRequest &&
+        !nextDataAppRouterPath &&
+        __creekIsFallbackFalseMiss(resolvedPathname, url.pathname)
+      ) {
+        return await __creekStaticNotFoundResponse(env, url, result, request.method);
+      }
       // Any tag on this prerender invalidated since build? If yes the static
       // HTML is stale — skip the fast-path and let the handler rebuild so the
       // server-action-side updateTag/revalidateTag actually takes effect.
