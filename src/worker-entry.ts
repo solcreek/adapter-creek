@@ -3020,10 +3020,7 @@ class CreekCacheHandler {
       for (const cacheKey of cacheKeys) keys.add(cacheKey);
     }
 
-    // Fetch cache entries are per-render data artifacts. Keeping them in L1
-    // preserves same-isolate cache semantics for deploy tests without adding
-    // KV serialization and cross-runtime body reuse pressure to edge renders.
-    if (value?.kind === "FETCH") return;
+    const isFetchEntry = value?.kind === "FETCH";
 
     // L2: persist to KV (fire-and-forget)
     const kv = __creekKV();
@@ -3044,7 +3041,12 @@ class CreekCacheHandler {
         const p = Promise.all(
           cacheKeys.map((cacheKey) => kv.put(__CREEK_KV_PREFIX + cacheKey, serialized, { expirationTtl })),
         );
-        if (kvCtx && typeof kvCtx.waitUntil === "function") {
+        if (isFetchEntry) {
+          // Fetch cache entries are read back by the very next page request in
+          // several deploy tests. Miniflare/workerd may serve that request from
+          // a different isolate, so L1 memory is not a sufficient handoff.
+          await p.catch(() => {});
+        } else if (kvCtx && typeof kvCtx.waitUntil === "function") {
           try { kvCtx.waitUntil(p.catch(() => {})); } catch { await p.catch(() => {}); }
         } else {
           await p.catch(() => {});
