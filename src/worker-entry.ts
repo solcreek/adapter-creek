@@ -4247,6 +4247,41 @@ async function __handleRequestInner(request, env, ctx) {
             !staticPagesDataRoutePath &&
             !pagesFallbackDataRoutePath
           ) {
+            const dataAssetCandidates = [];
+            const addDataAssetCandidate = (pathname) => {
+              if (
+                typeof pathname === "string" &&
+                pathname.startsWith("/") &&
+                !dataAssetCandidates.includes(pathname)
+              ) {
+                dataAssetCandidates.push(pathname);
+              }
+            };
+            addDataAssetCandidate(url.pathname);
+            addDataAssetCandidate(assetPath);
+            if (BASE_PATH) addDataAssetCandidate(BASE_PATH + assetPath);
+            for (const dataAssetPath of dataAssetCandidates) {
+              try {
+                const dataAssetRes = await env.ASSETS.fetch(
+                  new Request(new URL(dataAssetPath, url.origin), { headers: request.headers })
+                );
+                if (dataAssetRes.status === 304) return dataAssetRes;
+                if (dataAssetRes.ok) {
+                  const headers = new Headers(dataAssetRes.headers);
+                  headers.set("content-type", headers.get("content-type") || "application/json; charset=utf-8");
+                  headers.set("x-nextjs-matched-path", candidate);
+                  headers.set("x-nextjs-cache", "HIT");
+                  return new Response(
+                    request.method === "HEAD" ? null : dataAssetRes.body,
+                    {
+                      status: dataAssetRes.status,
+                      statusText: dataAssetRes.statusText,
+                      headers,
+                    },
+                  );
+                }
+              } catch {}
+            }
             const headers = new Headers();
             headers.set("content-type", "application/json; charset=utf-8");
             headers.set("x-nextjs-matched-path", candidate);
