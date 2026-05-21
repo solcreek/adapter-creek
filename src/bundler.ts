@@ -619,7 +619,7 @@ function patchAfterContextRunCallbacksOnClose(workerCode: string): string {
   return patched ? patched + workerCode.slice(last) : workerCode;
 }
 
-function patchUseCachePrerenderDanglingPromiseBailout(workerCode: string): string {
+export function patchUseCachePrerenderDanglingPromiseBailout(workerCode: string): string {
   const findHangingPromiseCall = (
     followingCode: string,
     workUnitStoreVar: string,
@@ -656,52 +656,114 @@ function patchUseCachePrerenderDanglingPromiseBailout(workerCode: string): strin
   ): string =>
     `if (("prerender" === ${workUnitStoreVar}.type || "prerender-runtime" === ${workUnitStoreVar}.type) && "string" == typeof ${serializedKeyVar}) { let __creekDanglingThenableStart = ${serializedKeyVar}.lastIndexOf("$@"); if (__creekDanglingThenableStart !== -1 && ${serializedKeyVar}.indexOf(":", __creekDanglingThenableStart) === -1) return ${hangingCall.callee}(${workUnitStoreVar}.renderSignal, ${hangingCall.workStoreVar}.route, 'dynamic "use cache"'); }`;
 
-  const serializedKeyPattern =
-    /let\s+(\w+)\s*=\s*"string"\s*==\s*typeof\s+(\w+)\s*\?\s*\2\s*:\s*await\s+(\w+)\(\2\),\s*(\w+)\s*=\s*(\w+)\.rootParams/g;
+  const patchSerializedKeyMatch = (
+    match: string,
+    declaration: string,
+    serializedKeyVar: string,
+    condition: string,
+    encodedKeyVar: string,
+    trueExprVar: string,
+    encodeFnVar: string,
+    encodeArgVar: string,
+    rootParamsDecl: string,
+    rootParamsVar: string,
+    workUnitStoreVar: string,
+    offset: number,
+    fullCode: string,
+  ): string => {
+    if (
+      match.includes("__creekDanglingThenableStart") ||
+      trueExprVar !== encodedKeyVar ||
+      encodeArgVar !== encodedKeyVar
+    ) {
+      return match;
+    }
+
+    const followingCode = fullCode.slice(offset, offset + 8000);
+    const hangingCall = findHangingPromiseCall(followingCode, workUnitStoreVar);
+    if (!hangingCall) return match;
+
+    return `${declaration}${serializedKeyVar} = ${condition} ? ${trueExprVar} : await ${encodeFnVar}(${encodeArgVar}); ${danglingBailout(serializedKeyVar, workUnitStoreVar, hangingCall)} ${rootParamsDecl} ${rootParamsVar} = ${workUnitStoreVar}.rootParams`;
+  };
+
+  const minifiedSerializedKeyPattern =
+    /((?:const|let|var)\s+)(\w+)\s*=\s*((?:(?:"string"|'string')\s*={2,3}\s*typeof\s+(\w+))|(?:typeof\s+(\w+)\s*={2,3}\s*(?:"string"|'string')))\s*\?\s*(\w+)\s*:\s*await\s+(\w+)\(\s*(\w+)\s*\)\s*,\s*(\w+)\s*=\s*(\w+)\.rootParams/g;
 
   let patchedCode = workerCode.replace(
-    serializedKeyPattern,
+    minifiedSerializedKeyPattern,
     (
       match: string,
+      declaration: string,
       serializedKeyVar: string,
-      encodedKeyVar: string,
+      condition: string,
+      encodedKeyVarFromStringFirst: string | undefined,
+      encodedKeyVarFromTypeofFirst: string | undefined,
+      trueExprVar: string,
       encodeFnVar: string,
+      encodeArgVar: string,
       rootParamsVar: string,
       workUnitStoreVar: string,
       offset: number,
       fullCode: string,
     ) => {
-      const followingCode = fullCode.slice(offset, offset + 3000);
-      const hangingCall = findHangingPromiseCall(followingCode, workUnitStoreVar);
-      if (!hangingCall) return match;
-
-      return `let ${serializedKeyVar} = "string" == typeof ${encodedKeyVar} ? ${encodedKeyVar} : await ${encodeFnVar}(${encodedKeyVar}); ${danglingBailout(serializedKeyVar, workUnitStoreVar, hangingCall)} let ${rootParamsVar} = ${workUnitStoreVar}.rootParams`;
+      const encodedKeyVar = encodedKeyVarFromStringFirst ?? encodedKeyVarFromTypeofFirst;
+      if (!encodedKeyVar) return match;
+      return patchSerializedKeyMatch(
+        match,
+        declaration,
+        serializedKeyVar,
+        condition,
+        encodedKeyVar,
+        trueExprVar,
+        encodeFnVar,
+        encodeArgVar,
+        declaration.trim(),
+        rootParamsVar,
+        workUnitStoreVar,
+        offset,
+        fullCode,
+      );
     },
   );
 
   const readableSerializedKeyPattern =
-    /((?:const|let|var)\s+(\w+)\s*=\s*typeof\s+(\w+)\s*===\s*['"]string['"]\s*\?\s*(?:(?:\/\/[^\r\n]*(?:\r?\n))|\/\*[\s\S]*?\*\/|\s)*?\3\s*:\s*await\s+(\w+)\(\3\)\s*;\s*(?:(?:\/\/[^\r\n]*(?:\r?\n))|\/\*[\s\S]*?\*\/|\s)*?)(const|let|var)\s+(\w+)\s*=\s*(\w+)\.rootParams/g;
+    /((?:const|let|var)\s+)(\w+)\s*=\s*((?:(?:"string"|'string')\s*={2,3}\s*typeof\s+(\w+))|(?:typeof\s+(\w+)\s*={2,3}\s*(?:"string"|'string')))\s*\?\s*(?:(?:\/\/[^\r\n]*(?:\r?\n))|\/\*[\s\S]*?\*\/|\s)*?(\w+)\s*:\s*await\s+(\w+)\(\s*(\w+)\s*\)\s*;\s*(?:(?:\/\/[^\r\n]*(?:\r?\n))|\/\*[\s\S]*?\*\/|\s)*?(const|let|var)\s+(\w+)\s*=\s*(\w+)\.rootParams/g;
 
   patchedCode = patchedCode.replace(
     readableSerializedKeyPattern,
     (
       match: string,
-      prefix: string,
+      declaration: string,
       serializedKeyVar: string,
-      _encodedKeyVar: string,
-      _encodeFnVar: string,
+      condition: string,
+      encodedKeyVarFromStringFirst: string | undefined,
+      encodedKeyVarFromTypeofFirst: string | undefined,
+      trueExprVar: string,
+      encodeFnVar: string,
+      encodeArgVar: string,
       rootParamsDecl: string,
       rootParamsVar: string,
       workUnitStoreVar: string,
       offset: number,
       fullCode: string,
     ) => {
-      if (match.includes("__creekDanglingThenableStart")) return match;
-      const followingCode = fullCode.slice(offset, offset + 5000);
-      const hangingCall = findHangingPromiseCall(followingCode, workUnitStoreVar);
-      if (!hangingCall) return match;
-
-      return `${prefix}${danglingBailout(serializedKeyVar, workUnitStoreVar, hangingCall)} ${rootParamsDecl} ${rootParamsVar} = ${workUnitStoreVar}.rootParams`;
+      const encodedKeyVar = encodedKeyVarFromStringFirst ?? encodedKeyVarFromTypeofFirst;
+      if (!encodedKeyVar) return match;
+      return patchSerializedKeyMatch(
+        match,
+        declaration,
+        serializedKeyVar,
+        condition,
+        encodedKeyVar,
+        trueExprVar,
+        encodeFnVar,
+        encodeArgVar,
+        rootParamsDecl,
+        rootParamsVar,
+        workUnitStoreVar,
+        offset,
+        fullCode,
+      );
     },
   );
 
