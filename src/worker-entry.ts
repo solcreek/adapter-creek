@@ -3285,6 +3285,25 @@ function __creekMergeBytes(chunks, totalLength) {
   return out;
 }
 
+function __creekHasCompleteRootFlightLine(text) {
+  let searchFrom = 0;
+  while (searchFrom < text.length) {
+    let lineStart = -1;
+    if (searchFrom === 0 && text.startsWith("0:")) {
+      lineStart = 0;
+    } else {
+      const marker = text.indexOf("\\n0:", searchFrom);
+      if (marker === -1) return false;
+      lineStart = marker + 1;
+    }
+
+    const lineEnd = text.indexOf("\\n", lineStart);
+    if (lineEnd !== -1) return true;
+    searchFrom = lineStart + 2;
+  }
+  return false;
+}
+
 function __creekPatchFlightStaticBoundaryStream(stream) {
   if (!stream) return stream;
 
@@ -3310,39 +3329,22 @@ function __creekPatchFlightStaticBoundaryStream(stream) {
         return;
       }
 
-      // First read: decide whether this stream needs the static-boundary
-      // rewrite at all. The \`"l":"$@<id>"\` marker lives in the JSON prelude
-      // at the very start of the stream — if the first chunk doesn't contain
-      // it, no static boundary will appear later and we can pass-through all
-      // subsequent chunks untouched. Without this fast-path, regular RSC
-      // responses (which don't use cacheComponents static boundaries) buffer
-      // all the way to EOF, which blocks progressive client commits: Next's
-      // client router queues server-action dispatches behind the pending
-      // navigation, so a 3s RSC body keeps a server action held for 3s —
-      // breaking tests like use-link-status "should remove pending state
-      // when server action triggers a redirect" that expect the action POST
-      // to fire within ~1s of the button click.
-      if (chunks.length === 0) {
-        const { done, value } = await reader.read();
-        if (done) {
-          controller.close();
-          patched = true;
-          return;
-        }
-        const firstText = decoder.decode(value, { stream: false });
-        const firstMatch = firstText.match(/"l":"\\$@([0-9a-z]+)"/i);
-        if (!firstMatch) {
-          controller.enqueue(value);
-          patched = true;
-          return;
-        }
-        boundaryId = firstMatch[1];
-        chunks.push(value);
-        totalLength += value.byteLength;
-      }
-
       while (true) {
         const prefix = __creekMergeBytes(chunks, totalLength);
+        if (boundaryId === null && totalLength > 0) {
+          const prefixText = decoder.decode(prefix, { stream: false });
+          const boundaryMatch = prefixText.match(/"l":"\\$@([0-9a-z]+)"/i);
+          if (boundaryMatch) {
+            boundaryId = boundaryMatch[1];
+          } else if (__creekHasCompleteRootFlightLine(prefixText)) {
+            controller.enqueue(prefix);
+            chunks.length = 0;
+            totalLength = 0;
+            patched = true;
+            return;
+          }
+        }
+
         if (boundaryId !== null) {
           const lineNeedle = encoder.encode("\\n" + boundaryId + ":");
           let lineStart = __creekIndexOfBytes(prefix, lineNeedle);
@@ -5469,7 +5471,6 @@ async function __handleRequestInner(request, env, ctx) {
         }
       }
       if (
-        !staticEntry &&
         BASE_PATH &&
         (url.pathname === BASE_PATH || url.pathname === BASE_PATH + "/") &&
         (request.method === "GET" || request.method === "HEAD") &&
@@ -5479,11 +5480,15 @@ async function __handleRequestInner(request, env, ctx) {
         !nextDataAppRouterPath
       ) {
         const rootAssetCandidates = [
+          STATIC_PAGES["/"]?.assetPath,
+          STATIC_PAGES["/index"]?.assetPath,
+          STATIC_PAGES[BASE_PATH]?.assetPath,
+          STATIC_PAGES[BASE_PATH + "/index"]?.assetPath,
           BASE_PATH + "/index.html",
           BASE_PATH + "/index/index.html",
           "/index.html",
           "/index/index.html",
-        ];
+        ].filter(Boolean);
         for (const candidate of rootAssetCandidates) {
           try {
             const assetRes = await env.ASSETS.fetch(
