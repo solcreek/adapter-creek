@@ -597,7 +597,6 @@ function __initEdgeModules() {
   }` : ""}
 }
 ` : opts.outputs.middleware ? `
-import * as __middleware_file from ${JSON.stringify(opts.outputs.middleware.filePath)};
 function __initEdgeModules() {}
 ` : `function __initEdgeModules() {}`}
 ${opts.turbopackRuntimePath ? `
@@ -1523,6 +1522,71 @@ function __duplicateRewriteQueryForPath(pathname) {
         if (items.length > 1) duplicates[key] = items;
       }
       if (Object.keys(duplicates).length > 0) return duplicates;
+    }
+  }
+  return null;
+}
+
+function __queryObjectFromSearch(search) {
+  const result = {};
+  if (!search) return result;
+  const params = new URLSearchParams(search.startsWith("?") ? search.slice(1) : search);
+  for (const [key, value] of params.entries()) {
+    const current = result[key];
+    if (current === undefined) {
+      result[key] = value;
+    } else if (Array.isArray(current)) {
+      current.push(value);
+    } else {
+      result[key] = [current, value];
+    }
+  }
+  return result;
+}
+
+function __resolveConfigRewriteDestination(url, headers) {
+  if (!ROUTING) return null;
+  const candidatePaths = [];
+  const addCandidate = (pathname) => {
+    if (typeof pathname !== "string" || !pathname.startsWith("/")) return;
+    if (!candidatePaths.includes(pathname)) candidatePaths.push(pathname);
+    if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+      const seg = pathname.split("/")[1] || "";
+      if (!I18N.locales.includes(seg)) {
+        const def = I18N.defaultLocale || I18N.locales[0];
+        const localized = "/" + def + pathname;
+        if (!candidatePaths.includes(localized)) candidatePaths.push(localized);
+      }
+    }
+  };
+  addCandidate(url.pathname);
+  if (BASE_PATH && url.pathname.startsWith(BASE_PATH + "/")) {
+    addCandidate(url.pathname.slice(BASE_PATH.length) || "/");
+  } else if (BASE_PATH && url.pathname === BASE_PATH) {
+    addCandidate("/");
+  }
+
+  for (const list of [ROUTING.beforeFiles || [], ROUTING.afterFiles || [], ROUTING.fallback || []]) {
+    if (!Array.isArray(list)) continue;
+    for (const rule of list) {
+      const sourceRegex = rule?.sourceRegex || rule?.regex || rule?.namedRegex;
+      if (!rule || !sourceRegex || !rule.destination) continue;
+      let regex;
+      try { regex = new RegExp(sourceRegex, "i"); } catch { continue; }
+      for (const candidatePath of candidatePaths) {
+        const match = candidatePath.match(regex);
+        if (!match) continue;
+        if (rule.has && !__checkHasConditions(rule.has, url, headers)) continue;
+        if (rule.missing && !__checkMissingConditions(rule.missing, url, headers)) continue;
+        const dest = __substituteRouteDestination(rule.destination, match, rule.routeKeys, rule.source);
+        if (typeof dest !== "string" || /^https?:\\/\\//i.test(dest)) continue;
+        const [destPath, destQuery = ""] = dest.split("?");
+        if (!destPath || !destPath.startsWith("/")) continue;
+        return {
+          pathname: destPath,
+          search: destQuery ? "?" + destQuery : "",
+        };
+      }
     }
   }
   return null;
@@ -3124,20 +3188,38 @@ const middlewareHandler = async (mwCtx) => {
 };
 ` : opts.outputs.middleware ? `
 // Node.js runtime middleware — import the module and call handler directly.
-import * as __middleware_mod from ${JSON.stringify(opts.outputs.middleware.filePath)};
 import { NextRequest as __CreekNextRequest } from "next/server";
+let __nodeMiddlewareModulePromise = null;
+const __resolveNodeMiddlewareModule = async () => {
+  if (!__nodeMiddlewareModulePromise) {
+    __nodeMiddlewareModulePromise = import(${JSON.stringify(opts.outputs.middleware.filePath)});
+  }
+  let mod = await __nodeMiddlewareModulePromise;
+  if (mod && typeof mod.then === "function") {
+    mod = await mod;
+  }
+  let defaultExport = mod && mod.default;
+  if (defaultExport && typeof defaultExport.then === "function") {
+    defaultExport = await defaultExport;
+  }
+  if (defaultExport && typeof defaultExport === "object") {
+    mod = { ...defaultExport, ...mod };
+  }
+  return { mod, defaultExport };
+};
 const middlewareHandler = async (mwCtx) => {
   try {
-    const compiledHandler = typeof __middleware_mod.handler === "function"
-      ? __middleware_mod.handler
+    const { mod: mwMod, defaultExport } = await __resolveNodeMiddlewareModule();
+    const compiledHandler = typeof mwMod?.handler === "function"
+      ? mwMod.handler
       : null;
     const userlandHandler =
-      typeof __middleware_mod.proxy === "function"
-        ? __middleware_mod.proxy
-        : typeof __middleware_mod.middleware === "function"
-          ? __middleware_mod.middleware
-          : (!compiledHandler && typeof __middleware_mod.default === "function"
-            ? __middleware_mod.default
+      typeof mwMod?.proxy === "function"
+        ? mwMod.proxy
+        : typeof mwMod?.middleware === "function"
+          ? mwMod.middleware
+          : (!compiledHandler && typeof defaultExport === "function"
+            ? defaultExport
             : null);
     if (!compiledHandler && !userlandHandler) return {};
     // Mirror the edge middleware path: strip flight headers and the _rsc
@@ -4542,6 +4624,7 @@ async function __handleRequestInner(request, env, ctx) {
       // body.
       let mwModifiedRequestHeaders = null;
       let mwCapturedResponse = null;
+      let mwCapturedResponseHeaders = null;
       let mwCapturedRewrite = null;
       let mwCapturedRedirect = null;
       const wrappedMiddlewareHandler = async (mwCtx) => {
@@ -4597,6 +4680,9 @@ async function __handleRequestInner(request, env, ctx) {
         const mwRes = await middlewareHandler({ ...mwCtx, method: request.method });
         if (mwRes && mwRes.requestHeaders) {
           mwModifiedRequestHeaders = mwRes.requestHeaders;
+        }
+        if (mwRes && mwRes.responseHeaders) {
+          mwCapturedResponseHeaders = mwRes.responseHeaders;
         }
         if (mwRes && mwRes.__mwResponse) {
           mwCapturedResponse = mwRes.__mwResponse;
@@ -4822,6 +4908,17 @@ async function __handleRequestInner(request, env, ctx) {
       if (mwModifiedRequestHeaders) {
         result = { ...result, mwRequestHeaders: mwModifiedRequestHeaders };
       }
+      if (mwCapturedResponseHeaders) {
+        const resolvedHeaders = new Headers(result.resolvedHeaders || undefined);
+        mwCapturedResponseHeaders.forEach((val, key) => {
+          if (key.toLowerCase() === "set-cookie") {
+            resolvedHeaders.append(key, val);
+          } else {
+            resolvedHeaders.set(key, val);
+          }
+        });
+        result = { ...result, resolvedHeaders };
+      }
       if (mwCapturedRewrite) {
         result = { ...result, mwRewrite: mwCapturedRewrite };
         // When @next/routing fails to match the mw rewrite target
@@ -4894,6 +4991,38 @@ async function __handleRequestInner(request, env, ctx) {
               routeMatches: undefined,
             };
             break;
+          }
+        }
+      }
+      if (!result.resolvedPathname && !result.invocationTarget) {
+        const configRewrite = __resolveConfigRewriteDestination(url, routingClone.headers);
+        if (configRewrite) {
+          const targetPath = configRewrite.pathname;
+          const candidates = [targetPath];
+          if (targetPath === "/") candidates.push("/index");
+          if (targetPath !== "/" && !targetPath.endsWith("/")) {
+            candidates.push(targetPath + "/index");
+          }
+          let matchedPathname = null;
+          for (const candidate of candidates) {
+            if (PATHNAMES.includes(candidate) || HANDLERS[candidate] || STATIC_PAGES[candidate]) {
+              matchedPathname = candidate;
+              break;
+            }
+          }
+          if (matchedPathname) {
+            result = {
+              ...result,
+              resolvedPathname: matchedPathname,
+              invocationTarget: {
+                pathname: targetPath,
+                query: __queryObjectFromSearch(configRewrite.search),
+              },
+              resolvedQuery: {
+                ...(result.resolvedQuery || {}),
+                ...__queryObjectFromSearch(configRewrite.search),
+              },
+            };
           }
         }
       }
@@ -8499,6 +8628,18 @@ function getRawResolvedQueryForUrl(routeResult) {
   return result;
 }
 
+function getDynamicRouteParamNames(routePattern) {
+  const names = new Set();
+  if (typeof routePattern !== "string") return names;
+  const re = /\\[\\[?\\.\\.\\.([^\\]]+)\\]\\]?|\\[([^\\]]+)\\]/g;
+  let match;
+  while ((match = re.exec(routePattern))) {
+    const name = match[1] || match[2];
+    if (name) names.add(name);
+  }
+  return names;
+}
+
 function appendSearchParam(searchParams, key, value) {
   if (value == null || value === "") return;
   if (Array.isArray(value)) {
@@ -8699,7 +8840,22 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
         dataPath = dataMatch[1] + "/" + rewriteBase + ".json";
       }
     }
-    req.url = dataPath + (targetQuery || "");
+    const dataSearchParams = new URLSearchParams(url.search || "");
+    const routeParamNames = getDynamicRouteParamNames(
+      handlerPathname || routeResult?.resolvedPathname || "",
+    );
+    for (const [key, value] of Object.entries(rawQueryForUrl)) {
+      if (key === "nextLocale") continue;
+      if (/^[0-9]+$/.test(key)) continue;
+      const bareKey = key.startsWith("nxtP") || key.startsWith("nxtI")
+        ? key.slice(4)
+        : key;
+      if (routeParamNames.has(bareKey)) continue;
+      if (dataSearchParams.has(key) || dataSearchParams.has(bareKey)) continue;
+      appendSearchParam(dataSearchParams, bareKey, value);
+    }
+    const dataTargetQuery = dataSearchParams.toString();
+    req.url = dataPath + (dataTargetQuery ? "?" + dataTargetQuery : "");
   } else {
     // For config/middleware rewrites we have a router-type split:
     //   • App Router (\`handler.type === "APP_PAGE"\`) reads

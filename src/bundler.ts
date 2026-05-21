@@ -789,6 +789,23 @@ export function patchNullFallbackPartialShellBlocking(workerCode: string): strin
       `true !== ${nextConfigVar}.experimental.partialFallbacks || (null == ${prerenderInfoVar} ? void 0 : ${prerenderInfoVar}.fallback) !== null || ${omittedFallbackParamVar} || ${unresolvedRootParamsVar} || !(${remainingParamsVar}.length > 0) || (${fallbackModeVar} = ${fallbackEnumVar}.FallbackMode.BLOCKING_STATIC_RENDER)`,
   );
 
+  const minifiedNullFallbackUpgradePattern =
+    /\(null\s*==\s*(\w+)\s*\?\s*void\s*0\s*:\s*\1\.fallback\)\s*!==\s*null\s*\|\|\s*(\w+)\s*\|\|\s*(\w+)\s*\|\|\s*!\((\w+)\.length\s*>\s*0\)\s*\|\|\s*\((\w+)\s*=\s*(\w+)\.FallbackMode\.PRERENDER\)/g;
+
+  workerCode = workerCode.replace(
+    minifiedNullFallbackUpgradePattern,
+    (
+      _match: string,
+      prerenderInfoVar: string,
+      omittedFallbackParamVar: string,
+      unresolvedRootParamsVar: string,
+      remainingParamsVar: string,
+      fallbackModeVar: string,
+      fallbackEnumVar: string,
+    ) =>
+      `(null == ${prerenderInfoVar} ? void 0 : ${prerenderInfoVar}.fallback) !== null || ${omittedFallbackParamVar} || ${unresolvedRootParamsVar} || !(${remainingParamsVar}.length > 0) || (${fallbackModeVar} = ${fallbackEnumVar}.FallbackMode.BLOCKING_STATIC_RENDER)`,
+  );
+
   const readableNullFallbackUpgradePattern =
     /(if\s*\(\s*\(\s*(?:(?:null\s*==\s*\w+)|(?:\w+\s*==\s*null))\s*\?\s*void\s*0\s*:\s*\w+\.fallback\s*\)\s*={2,3}\s*null\s*&&\s*!\w+\s*&&\s*!\w+\s*&&\s*\w+\.length\s*>\s*0\s*\)\s*\{[\s\S]{0,1600}?)(\w+)\s*=\s*([\w$]+)\.FallbackMode\.PRERENDER\s*;/g;
 
