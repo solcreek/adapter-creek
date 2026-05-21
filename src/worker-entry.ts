@@ -4050,6 +4050,113 @@ function __creekMoveFlightSuspenseRowsAfterBoundary(text, boundaryId) {
   );
 }
 
+function __creekHasDynamicParamCacheKeys(dynamicParamCacheKeys) {
+  return (
+    dynamicParamCacheKeys &&
+    typeof dynamicParamCacheKeys === "object" &&
+    Object.keys(dynamicParamCacheKeys).length > 0
+  );
+}
+
+function __creekPatchDynamicParamText(text, dynamicParamCacheKeys) {
+  if (!__creekHasDynamicParamCacheKeys(dynamicParamCacheKeys)) return text;
+
+  let patched = text.replace(
+    /%%drp:([^:%]+):[^%]+%%/g,
+    (full, paramName) => (
+      Object.prototype.hasOwnProperty.call(dynamicParamCacheKeys, paramName)
+        ? String(dynamicParamCacheKeys[paramName])
+        : full
+    )
+  );
+
+  patched = patched.replace(
+    /("name":"([^"]+)","param":\{"type":"[^"]+","key":)null(,"siblings":)/g,
+    (full, beforeKey, paramName, afterKey) => (
+      Object.prototype.hasOwnProperty.call(dynamicParamCacheKeys, paramName)
+        ? beforeKey + JSON.stringify(String(dynamicParamCacheKeys[paramName])) + afterKey
+        : full
+    )
+  );
+
+  patched = patched.replace(
+    /\\["([^"]+)","(?:[^"\\\\]|\\\\.)*","([^"]+)",(null|\\[[^\\]]*\\])\\]/g,
+    (full, paramName, paramType, siblings) => {
+      if (!Object.prototype.hasOwnProperty.call(dynamicParamCacheKeys, paramName)) {
+        return full;
+      }
+      if (
+        paramType !== "d" &&
+        paramType !== "c" &&
+        paramType !== "oc" &&
+        !paramType.startsWith("di") &&
+        !paramType.startsWith("ci")
+      ) {
+        return full;
+      }
+      return (
+        "[" +
+        JSON.stringify(paramName) +
+        "," +
+        JSON.stringify(String(dynamicParamCacheKeys[paramName])) +
+        "," +
+        JSON.stringify(paramType) +
+        "," +
+        siblings +
+        "]"
+      );
+    }
+  );
+
+  return patched;
+}
+
+function __creekPatchDynamicParamStream(stream, dynamicParamCacheKeys) {
+  if (!stream || !__creekHasDynamicParamCacheKeys(dynamicParamCacheKeys)) return stream;
+
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const carryLength = 512;
+  let carry = "";
+
+  return stream.pipeThrough(new TransformStream({
+    transform(chunk, controller) {
+      const text = carry + decoder.decode(chunk, { stream: true });
+      if (text.length <= carryLength) {
+        carry = text;
+        return;
+      }
+      const flushable = text.slice(0, -carryLength);
+      carry = text.slice(-carryLength);
+      controller.enqueue(encoder.encode(
+        __creekPatchDynamicParamText(flushable, dynamicParamCacheKeys)
+      ));
+    },
+    flush(controller) {
+      const text = carry + decoder.decode();
+      if (text.length > 0) {
+        controller.enqueue(encoder.encode(
+          __creekPatchDynamicParamText(text, dynamicParamCacheKeys)
+        ));
+      }
+    },
+  }));
+}
+
+function __creekPatchFlightStream(stream, dynamicParamCacheKeys) {
+  return __creekPatchDynamicParamStream(
+    __creekPatchFlightStaticBoundaryStream(stream),
+    dynamicParamCacheKeys
+  );
+}
+
+function __creekPatchHtmlFlightStream(stream, dynamicParamCacheKeys) {
+  return __creekPatchDynamicParamStream(
+    __creekPatchHtmlFlightStaticBoundaryStream(stream),
+    dynamicParamCacheKeys
+  );
+}
+
 function __creekPatchFlightStaticBoundaryStream(stream) {
   if (!stream) return stream;
 
@@ -6793,6 +6900,10 @@ async function __handleRequestInner(request, env, ctx) {
         : url.pathname;
       const isFallbackFalseMiss =
         !!hasHandler && __creekIsFallbackFalseMiss(resolvedPathname, fallbackFalseCheckPathname);
+      const dynamicParamCacheKeys = __creekDynamicParamCacheKeysForPathname(
+        resolvedPathname,
+        url.pathname
+      );
       if (
         hasHandler &&
         (targetHandlerType === "PAGES" || targetHandlerType === "APP_PAGE") &&
@@ -7034,7 +7145,7 @@ async function __handleRequestInner(request, env, ctx) {
                 return new Response(
                   request.method === "HEAD"
                     ? null
-                    : __creekPatchFlightStaticBoundaryStream(segmentRes.body),
+                    : __creekPatchFlightStream(segmentRes.body, dynamicParamCacheKeys),
                   {
                   status: segmentRes.status,
                   statusText: segmentRes.statusText,
@@ -7085,7 +7196,7 @@ async function __handleRequestInner(request, env, ctx) {
               return new Response(
                 request.method === "HEAD"
                   ? null
-                  : __creekPatchFlightStaticBoundaryStream(rscRes.body),
+                  : __creekPatchFlightStream(rscRes.body, dynamicParamCacheKeys),
                 {
                 status: rscRes.status,
                 statusText: rscRes.statusText,
@@ -7155,7 +7266,7 @@ async function __handleRequestInner(request, env, ctx) {
               request.method === "HEAD"
                 ? null
                 : headers.get("x-nextjs-postponed") === "1"
-                  ? __creekPatchHtmlFlightStaticBoundaryStream(assetRes.body)
+                  ? __creekPatchHtmlFlightStream(assetRes.body, dynamicParamCacheKeys)
                   : assetRes.body;
             if (body !== assetRes.body) headers.delete("content-length");
             return new Response(body, {
@@ -8592,10 +8703,11 @@ interface StaticPageEntry {
   // cache reconciles entries with — matching vanilla keeps client cache
   // behavior identical, which matters for prefetch-hit-then-click flows.
   staleTime?: string;
-  // Concrete App PPR pages whose prerendered shell contains server functions
-  // passed to Client Components must be resumed by the app handler on hard
-  // navigations. Serving only the static HTML leaves the client with stale
-  // function payloads and action POSTs fail after hydration.
+  // Concrete App PPR pages that need the app handler to resume the shell on
+  // hard navigations. Serving only the static HTML is correct for
+  // generateStaticParams shells whose build-time output is the desired user
+  // HTML, but it breaks shells that postponed runtime request data such as
+  // connection(), dynamic metadata, searchParams, or bound server functions.
   requiresDynamicPprResume?: boolean;
 }
 
@@ -8754,6 +8866,7 @@ function collectStaticPageMap(
   // post-revalidation assertion for \`'use cache'\` pages.
   const cacheTagsByPathname = new Map<string, string[]>();
   const staleTimeByPathname = new Map<string, string>();
+  const segmentPathsByPathname = new Map<string, string[]>();
   for (const pe of prerenderEntries) {
     const raw = pe.metaHeaders?.["x-next-cache-tags"] ?? pe.initialHeaders?.["x-next-cache-tags"];
     if (typeof raw === "string" && raw.length > 0) {
@@ -8765,6 +8878,9 @@ function collectStaticPageMap(
       staleTimeByPathname.set(pe.pathname, st);
     } else if (typeof st === "number") {
       staleTimeByPathname.set(pe.pathname, String(st));
+    }
+    if (Array.isArray(pe.segmentPaths) && pe.segmentPaths.length > 0) {
+      segmentPathsByPathname.set(pe.pathname, pe.segmentPaths);
     }
   }
   const applyCacheTags = (pathname: string, entry: StaticPageEntry) => {
@@ -8841,16 +8957,22 @@ function collectStaticPageMap(
       assetPath: staticPageAssetPath(prerender.pathname, routerType),
       routerType,
     };
-    if (
-      routerType === "APP" &&
-      !prerender.pathname.includes("[") &&
-      typeof prerender.fallback.postponedState === "string" &&
-      prerender.fallback.postponedState.length > 0 &&
-      !!prerender.pprChain?.headers &&
-      (serverActionPages.has(prerender.pathname) ||
-        prerenderHtmlHasBoundServerAction(prerender.fallback.filePath))
-    ) {
-      entry.requiresDynamicPprResume = true;
+    if (routerType === "APP" && !prerender.pathname.includes("[")) {
+      const hasPostponedState =
+        typeof prerender.fallback.postponedState === "string" &&
+        prerender.fallback.postponedState.length > 0;
+      const isPprChain = !!prerender.pprChain?.headers;
+      const hasServerFunctions =
+        serverActionPages.has(prerender.pathname) ||
+        prerenderHtmlHasBoundServerAction(prerender.fallback.filePath);
+      const segmentPaths = segmentPathsByPathname.get(prerender.pathname) || [];
+      const hasDynamicParamSegment = segmentPaths.some((segmentPath) =>
+        typeof segmentPath === "string" &&
+        (segmentPath.includes("$d$") || segmentPath.includes("$c$"))
+      );
+      if (hasPostponedState && isPprChain && (hasServerFunctions || !hasDynamicParamSegment)) {
+        entry.requiresDynamicPprResume = true;
+      }
     }
     if (typeof prerender.fallback.initialStatus === "number") {
       entry.status = prerender.fallback.initialStatus;
@@ -9297,6 +9419,73 @@ function fillRouteParamsFromPath(routePattern, pathname, params) {
   return params;
 }
 
+function __creekStripBasePathFromRawPathname(pathname) {
+  if (!BASE_PATH || typeof pathname !== "string") return pathname;
+  if (pathname === BASE_PATH) return "/";
+  if (pathname.startsWith(BASE_PATH + "/")) return pathname.slice(BASE_PATH.length) || "/";
+  return pathname;
+}
+
+function __creekDynamicParamCacheKeysForPathname(routePattern, rawPathname) {
+  if (
+    typeof routePattern !== "string" ||
+    !routePattern.includes("[") ||
+    typeof rawPathname !== "string"
+  ) {
+    return null;
+  }
+
+  const patternSegments = routePattern.split("?")[0].split("/").filter(Boolean);
+  const pathSegments = __creekStripBasePathFromRawPathname(rawPathname)
+    .split("?")[0]
+    .split("/")
+    .filter(Boolean);
+  const keys = {};
+  let pathIndex = 0;
+
+  for (const segment of patternSegments) {
+    if (
+      !segment ||
+      (segment.startsWith("(") && segment.endsWith(")")) ||
+      segment.startsWith("@")
+    ) {
+      continue;
+    }
+
+    if (segment.startsWith("[[...") && segment.endsWith("]]")) {
+      const key = segment.slice(5, -2);
+      const rest = pathSegments.slice(pathIndex);
+      keys[key] = rest.length > 0
+        ? rest.map((part) => encodeURIComponent(part)).join("/")
+        : "";
+      pathIndex = pathSegments.length;
+      continue;
+    }
+
+    if (segment.startsWith("[...") && segment.endsWith("]")) {
+      const key = segment.slice(4, -1);
+      keys[key] = pathSegments.slice(pathIndex)
+        .map((part) => encodeURIComponent(part))
+        .join("/");
+      pathIndex = pathSegments.length;
+      continue;
+    }
+
+    if (segment.startsWith("[") && segment.endsWith("]")) {
+      const key = segment.slice(1, -1);
+      if (pathIndex < pathSegments.length) {
+        keys[key] = encodeURIComponent(pathSegments[pathIndex]);
+      }
+      pathIndex += 1;
+      continue;
+    }
+
+    pathIndex += 1;
+  }
+
+  return Object.keys(keys).length > 0 ? keys : null;
+}
+
 function getNormalizedRouteParams(routeResult, handlerPathname, fallbackUrl, requestHeaders) {
   const normalizedRouteParams = {};
   for (const [key, value] of Object.entries(routeResult?.routeMatches || {})) {
@@ -9490,6 +9679,7 @@ function applyStaticAssetHeaders(headers, pathname) {
 async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname, handlerType) {
   const url = new URL(request.url);
   const normalizedRouteParams = getNormalizedRouteParams(routeResult, handlerPathname, url, request.headers);
+  const dynamicParamCacheKeys = __creekDynamicParamCacheKeysForPathname(handlerPathname, url.pathname);
   const isRSCRequest = request.headers.has("rsc") || request.headers.has("next-router-state-tree");
   const isPrefetchRSCRequest = request.headers.get("next-router-prefetch") === "1";
   const segmentPrefetchRSCRequest = request.headers.get("next-router-segment-prefetch");
@@ -10162,7 +10352,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       !actionRedirect &&
       ctLower.includes("text/x-component")
     ) {
-      body = __creekPatchFlightStaticBoundaryStream(body);
+      body = __creekPatchFlightStream(body, dynamicParamCacheKeys);
       h.delete("content-length");
     }
     if (
@@ -10173,7 +10363,7 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       ctLower.includes("text/html") &&
       h.get("x-nextjs-postponed") === "1"
     ) {
-      body = __creekPatchHtmlFlightStaticBoundaryStream(body);
+      body = __creekPatchHtmlFlightStream(body, dynamicParamCacheKeys);
       h.delete("content-length");
     }
     const init = {
