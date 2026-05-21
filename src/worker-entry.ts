@@ -6784,6 +6784,8 @@ async function __handleRequestInner(request, env, ctx) {
         !!hasHandler &&
         !isServingBracketShell &&
         __creekHasPostponedPrerenderForPathname(url.pathname, decodedPathname, servePath);
+      const shouldResumeConcreteAppPPRPage =
+        isConcreteAppPPRPage && staticEntry?.requiresDynamicPprResume === true;
       const shouldBypassStaticForISR = isISRPage && hasHandler && !isConcreteAppPPRPage;
       const targetHandlerType = hasHandler ? HANDLERS[resolvedPathname]?.type : undefined;
       const fallbackFalseCheckPathname = staticEntryFromConfigRewrite
@@ -6853,7 +6855,7 @@ async function __handleRequestInner(request, env, ctx) {
         !isDraftModeRequest &&
         !(isCrawlerRequest && isServingBracketShell) &&
         !isAppRouterBracketShell &&
-        !isConcreteAppPPRPage &&
+        !shouldResumeConcreteAppPPRPage &&
         (!hasMiddlewareRewrite || !hasHandlerForTarget || canServeStaticConfigRewriteTarget) &&
         (!isRewritten || !hasHandlerForTarget || canServeStaticConfigRewriteTarget) &&
         // ISR pages bypass static assets when a handler exists.
@@ -8590,6 +8592,11 @@ interface StaticPageEntry {
   // cache reconciles entries with — matching vanilla keeps client cache
   // behavior identical, which matters for prefetch-hit-then-click flows.
   staleTime?: string;
+  // Concrete App PPR pages whose prerendered shell contains server functions
+  // passed to Client Components must be resumed by the app handler on hard
+  // navigations. Serving only the static HTML leaves the client with stale
+  // function payloads and action POSTs fail after hydration.
+  requiresDynamicPprResume?: boolean;
 }
 
 function routePatternMatches(routePattern: string, pathname: string): boolean {
@@ -8834,6 +8841,17 @@ function collectStaticPageMap(
       assetPath: staticPageAssetPath(prerender.pathname, routerType),
       routerType,
     };
+    if (
+      routerType === "APP" &&
+      !prerender.pathname.includes("[") &&
+      typeof prerender.fallback.postponedState === "string" &&
+      prerender.fallback.postponedState.length > 0 &&
+      !!prerender.pprChain?.headers &&
+      (serverActionPages.has(prerender.pathname) ||
+        prerenderHtmlHasBoundServerAction(prerender.fallback.filePath))
+    ) {
+      entry.requiresDynamicPprResume = true;
+    }
     if (typeof prerender.fallback.initialStatus === "number") {
       entry.status = prerender.fallback.initialStatus;
     }
