@@ -544,6 +544,33 @@ import { workAsyncStorage as __nextWorkAsyncStorage } from "next/dist/server/app
 import { Buffer } from "node:buffer";
 import { DurableObject } from "cloudflare:workers";
 
+// Next's fetch cache recreates cached responses from base64 via
+// \`new Response(Buffer.from(...))\`. Workerd accepts Web byte sources
+// reliably, but Node Buffer bodies can wedge cached edge renders after many
+// fetch-cache operations. Normalize only Buffer bodies while preserving
+// native Response branding for instanceof checks.
+const __CREEK_NATIVE_RESPONSE = globalThis.Response;
+if (
+  __CREEK_NATIVE_RESPONSE &&
+  !__CREEK_NATIVE_RESPONSE.__creekBufferBodySafe
+) {
+  class CreekResponse extends __CREEK_NATIVE_RESPONSE {
+    constructor(body, init) {
+      if (typeof Buffer !== "undefined" && Buffer.isBuffer?.(body)) {
+        body = new Uint8Array(body.buffer, body.byteOffset, body.byteLength);
+      }
+      super(body, init);
+    }
+  }
+  Object.defineProperty(CreekResponse, Symbol.hasInstance, {
+    value(value) {
+      return value instanceof __CREEK_NATIVE_RESPONSE;
+    },
+  });
+  Object.defineProperty(CreekResponse, "__creekBufferBodySafe", { value: true });
+  globalThis.Response = CreekResponse;
+}
+
 // Boot manifest globals before importing edge runtime chunks.
 ${manifestImports}
 
@@ -2443,24 +2470,27 @@ async function __creekSeededAppPageEntry(key, ctx) {
   // regex mapping, not direct seeds. Seeds only cover concrete paths.
   if (!seed || seed.pathname.includes("[")) return null;
   const assetBasePath = seed.pathname || key;
-  // Only seed PPR-chain pages. Non-PPR static pages flow through the
-  // static-asset fast-path (\`STATIC_PAGES\` lookup in the main handler) —
-  // intercepting them here would race the fast-path and can cause the
-  // cache-handler entry to win for hard navigations whose route-level
-  // metadata differs from the seed's build-time value (e.g. app-prefetch's
-  // \`/\` where a query-param prefetch asserts that the freshly-rendered RSC,
-  // not the stale seeded one, determines the accordion visibility).
-  if (!seed.pprHeaders) return null;
-  // PPR-chain seeds always produce a valid cache entry: either a fully
-  // static prerender (no postponed), or a static shell with a
-  // \`postponedState\` that Next's app-page template uses to resume
-  // rendering. Previously this function returned null for the postponed
-  // case, which made Next fall back to a fresh render — but PPR routes
-  // with \`cacheComponents: true\` trip the "encountered uncached or
-  // runtime data during the initial render" guard because they were
-  // only designed to be resumable, not re-rendered from scratch.
-  // Fixes concurrent-navigations/mismatching-prefetch (and generally
-  // any PPR-chain concrete param page like /dynamic-page/[a|b]).
+  // Seed PPR-chain pages and App ISR pages. Non-PPR, non-ISR static pages
+  // flow through the static-asset fast-path; intercepting those here can
+  // cause the cache-handler entry to win for hard navigations whose
+  // route-level metadata differs from the seed's build-time value. ISR is
+  // different: once the main handler bypasses the static asset so Next can
+  // perform the fresh/stale lifecycle, the App Page handler requires a
+  // concrete cache entry as its base. Without this seed, dynamic
+  // generateStaticParams ISR pages throw "cache entry required but not
+  // generated" instead of serving stale HTML and regenerating.
+  const isSeedableISR =
+    typeof seed.initialRevalidate === "number" && seed.initialRevalidate > 0;
+  if (!seed.pprHeaders && !isSeedableISR) return null;
+  // PPR/ISR seeds always produce a valid cache entry: either a fully static
+  // prerender (no postponed), or a static shell with a \`postponedState\`
+  // that Next's app-page template uses to resume rendering. Previously this
+  // function returned null for the postponed case, which made Next fall back
+  // to a fresh render — but PPR routes with \`cacheComponents: true\` trip
+  // the "encountered uncached or runtime data during the initial render"
+  // guard because they were only designed to be resumable, not re-rendered
+  // from scratch. Fixes concurrent-navigations/mismatching-prefetch and
+  // ISR dynamic prerenders.
 
   const headers = seed.initialHeaders && typeof seed.initialHeaders === "object"
     ? Object.assign({}, seed.initialHeaders)
@@ -2559,16 +2589,148 @@ async function __creekSeededAppPageEntry(key, ctx) {
   };
 }
 
-function __creekDecodeJsStringFragment(value) {
-  if (typeof value !== "string") return value;
-  try {
-    return JSON.parse('"' + value.replace(/"/g, '\\"') + '"');
-  } catch {
-    return value
-      .replace(/\\u([0-9a-fA-F]{4})/g, (_m, hex) => String.fromCharCode(parseInt(hex, 16)))
-      .replace(/\\"/g, '"')
-      .replace(/\\\\/g, "\\\\");
+function __creekFindEscapedJsStringEnd(html, start) {
+  const bs = String.fromCharCode(92);
+  const dq = String.fromCharCode(34);
+  for (let i = start; i < html.length; i++) {
+    if (html[i] !== dq) continue;
+    let slashes = 0;
+    for (let j = i - 1; j >= start && html[j] === bs; j--) slashes++;
+    // Flight is embedded inside a JS string. The field terminator appears as
+    // \" while quotes inside the text value are nested as \\\".
+    if (slashes === 1) return i - 1;
   }
+  return -1;
+}
+
+function __creekFindJsStringEnd(html, start) {
+  const bs = String.fromCharCode(92);
+  const dq = String.fromCharCode(34);
+  for (let i = start; i < html.length; i++) {
+    if (html[i] !== dq) continue;
+    let slashes = 0;
+    for (let j = i - 1; j >= start && html[j] === bs; j--) slashes++;
+    if (slashes % 2 === 0) return i;
+  }
+  return -1;
+}
+
+function __creekUnescapeNestedJsStringText(value) {
+  if (typeof value !== "string") return value;
+  const bs = String.fromCharCode(92);
+  const dq = String.fromCharCode(34);
+  let out = "";
+  for (let i = 0; i < value.length; i++) {
+    if (value[i] !== bs) {
+      out += value[i];
+      continue;
+    }
+    let j = i;
+    while (j < value.length && value[j] === bs) j++;
+    if (value[j] === dq) {
+      out += dq;
+      i = j;
+      continue;
+    }
+    out += value.slice(i, j);
+    i = j - 1;
+  }
+  return out.split(bs + bs).join(bs);
+}
+
+function __creekIsHexChar(value) {
+  if (!value) return false;
+  const code = value.charCodeAt(0);
+  return (
+    (code >= 48 && code <= 57) ||
+    (code >= 65 && code <= 70) ||
+    (code >= 97 && code <= 102)
+  );
+}
+
+function __creekUtf8ByteLengthForCodePoint(codePoint) {
+  if (codePoint <= 0x7f) return 1;
+  if (codePoint <= 0x7ff) return 2;
+  if (codePoint <= 0xffff) return 3;
+  return 4;
+}
+
+function __creekSliceByUtf8ByteLength(value, start, byteLength) {
+  let bytes = 0;
+  let end = start;
+  while (end < value.length && bytes < byteLength) {
+    const codePoint = value.codePointAt(end);
+    const charLength = codePoint > 0xffff ? 2 : 1;
+    const nextBytes = bytes + __creekUtf8ByteLengthForCodePoint(codePoint);
+    if (nextBytes > byteLength) return null;
+    bytes = nextBytes;
+    end += charLength;
+  }
+  return bytes === byteLength ? { text: value.slice(start, end), end } : null;
+}
+
+function __creekDecodeJsStringLiteral(value) {
+  if (typeof value !== "string") return value;
+  const bs = String.fromCharCode(92);
+  const dq = String.fromCharCode(34);
+  try {
+    return JSON.parse(dq + value + dq);
+  } catch {
+    try {
+      return JSON.parse(dq + value.split(dq).join(bs + dq) + dq);
+    } catch {
+      return value
+        .replace(/\\u([0-9a-fA-F]{4})/g, (_m, hex) => String.fromCharCode(parseInt(hex, 16)));
+    }
+  }
+}
+
+function __creekDecodeJsStringFragment(value) {
+  return __creekUnescapeNestedJsStringText(__creekDecodeJsStringLiteral(value));
+}
+
+function __creekCollectFlightTextReferences(html) {
+  const refs = new Map();
+  if (typeof html !== "string" || !html.includes("self.__next_f.push")) {
+    return refs;
+  }
+  const dq = String.fromCharCode(34);
+  const lf = String.fromCharCode(10);
+  const pushNeedle = "self.__next_f.push([1,";
+  let flight = "";
+  let searchFrom = 0;
+  while (true) {
+    const pushIndex = html.indexOf(pushNeedle, searchFrom);
+    if (pushIndex === -1) break;
+    const quoteStart = html.indexOf(dq, pushIndex + pushNeedle.length);
+    if (quoteStart === -1) break;
+    const contentStart = quoteStart + 1;
+    const contentEnd = __creekFindJsStringEnd(html, contentStart);
+    if (contentEnd === -1) break;
+    flight += __creekDecodeJsStringLiteral(html.slice(contentStart, contentEnd));
+    searchFrom = contentEnd + 1;
+  }
+
+  for (let i = 0; i < flight.length; i++) {
+    if (i > 0 && flight[i - 1] !== lf) continue;
+    let idEnd = i;
+    while (idEnd < flight.length && __creekIsHexChar(flight[idEnd])) idEnd++;
+    if (idEnd === i || flight[idEnd] !== ":" || flight[idEnd + 1] !== "T") continue;
+    let lenEnd = idEnd + 2;
+    while (lenEnd < flight.length && __creekIsHexChar(flight[lenEnd])) lenEnd++;
+    if (lenEnd === idEnd + 2 || flight[lenEnd] !== ",") continue;
+    const byteLength = parseInt(flight.slice(idEnd + 2, lenEnd), 16);
+    const payloadStart = lenEnd + 1;
+    const payload = Number.isFinite(byteLength)
+      ? __creekSliceByUtf8ByteLength(flight, payloadStart, byteLength)
+      : null;
+    if (!payload) continue;
+    const id = flight.slice(i, idEnd);
+    refs.set(id, payload.text);
+    refs.set(id.toLowerCase(), payload.text);
+    i = payload.end - 1;
+  }
+  return refs;
 }
 
 function __creekPatchVisibleHtmlFromFlight(html) {
@@ -2576,11 +2738,12 @@ function __creekPatchVisibleHtmlFromFlight(html) {
     return html;
   }
   const replacements = new Map();
+  const flightTextReferences = __creekCollectFlightTextReferences(html);
   const bs = String.fromCharCode(92);
   const dq = String.fromCharCode(34);
   const quoted = (value) => bs + dq + value + bs + dq;
   const idNeedle = quoted("id") + ":" + bs + dq;
-  const childrenNeedle = quoted("children") + ":" + bs + dq;
+  const childrenKeyNeedle = quoted("children") + ":";
   let searchFrom = 0;
   while (true) {
     const idNeedleIndex = html.indexOf(idNeedle, searchFrom);
@@ -2588,17 +2751,34 @@ function __creekPatchVisibleHtmlFromFlight(html) {
     const idStart = idNeedleIndex + idNeedle.length;
     const idEnd = html.indexOf(bs + dq, idStart);
     if (idEnd === -1) break;
-    const childrenNeedleIndex = html.indexOf(childrenNeedle, idEnd + 2);
+    const childrenNeedleIndex = html.indexOf(childrenKeyNeedle, idEnd + 2);
     if (childrenNeedleIndex === -1 || childrenNeedleIndex - idEnd > 400) {
       searchFrom = idEnd + 2;
       continue;
     }
-    const textStart = childrenNeedleIndex + childrenNeedle.length;
-    const textEnd = html.indexOf(bs + dq, textStart);
+    const valueStart = childrenNeedleIndex + childrenKeyNeedle.length;
+    if (html.slice(valueStart, valueStart + 2) !== bs + dq) {
+      searchFrom = valueStart;
+      continue;
+    }
+    const textStart = valueStart + 2;
+    const textEnd = __creekFindEscapedJsStringEnd(html, textStart);
     if (textEnd === -1) break;
     const id = __creekDecodeJsStringFragment(html.slice(idStart, idEnd));
-    const text = __creekDecodeJsStringFragment(html.slice(textStart, textEnd));
-    if (typeof id === "string" && id.length > 0 && typeof text === "string") {
+    let text = __creekDecodeJsStringFragment(html.slice(textStart, textEnd));
+    if (typeof text === "string" && text.startsWith("$")) {
+      const refId = text.slice(1);
+      const referencedText = flightTextReferences.get(refId) || flightTextReferences.get(refId.toLowerCase());
+      if (referencedText !== undefined) {
+        text = referencedText;
+      }
+    }
+    if (
+      typeof id === "string" &&
+      id.length > 0 &&
+      typeof text === "string" &&
+      !text.startsWith("$")
+    ) {
       replacements.set(id, text);
     }
     searchFrom = textEnd + 2;
@@ -2631,6 +2811,16 @@ function __creekPatchVisibleHtmlFromFlight(html) {
   return patched;
 }
 
+function __creekPatchVisibleHtmlFromFlightStable(html) {
+  let patched = html;
+  for (let i = 0; i < 2; i++) {
+    const next = __creekPatchVisibleHtmlFromFlight(patched);
+    if (next === patched) return next;
+    patched = next;
+  }
+  return patched;
+}
+
 function __creekValueWithCacheTags(value, tags) {
   if (
     !value ||
@@ -2649,6 +2839,18 @@ function __creekValueWithCacheTags(value, tags) {
   return Object.assign({}, value, { headers });
 }
 
+function __creekScopedCacheKey(key, ctx, value) {
+  const isFetchEntry = ctx?.kind === "FETCH" || value?.kind === "FETCH";
+  if (!isFetchEntry) return key;
+  try {
+    const runtime = __INTERNAL_FETCH_CONTEXT.getStore()?.handlerRuntime;
+    if (runtime === "edge" || runtime === "nodejs") {
+      return "__fetch:" + runtime + ":" + key;
+    }
+  } catch {}
+  return key;
+}
+
 class CreekCacheHandler {
   constructor(ctx) {
     if (!globalThis.__CREEK_CACHE) globalThis.__CREEK_CACHE = new Map();
@@ -2657,6 +2859,7 @@ class CreekCacheHandler {
   }
 
   async get(key, ctx) {
+    key = __creekScopedCacheKey(key, ctx);
     // L1: in-memory
     let entry = globalThis.__CREEK_CACHE.get(key);
 
@@ -2690,7 +2893,6 @@ class CreekCacheHandler {
     if (!entry) return null;
 
     const age = (__CREEK_NATIVE_DATE.now() - entry.lastModified) / 1000;
-
     // Stale by tag invalidation — checks DO shards first (cross-isolate),
     // falls back to the in-memory map.
     //
@@ -2748,6 +2950,7 @@ class CreekCacheHandler {
   }
 
   async set(key, data, ctx) {
+    key = __creekScopedCacheKey(key, ctx, data);
     if (data === null) {
       globalThis.__CREEK_CACHE.delete(key);
       // Also delete from KV
@@ -2776,12 +2979,14 @@ class CreekCacheHandler {
     const revalidate =
       typeof ctx?.revalidate === "number"
         ? ctx.revalidate
+        : typeof data?.revalidate === "number"
+          ? data.revalidate
         : typeof ctx?.cacheControl?.revalidate === "number"
           ? ctx.cacheControl.revalidate
           : undefined;
     let value = __creekValueWithCacheTags(data, tags);
     if (value?.kind === "APP_PAGE" && typeof value.html === "string") {
-      const patchedHtml = __creekPatchVisibleHtmlFromFlight(value.html);
+      const patchedHtml = __creekPatchVisibleHtmlFromFlightStable(value.html);
       if (patchedHtml !== value.html) {
         value = { ...value, html: patchedHtml };
       }
@@ -2804,6 +3009,21 @@ class CreekCacheHandler {
     for (const cacheKey of cacheKeys) {
       globalThis.__CREEK_CACHE.set(cacheKey, entry);
     }
+
+    // Track tags → keys mapping (in-memory only, for same-isolate invalidation)
+    for (const tag of tags) {
+      let keys = globalThis.__CREEK_TAG_TO_KEYS.get(tag);
+      if (!keys) {
+        keys = new Set();
+        globalThis.__CREEK_TAG_TO_KEYS.set(tag, keys);
+      }
+      for (const cacheKey of cacheKeys) keys.add(cacheKey);
+    }
+
+    // Fetch cache entries are per-render data artifacts. Keeping them in L1
+    // preserves same-isolate cache semantics for deploy tests without adding
+    // KV serialization and cross-runtime body reuse pressure to edge renders.
+    if (value?.kind === "FETCH") return;
 
     // L2: persist to KV (fire-and-forget)
     const kv = __creekKV();
@@ -2832,15 +3052,6 @@ class CreekCacheHandler {
       } catch {}
     }
 
-    // Track tags → keys mapping (in-memory only, for same-isolate invalidation)
-    for (const tag of tags) {
-      let keys = globalThis.__CREEK_TAG_TO_KEYS.get(tag);
-      if (!keys) {
-        keys = new Set();
-        globalThis.__CREEK_TAG_TO_KEYS.set(tag, keys);
-      }
-      for (const cacheKey of cacheKeys) keys.add(cacheKey);
-    }
   }
 
   async revalidateTag(tag, durations) {
@@ -2906,6 +3117,251 @@ function __creekGetIncrementalCache(requestHeaders) {
     console.error("[creek-cache] failed to construct IncrementalCache:", err?.message);
   }
   return __creekApplyRequestRevalidatedTags(globalThis.__CREEK_INCREMENTAL_CACHE, requestHeaders);
+}
+
+function __creekBase64ToBytes(value) {
+  const buf = Buffer.from(value || "", "base64");
+  return new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+}
+
+function __creekResponseFromCachedFetchData(data, fetchUrl) {
+  const cached = data || {};
+  const response = new Response(__creekBase64ToBytes(cached.body), {
+    headers: cached.headers,
+    status: cached.status || 200,
+  });
+  try {
+    Object.defineProperty(response, "url", {
+      value: cached.url || fetchUrl,
+      configurable: true,
+      enumerable: true,
+    });
+  } catch {}
+  return response;
+}
+
+function __creekOriginalFetchArgs(input, init) {
+  if (input instanceof Request) {
+    const reqOptions = {};
+    const requestInputFields = [
+      "cache",
+      "credentials",
+      "headers",
+      "integrity",
+      "keepalive",
+      "method",
+      "mode",
+      "redirect",
+      "referrer",
+      "referrerPolicy",
+      "window",
+      "duplex",
+      "signal",
+    ];
+    const body = input._ogBody || input.body;
+    if (body !== undefined && body !== null) reqOptions.body = body;
+    for (const field of requestInputFields) {
+      if (field in input) reqOptions[field] = input[field];
+    }
+    return [new Request(input.url, reqOptions), undefined];
+  }
+  if (init && typeof init === "object") {
+    const fetchInit = { ...init };
+    if ("_ogBody" in fetchInit) {
+      fetchInit.body = fetchInit._ogBody;
+      delete fetchInit._ogBody;
+    }
+    delete fetchInit.next;
+    delete fetchInit.cache;
+    return [input, fetchInit];
+  }
+  return [input, init];
+}
+
+async function __creekFetchAndStoreEdgeAppFetch(
+  originalFetch,
+  input,
+  init,
+  cache,
+  cacheKey,
+  cacheCtx,
+  revalidate,
+  fetchUrl,
+) {
+  const [fetchInput, fetchInit] = __creekOriginalFetchArgs(input, init);
+  const response = await originalFetch(fetchInput, fetchInit);
+  if (response.status !== 200) return response;
+
+  const bodyBuffer = await response.arrayBuffer();
+  const bodyBytes = new Uint8Array(bodyBuffer);
+  const fetchedData = {
+    headers: Object.fromEntries(response.headers.entries()),
+    body: Buffer.from(bodyBytes).toString("base64"),
+    status: response.status,
+    url: response.url || fetchUrl,
+  };
+  try {
+    await cache.set(
+      cacheKey,
+      { kind: "FETCH", data: fetchedData, revalidate },
+      cacheCtx,
+    );
+  } catch {}
+  const out = new Response(bodyBytes, {
+    headers: response.headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
+  try {
+    Object.defineProperty(out, "url", {
+      value: response.url || fetchUrl,
+      configurable: true,
+      enumerable: true,
+    });
+  } catch {}
+  return out;
+}
+
+function __creekWrapEdgeAppFetchCache(patchedFetch) {
+  if (typeof patchedFetch !== "function") return patchedFetch;
+  if (patchedFetch.__creekEdgeAppFetchCacheShim) return patchedFetch;
+  const originalFetch = patchedFetch._nextOriginalFetch;
+  if (typeof originalFetch !== "function") return patchedFetch;
+
+  const shimFetch = async function fetch(input, init) {
+    let store = null;
+    try { store = __INTERNAL_FETCH_CONTEXT.getStore(); } catch {}
+    const isEdgeAppPage =
+      store?.handlerRuntime === "edge" &&
+      store?.handlerType === "APP_PAGE";
+    const nextConfig = init?.next || (input && typeof input === "object" ? input.next : undefined);
+    const revalidate = nextConfig?.revalidate;
+    if (
+      !isEdgeAppPage ||
+      nextConfig?.internal === true ||
+      typeof revalidate !== "number" ||
+      !Number.isFinite(revalidate) ||
+      revalidate <= 0
+    ) {
+      return patchedFetch(input, init);
+    }
+
+    let fetchUrl = "";
+    try {
+      fetchUrl = new URL(input instanceof Request ? input.url : input).href;
+    } catch {
+      return patchedFetch(input, init);
+    }
+
+    let cacheKey = null;
+    try {
+      cacheKey = await __creekGetIncrementalCache()?.generateCacheKey(
+        fetchUrl,
+        input instanceof Request ? input : init,
+      );
+    } catch {}
+    if (!cacheKey) return patchedFetch(input, init);
+
+    const tags = Array.isArray(nextConfig?.tags) ? nextConfig.tags : [];
+    const cache = new CreekCacheHandler();
+    const cacheCtx = {
+      kind: "FETCH",
+      revalidate,
+      fetchUrl,
+      tags,
+      softTags: [],
+    };
+    try {
+      const entry = await cache.get(cacheKey, cacheCtx);
+      if (entry?.value?.kind === "FETCH") {
+        const cachedResponse = __creekResponseFromCachedFetchData(entry.value.data, fetchUrl);
+        if (entry.cacheState === "stale") {
+          const revalidatePromise = __creekFetchAndStoreEdgeAppFetch(
+            originalFetch,
+            input,
+            init,
+            cache,
+            cacheKey,
+            cacheCtx,
+            revalidate,
+            fetchUrl,
+          ).catch(() => {});
+          try {
+            store?.ctx?.waitUntil?.(revalidatePromise);
+          } catch {}
+        }
+        return cachedResponse;
+      }
+    } catch {}
+
+    return await __creekFetchAndStoreEdgeAppFetch(
+      originalFetch,
+      input,
+      init,
+      cache,
+      cacheKey,
+      cacheCtx,
+      revalidate,
+      fetchUrl,
+    );
+  };
+
+  for (const key of ["__nextPatched", "__nextGetStaticStore", "_nextOriginalFetch"]) {
+    if (key in patchedFetch) {
+      try {
+        Object.defineProperty(shimFetch, key, {
+          value: patchedFetch[key],
+          configurable: true,
+        });
+      } catch {
+        try { shimFetch[key] = patchedFetch[key]; } catch {}
+      }
+    }
+  }
+  Object.defineProperty(shimFetch, "__creekEdgeAppFetchCacheShim", { value: true });
+  Object.defineProperty(shimFetch, "__creekWrappedFetch", { value: patchedFetch });
+  try { Object.defineProperty(shimFetch, "name", { value: "fetch", writable: false }); } catch {}
+  return shimFetch;
+}
+
+function __creekInstallEdgeAppFetchCacheShim() {
+  const currentFetch = globalThis.fetch;
+  const wrappedFetch = __creekWrapEdgeAppFetchCache(currentFetch);
+  const restore = () => {
+    delete globalThis.__CREEK_EDGE_APP_FETCH_CACHE_TRAP;
+    try {
+      Object.defineProperty(globalThis, "fetch", {
+        configurable: true,
+        writable: true,
+        value: __ourFetchWrapper,
+      });
+      globalThis[__NEXT_PATCH_SYMBOL] = false;
+    } catch {
+      try { globalThis.fetch = __ourFetchWrapper; } catch {}
+    }
+  };
+  if (wrappedFetch !== currentFetch) {
+    globalThis.fetch = wrappedFetch;
+    return restore;
+  }
+  if (globalThis.__CREEK_EDGE_APP_FETCH_CACHE_TRAP) return null;
+
+  let activeFetch = currentFetch;
+  const getter = function() {
+    return activeFetch;
+  };
+  try {
+    Object.defineProperty(getter, "__creekEdgeAppFetchCacheTrap", { value: true });
+  } catch {}
+  Object.defineProperty(globalThis, "fetch", {
+    configurable: true,
+    get: getter,
+    set(value) {
+      activeFetch = __creekWrapEdgeAppFetchCache(value);
+    },
+  });
+  globalThis.__CREEK_EDGE_APP_FETCH_CACHE_TRAP = true;
+  return restore;
 }
 
 // =====================================================================
@@ -4925,7 +5381,7 @@ async function __handleRequestInner(request, env, ctx) {
   // Reset patch state so Next.js will re-wrap fetch for this request.
   globalThis.fetch = __ourFetchWrapper;
   globalThis[__NEXT_PATCH_SYMBOL] = false;
-  const response = await __INTERNAL_FETCH_CONTEXT.run({ origin: new URL(request.url).origin, env, ctx, request }, async () => {
+  let response = await __INTERNAL_FETCH_CONTEXT.run({ origin: new URL(request.url).origin, env, ctx, request }, async () => {
     try {
       __initManifests();
       let url = new URL(request.url);
@@ -6952,17 +7408,11 @@ async function __handleRequestInner(request, env, ctx) {
       })();
       const isServingBracketShell =
         typeof servePath === "string" && servePath.includes("[") && !!staticEntry;
-      // ISR pages (initialRevalidate > 0) must NOT be served from static
-      // assets because the handler needs to manage the fresh → stale → SWR
-      // lifecycle via IncrementalCache. Serving from assets would freeze the
-      // build-time snapshot forever, skipping time-based revalidation.
-      // Concrete App PPR/cacheComponents prerenders are the exception: their
-      // static HTML is the deploy-time hard-navigation shell, and stale tags
-      // / on-demand revalidation below already bypass it when it is invalid.
-      // When a handler exists for an ISR page, we let it run so getStaticProps
-      // executes with the correct revalidateReason ('stale' after TTL expires,
-      // 'on-demand' after res.revalidate()). Fixes revalidate-reason "stale",
-      // trailingslash revalidation, and stale-cache-serving tests.
+      // ISR HTML needs the handler so Next observes the stale/on-demand
+      // lifecycle and can regenerate the page. App Router RSC/segment
+      // prefetches are different: static .rsc assets are the deploy-time
+      // navigation payload and stay valid until explicit tag/path
+      // invalidation below marks them stale.
       const isISRPage = staticEntry?.initialRevalidate != null && staticEntry.initialRevalidate > 0;
       const staticEntryHandlerPathname = (() => {
         if (resolvedPathname && HANDLERS[resolvedPathname]) return resolvedPathname;
@@ -7009,7 +7459,15 @@ async function __handleRequestInner(request, env, ctx) {
         __creekHasPostponedPrerenderForPathname(url.pathname, decodedPathname, servePath);
       const shouldResumeConcreteAppPPRPage =
         isConcreteAppPPRPage && staticEntry?.requiresDynamicPprResume === true;
-      const shouldBypassStaticForISR = isISRPage && hasHandler && !isConcreteAppPPRPage;
+      const shouldBypassStaticForISR =
+        isISRPage &&
+        hasHandler &&
+        !isConcreteAppPPRPage;
+      const shouldBypassStaticRscForISR =
+        isISRPage &&
+        hasHandler &&
+        staticEntry?.routerType !== "APP" &&
+        !isConcreteAppPPRPage;
       const targetHandlerType = hasHandler ? HANDLERS[resolvedPathname]?.type : undefined;
       const fallbackFalseCheckPathname = staticEntryFromConfigRewrite
         ? servePath
@@ -7136,7 +7594,7 @@ async function __handleRequestInner(request, env, ctx) {
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
         !nextDataAppRouterPath &&
-        !shouldBypassStaticForISR &&
+        !shouldBypassStaticRscForISR &&
         (!isConcreteAppPPRPage || isAppRouterPrefetchRequest) &&
         !isFallbackFalseMiss &&
         !staleByTag &&
@@ -7343,6 +7801,7 @@ async function __handleRequestInner(request, env, ctx) {
           if (assetRes.ok) {
             const headers = new Headers(assetRes.headers);
             headers.set("Content-Type", "text/html; charset=utf-8");
+            headers.delete("x-next-cache-tags");
             // Prerender entries for pages calling notFound() / redirect() /
             // permanentRedirect() carry initialStatus + initialHeaders. The
             // status determines whether we return 404/307/308 vs 200, and the
@@ -7380,6 +7839,7 @@ async function __handleRequestInner(request, env, ctx) {
                 else headers.set(key, val);
               });
             }
+            headers.delete("x-next-cache-tags");
             const body =
               request.method === "HEAD"
                 ? null
@@ -7877,13 +8337,27 @@ async function __handleRequestInner(request, env, ctx) {
       // IncrementalCache each request → every call is a cache miss.
       try {
         const __seedIC = __creekGetIncrementalCache();
-        if (__seedIC) {
-          globalThis.__incrementalCache = __seedIC;
-          globalThis.__incrementalCacheShared = true;
+      if (__seedIC) {
+        globalThis.__incrementalCache = __seedIC;
+        globalThis.__incrementalCacheShared = true;
+      }
+      } catch {}
+      try {
+        const store = __INTERNAL_FETCH_CONTEXT.getStore();
+        if (store) {
+          store.handlerRuntime = handler.runtime;
+          store.handlerType = handler.type;
         }
       } catch {}
 
       if (handler.runtime === "edge") {
+        const __restoreEdgeAppFetchCacheShim =
+          handler.type === "APP_PAGE"
+            ? __creekInstallEdgeAppFetchCacheShim()
+            : null;
+        const __cleanupEdgeAppFetchCacheShim = () => {
+          try { __restoreEdgeAppFetchCacheShim?.(); } catch {}
+        };
         // CF Workers IS edge — try _ENTRIES first, then fall through to Node.js.
         // (Per opennext research: edge runtime is redundant on CF Workers.)
         const edgeRouteParams = getNormalizedRouteParams(result, handler.pathname, url, request.headers);
@@ -8052,13 +8526,17 @@ async function __handleRequestInner(request, env, ctx) {
                 () => proxiedHandler(edgeRequest, edgeHandlerContext),
               );
               if (edgeResult instanceof Response) {
-                return __applyMwResponseHeaders(edgeResult);
+                const edgeResponse = __applyMwResponseHeaders(edgeResult);
+                __cleanupEdgeAppFetchCacheShim();
+                return edgeResponse;
               }
               if (edgeResult?.response instanceof Response) {
                 if (edgeResult.waitUntil) {
                   ctx.waitUntil(Promise.resolve(edgeResult.waitUntil).catch(() => {}));
                 }
-                return __applyMwResponseHeaders(edgeResult.response);
+                const edgeResponse = __applyMwResponseHeaders(edgeResult.response);
+                __cleanupEdgeAppFetchCacheShim();
+                return edgeResponse;
               }
             }
 
@@ -8071,18 +8549,23 @@ async function __handleRequestInner(request, env, ctx) {
                   () => fn(edgeRequest, edgeHandlerContext),
                 );
                 if (edgeResult instanceof Response) {
-                  return __applyMwResponseHeaders(edgeResult);
+                  const edgeResponse = __applyMwResponseHeaders(edgeResult);
+                  __cleanupEdgeAppFetchCacheShim();
+                  return edgeResponse;
                 }
                 if (edgeResult?.response instanceof Response) {
                   if (edgeResult.waitUntil) {
                     ctx.waitUntil(Promise.resolve(edgeResult.waitUntil).catch(() => {}));
                   }
-                  return __applyMwResponseHeaders(edgeResult.response);
+                  const edgeResponse = __applyMwResponseHeaders(edgeResult.response);
+                  __cleanupEdgeAppFetchCacheShim();
+                  return edgeResponse;
                 }
               }
             }
           } catch {}
         }
+        __cleanupEdgeAppFetchCacheShim();
         // Fall through to Node.js handler bridge
       }
 
@@ -8339,6 +8822,9 @@ async function __handleRequestInner(request, env, ctx) {
           if (isIsrHtml || isDataUrlJson) {
             const patched = new Headers(__invokedResponse.headers);
             patched.set("cache-control", "public, max-age=0, must-revalidate");
+            if (ct.includes("text/html")) {
+              patched.delete("x-next-cache-tags");
+            }
             __invokedResponse = new Response(__invokedResponse.body, {
               status: __invokedResponse.status,
               statusText: __invokedResponse.statusText,
@@ -8378,19 +8864,39 @@ async function __handleRequestInner(request, env, ctx) {
           handler?.type === "APP_PAGE" &&
           request.method !== "HEAD" &&
           (__invokedResponse.headers.get("content-type") || "").includes("text/html") &&
-          __invokedResponse.headers.get("x-nextjs-cache") === "PRERENDER"
+          (
+            __invokedResponse.headers.get("x-nextjs-cache") === "PRERENDER" ||
+            __invokedResponse.headers.get("x-nextjs-prerender") === "1" ||
+            __invokedResponse.headers.has("x-nextjs-stale-time")
+          )
         ) {
           const text = await __invokedResponse.clone().text();
-          const patchedText = __creekPatchVisibleHtmlFromFlight(text);
+          const patchedText = __creekPatchVisibleHtmlFromFlightStable(text);
           if (patchedText !== text) {
             const headers = new Headers(__invokedResponse.headers);
             headers.delete("content-length");
+            headers.delete("x-next-cache-tags");
             __invokedResponse = new Response(patchedText, {
               status: __invokedResponse.status,
               statusText: __invokedResponse.statusText,
               headers,
             });
           }
+        }
+      } catch {}
+      try {
+        if (
+          __invokedResponse &&
+          (__invokedResponse.headers.get("content-type") || "").includes("text/html") &&
+          __invokedResponse.headers.has("x-next-cache-tags")
+        ) {
+          const headers = new Headers(__invokedResponse.headers);
+          headers.delete("x-next-cache-tags");
+          __invokedResponse = new Response(__invokedResponse.body, {
+            status: __invokedResponse.status,
+            statusText: __invokedResponse.statusText,
+            headers,
+          });
         }
       } catch {}
       return __invokedResponse;
@@ -8402,6 +8908,44 @@ async function __handleRequestInner(request, env, ctx) {
       });
     }
   });
+  try {
+    if (
+      response &&
+      request.method !== "HEAD" &&
+      (response.headers.get("content-type") || "").includes("text/html") &&
+      (
+        response.headers.get("x-nextjs-cache") === "PRERENDER" ||
+        response.headers.get("x-nextjs-prerender") === "1" ||
+        response.headers.has("x-nextjs-stale-time")
+      )
+    ) {
+      const text = await response.clone().text();
+      const patchedText = __creekPatchVisibleHtmlFromFlightStable(text);
+      if (patchedText !== text) {
+        const headers = new Headers(response.headers);
+        headers.delete("content-length");
+        headers.delete("x-next-cache-tags");
+        response = new Response(patchedText, {
+          status: response.status,
+          statusText: response.statusText,
+          headers,
+        });
+      }
+    }
+    if (
+      response &&
+      (response.headers.get("content-type") || "").includes("text/html") &&
+      response.headers.has("x-next-cache-tags")
+    ) {
+      const headers = new Headers(response.headers);
+      headers.delete("x-next-cache-tags");
+      response = new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers,
+      });
+    }
+  } catch {}
   // Skew protection: the Pages Router client compares
   // \`x-nextjs-deployment-id\` on \`/_next/data/*\` responses against the
   // \`data-dpl-id\` it read from \`<html>\` on the initial page load; any
