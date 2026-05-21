@@ -4189,19 +4189,67 @@ async function __handleRequestInner(request, env, ctx) {
               ? "/"
               : "/" + rawSegment.replace(/\\/index$/, "");
           const lookup = candidate === "/" ? "/index" : candidate;
-          const handler = HANDLERS[lookup] || HANDLERS[candidate];
+          const dataRouteCandidates = [];
+          const addDataRouteCandidate = (pathname) => {
+            if (
+              typeof pathname === "string" &&
+              pathname.startsWith("/") &&
+              !dataRouteCandidates.includes(pathname)
+            ) {
+              dataRouteCandidates.push(pathname);
+            }
+          };
+          const addDataRouteLookupPair = (pathname) => {
+            addDataRouteCandidate(pathname);
+            addDataRouteCandidate(pathname === "/" ? "/index" : pathname);
+            if (pathname !== "/" && pathname.endsWith("/index")) {
+              addDataRouteCandidate(pathname.slice(0, -"/index".length) || "/");
+            }
+          };
+          const addDataRouteVariants = (pathname) => {
+            addDataRouteLookupPair(pathname);
+            let withoutBase = pathname;
+            if (BASE_PATH && (pathname === BASE_PATH || pathname.startsWith(BASE_PATH + "/"))) {
+              withoutBase = pathname.slice(BASE_PATH.length) || "/";
+              addDataRouteLookupPair(withoutBase);
+            }
+            if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+              for (const routePath of [pathname, withoutBase]) {
+                const firstSeg = routePath.split("/")[1] || "";
+                if (I18N.locales.includes(firstSeg)) {
+                  addDataRouteLookupPair(routePath.slice(firstSeg.length + 1) || "/");
+                }
+              }
+            }
+          };
+          addDataRouteVariants(candidate);
+          addDataRouteVariants(lookup);
+          let handler = null;
+          let handlerRoutePath = null;
+          for (const routeCandidate of dataRouteCandidates) {
+            const candidateHandler = HANDLERS[routeCandidate];
+            if (candidateHandler) {
+              handler = candidateHandler;
+              handlerRoutePath = routeCandidate;
+              break;
+            }
+          }
           if (handler && handler.type === "APP_PAGE") {
             const headers = new Headers();
             headers.set("content-type", "application/json");
-            headers.set("x-nextjs-matched-path", candidate);
+            headers.set("x-nextjs-matched-path", handler.pathname || handlerRoutePath || candidate);
             headers.set("cache-control", "private, no-cache, no-store, max-age=0, must-revalidate");
             return new Response("{}", { status: 200, headers });
           }
           nextDataAppRouterPath = candidate;
           if (handler && (handler.type === "PAGES" || handler.type === "PAGES_API")) {
-            staticPagesDataRoutePath = handler.pathname || lookup;
+            staticPagesDataRoutePath = handler.pathname || handlerRoutePath || lookup;
           } else {
-            const dyn = __matchDynamicRoute(candidate);
+            let dyn = null;
+            for (const routeCandidate of dataRouteCandidates) {
+              dyn = __matchDynamicRoute(routeCandidate);
+              if (dyn) break;
+            }
             const dynHandler = dyn ? HANDLERS[dyn.page] : null;
             if (dynHandler && dynHandler.type === "PAGES") {
               try {
@@ -4228,7 +4276,7 @@ async function __handleRequestInner(request, env, ctx) {
           // /new-home) follows up with a /new-home data fetch; without
           // this, the follow-up 404s and the navigation degrades to a
           // full reload (window.__SAME_PAGE → undefined).
-          const staticDataCandidates = [candidate, lookup];
+          const staticDataCandidates = [...dataRouteCandidates];
           if (BASE_PATH) {
             const withBasePath =
               candidate === "/"
@@ -4650,12 +4698,19 @@ async function __handleRequestInner(request, env, ctx) {
         // works — my earlier \`staticPagesDataRoutePath\` pre-rewrite
         // fought the same machinery.
         __routingUrl = new URL(request.url);
-        const dataPrefix = (BASE_PATH || "") + "/_next/data/" + BUILD_ID + "/";
+        const unbasedDataPrefix = "/_next/data/" + BUILD_ID + "/";
+        const basedDataPrefix = BASE_PATH ? BASE_PATH + unbasedDataPrefix : null;
+        const dataPrefixSource =
+          assetPath.startsWith(unbasedDataPrefix)
+            ? { pathname: assetPath, prefix: unbasedDataPrefix }
+            : basedDataPrefix && url.pathname.startsWith(basedDataPrefix)
+              ? { pathname: url.pathname, prefix: basedDataPrefix }
+              : null;
         if (
           !ROUTING.shouldNormalizeNextData &&
-          assetPath.startsWith(dataPrefix)
+          dataPrefixSource
         ) {
-          let pagePath = assetPath.slice(dataPrefix.length);
+          let pagePath = dataPrefixSource.pathname.slice(dataPrefixSource.prefix.length);
           if (pagePath.endsWith(".json")) pagePath = pagePath.slice(0, -5);
           let newPathname =
             (BASE_PATH || "") + (pagePath.startsWith("/") ? pagePath : "/" + pagePath);
