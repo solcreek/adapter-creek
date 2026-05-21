@@ -1187,6 +1187,44 @@ function __getPrefetchHints() {
 // like middleware-custom-matchers fail because middleware fires when it
 // shouldn't.
 let __middlewareMatchersCache = null;
+let __middlewareRoutingMatchersCache = null;
+function __getMiddlewareRoutingMatchers() {
+  if (__middlewareRoutingMatchersCache !== null) return __middlewareRoutingMatchersCache;
+  __middlewareRoutingMatchersCache = [];
+
+  const addMatcher = (m) => {
+    const sourceRegex = m?.regexp || m?.sourceRegex;
+    if (typeof sourceRegex !== "string" || sourceRegex.length === 0) return;
+    __middlewareRoutingMatchersCache.push({
+      sourceRegex,
+      has: m.has || null,
+      missing: m.missing || null,
+    });
+  };
+
+  try {
+    const fnManifest = __parseJsonManifest("functions-config-manifest.json", null);
+    const fnMw = fnManifest?.functions?.["/_middleware"];
+    if (fnMw && Array.isArray(fnMw.matchers)) {
+      for (const m of fnMw.matchers) addMatcher(m);
+    }
+
+    if (__middlewareRoutingMatchersCache.length === 0) {
+      const manifest = __parseJsonManifest("middleware-manifest.json", null);
+      const mw = manifest?.middleware?.["/"];
+      if (mw && Array.isArray(mw.matchers)) {
+        for (const m of mw.matchers) addMatcher(m);
+      }
+    }
+  } catch {}
+
+  if (__middlewareRoutingMatchersCache.length === 0 && HAS_MIDDLEWARE) {
+    __middlewareRoutingMatchersCache.push({ sourceRegex: "^.*$", has: null, missing: null });
+  }
+
+  return __middlewareRoutingMatchersCache;
+}
+
 function __getMiddlewareMatchers() {
   if (__middlewareMatchersCache !== null) return __middlewareMatchersCache;
   __middlewareMatchersCache = [];
@@ -1232,6 +1270,13 @@ function __getMiddlewareMatchers() {
       }
     }
   } catch {}
+  if (__middlewareMatchersCache.length === 0 && HAS_MIDDLEWARE) {
+    __middlewareMatchersCache.push({
+      regex: /^.*$/,
+      has: null,
+      missing: null,
+    });
+  }
   return __middlewareMatchersCache;
 }
 
@@ -4439,6 +4484,25 @@ async function __handleRequestInner(request, env, ctx) {
         __routingUrl,
         routingClone.headers,
       );
+      if (HAS_MIDDLEWARE) {
+        const __mwRoutingMatchers = __getMiddlewareRoutingMatchers();
+        if (
+          __mwRoutingMatchers.length > 0 &&
+          (!Array.isArray(__routingForRequest.middlewareMatchers) ||
+            __routingForRequest.middlewareMatchers.length === 0)
+        ) {
+          __routingForRequest = {
+            ...__routingForRequest,
+            middlewareMatchers: __mwRoutingMatchers,
+          };
+        }
+        if (!__routingForRequest.shouldNormalizeNextData) {
+          __routingForRequest = {
+            ...__routingForRequest,
+            shouldNormalizeNextData: true,
+          };
+        }
+      }
       // For Pages Router data URLs, filter out the trailingSlash:true
       // beforeMiddleware "add slash" rule. Real Next.js applies this
       // rule to the human-facing page path, but @next/routing uses the
