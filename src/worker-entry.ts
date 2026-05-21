@@ -1737,6 +1737,14 @@ function __creekManifestPathCandidates(pathname) {
   if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
     for (const candidate of [...candidates]) {
       const firstSeg = candidate.split("/")[1] || "";
+      if (I18N.locales.includes(firstSeg)) {
+        add(candidate.slice(firstSeg.length + 1) || "/");
+      }
+    }
+  }
+  if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+    for (const candidate of [...candidates]) {
+      const firstSeg = candidate.split("/")[1] || "";
       if (!I18N.locales.includes(firstSeg)) {
         for (const locale of I18N.locales) add("/" + locale + candidate);
       }
@@ -1763,10 +1771,49 @@ function __creekPrerenderDynamicRoute(routePage) {
   return null;
 }
 
+function __creekDynamicRoutePagesForPathname(pathname) {
+  const candidates = [];
+  const pages = [];
+  const addCandidate = (value) => {
+    if (typeof value !== "string" || !value.startsWith("/")) return;
+    for (const alias of __creekPathnameAliases(value)) {
+      if (!candidates.includes(alias)) candidates.push(alias);
+    }
+  };
+  addCandidate(pathname);
+  if (BASE_PATH && pathname.startsWith(BASE_PATH + "/")) {
+    addCandidate(pathname.slice(BASE_PATH.length) || "/");
+  } else if (BASE_PATH && pathname === BASE_PATH) {
+    addCandidate("/");
+  }
+  if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+    for (const candidate of [...candidates]) {
+      const firstSeg = candidate.split("/")[1] || "";
+      if (I18N.locales.includes(firstSeg)) {
+        addCandidate(candidate.slice(firstSeg.length + 1) || "/");
+      }
+    }
+  }
+  for (const candidate of candidates) {
+    const dyn = __matchDynamicRoute(candidate);
+    if (dyn?.page && !pages.includes(dyn.page)) pages.push(dyn.page);
+  }
+  return pages;
+}
+
 function __creekIsFallbackFalseMiss(routePage, pathname) {
   try {
-    const dynamicRoute = __creekPrerenderDynamicRoute(routePage);
-    if (!dynamicRoute || dynamicRoute.fallback !== false) return false;
+    const routePages = [];
+    const addRoutePage = (page) => {
+      if (typeof page === "string" && page && !routePages.includes(page)) routePages.push(page);
+    };
+    addRoutePage(routePage);
+    for (const page of __creekDynamicRoutePagesForPathname(pathname)) addRoutePage(page);
+    const fallbackFalsePage = routePages.find((page) => {
+      const dynamicRoute = __creekPrerenderDynamicRoute(page);
+      return dynamicRoute && dynamicRoute.fallback === false;
+    });
+    if (!fallbackFalsePage) return false;
     const prerenderedRoutes = __getPrerenderManifest()?.routes || {};
     return !__creekManifestPathCandidates(pathname).some((candidate) => prerenderedRoutes[candidate] != null);
   } catch {}
