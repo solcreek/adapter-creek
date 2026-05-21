@@ -1547,15 +1547,22 @@ function __queryObjectFromSearch(search) {
 function __resolveConfigRewriteDestination(url, headers) {
   if (!ROUTING) return null;
   const candidatePaths = [];
-  const addCandidate = (pathname) => {
+  const candidateLocaleHints = Object.create(null);
+  const addPathCandidate = (pathname, localeHint) => {
     if (typeof pathname !== "string" || !pathname.startsWith("/")) return;
     if (!candidatePaths.includes(pathname)) candidatePaths.push(pathname);
+    if (localeHint && !candidateLocaleHints[pathname]) candidateLocaleHints[pathname] = localeHint;
+  };
+  const addCandidate = (pathname) => {
+    if (typeof pathname !== "string" || !pathname.startsWith("/")) return;
+    addPathCandidate(pathname);
     if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
       const seg = pathname.split("/")[1] || "";
-      if (!I18N.locales.includes(seg)) {
-        const def = I18N.defaultLocale || I18N.locales[0];
-        const localized = "/" + def + pathname;
-        if (!candidatePaths.includes(localized)) candidatePaths.push(localized);
+      if (I18N.locales.includes(seg)) {
+        addPathCandidate(pathname.slice(seg.length + 1) || "/", seg);
+      } else {
+        const locale = I18N.defaultLocale || I18N.locales[0];
+        addPathCandidate("/" + locale + pathname, locale);
       }
     }
   };
@@ -1579,13 +1586,124 @@ function __resolveConfigRewriteDestination(url, headers) {
         if (rule.has && !__checkHasConditions(rule.has, url, headers)) continue;
         if (rule.missing && !__checkMissingConditions(rule.missing, url, headers)) continue;
         const dest = __substituteRouteDestination(rule.destination, match, rule.routeKeys, rule.source);
-        if (typeof dest !== "string" || /^https?:\\/\\//i.test(dest)) continue;
+        if (typeof dest !== "string") continue;
+        const destLower = dest.toLowerCase();
+        if (destLower.startsWith("http://") || destLower.startsWith("https://")) continue;
         const [destPath, destQuery = ""] = dest.split("?");
         if (!destPath || !destPath.startsWith("/")) continue;
+        const localeHint = candidateLocaleHints[candidatePath];
+        const finalDestPath = (() => {
+          if (!localeHint || !I18N || !Array.isArray(I18N.locales)) return destPath;
+          const destFirstSeg = destPath.split("/")[1] || "";
+          if (I18N.locales.includes(destFirstSeg)) return destPath;
+          return "/" + localeHint + (destPath === "/" ? "" : destPath);
+        })();
         return {
-          pathname: destPath,
+          pathname: finalDestPath,
           search: destQuery ? "?" + destQuery : "",
         };
+      }
+    }
+  }
+  return null;
+}
+
+function __creekSourceHasConcreteStaticOrPage(pathname) {
+  if (typeof pathname !== "string" || !pathname.startsWith("/")) return false;
+  const candidates = [pathname];
+  if (BASE_PATH && pathname.startsWith(BASE_PATH + "/")) {
+    candidates.push(pathname.slice(BASE_PATH.length) || "/");
+  } else if (BASE_PATH && pathname === BASE_PATH) {
+    candidates.push("/");
+  }
+  if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+    for (const candidate of [...candidates]) {
+      const firstSeg = candidate.split("/")[1] || "";
+      if (I18N.locales.includes(firstSeg)) {
+        const withoutLocale = candidate.slice(firstSeg.length + 1) || "/";
+        if (!candidates.includes(withoutLocale)) candidates.push(withoutLocale);
+      }
+    }
+  }
+  for (const candidate of candidates) {
+    if (HANDLERS[candidate] || STATIC_PAGES[candidate]) return true;
+    const dyn = __matchDynamicRoute(candidate);
+    if (dyn?.page && (HANDLERS[dyn.page] || STATIC_PAGES[dyn.page])) return true;
+  }
+  return false;
+}
+
+function __creekResolveStaticConfigRewrite(candidateSourcePaths, url, headers, includeAfterFiles) {
+  if (!ROUTING) return null;
+  const rewriteSourceCandidates = [];
+  const sourceLocaleHints = Object.create(null);
+  const addRewriteSourceCandidate = (pathname, localeHint) => {
+    if (typeof pathname !== "string" || !pathname.startsWith("/")) return;
+    if (!rewriteSourceCandidates.includes(pathname)) rewriteSourceCandidates.push(pathname);
+    if (localeHint && !sourceLocaleHints[pathname]) sourceLocaleHints[pathname] = localeHint;
+  };
+  const addSourceCandidate = (pathname) => {
+    if (typeof pathname !== "string" || !pathname.startsWith("/")) return;
+    addRewriteSourceCandidate(pathname);
+    if (BASE_PATH && pathname.startsWith(BASE_PATH + "/")) {
+      const withoutBase = pathname.slice(BASE_PATH.length) || "/";
+      addRewriteSourceCandidate(withoutBase);
+    } else if (BASE_PATH && pathname === BASE_PATH) {
+      addRewriteSourceCandidate("/");
+    }
+    if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+      const firstSeg = pathname.split("/")[1] || "";
+      if (I18N.locales.includes(firstSeg)) {
+        addRewriteSourceCandidate(pathname.slice(firstSeg.length + 1) || "/", firstSeg);
+      } else {
+        const locale = I18N.defaultLocale || I18N.locales[0];
+        addRewriteSourceCandidate("/" + locale + (pathname === "/" ? "" : pathname), locale);
+      }
+    }
+  };
+  for (const candidate of candidateSourcePaths || []) addSourceCandidate(candidate);
+
+  const rewriteLists = [ROUTING.beforeFiles || []];
+  if (includeAfterFiles) rewriteLists.push(ROUTING.afterFiles || []);
+  for (const list of rewriteLists) {
+    if (!Array.isArray(list)) continue;
+    for (const rule of list) {
+      const sourceRegex = rule?.sourceRegex || rule?.regex || rule?.namedRegex;
+      if (!sourceRegex || !rule?.destination) continue;
+      let re;
+      try { re = new RegExp(sourceRegex, "i"); } catch { continue; }
+      let m = null;
+      let matchedSourcePath = null;
+      for (const sourcePath of rewriteSourceCandidates) {
+        m = sourcePath.match(re);
+        if (m) {
+          matchedSourcePath = sourcePath;
+          break;
+        }
+      }
+      if (!m) continue;
+      if (rule.has && !__checkHasConditions(rule.has, url, headers)) continue;
+      if (rule.missing && !__checkMissingConditions(rule.missing, url, headers)) continue;
+      const dest = __substituteRouteDestination(rule.destination, m, rule.routeKeys, rule.source);
+      if (typeof dest !== "string") continue;
+      const destLower = dest.toLowerCase();
+      if (destLower.startsWith("http://") || destLower.startsWith("https://")) continue;
+      const destPath = dest.split("?")[0];
+      if (!destPath || !destPath.startsWith("/")) continue;
+      const destCandidates = [destPath];
+      if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+        const destFirstSeg = destPath.split("/")[1] || "";
+        if (!I18N.locales.includes(destFirstSeg)) {
+          const sourceFirstSeg = (matchedSourcePath || "").split("/")[1] || "";
+          const locale = sourceLocaleHints[matchedSourcePath] || (I18N.locales.includes(sourceFirstSeg)
+            ? sourceFirstSeg
+            : (I18N.defaultLocale || I18N.locales[0]));
+          destCandidates.push("/" + locale + (destPath === "/" ? "" : destPath));
+        }
+      }
+      for (const candidatePath of destCandidates) {
+        const entry = STATIC_PAGES[candidatePath];
+        if (entry) return { pathname: candidatePath, entry };
       }
     }
   }
@@ -5356,6 +5474,7 @@ async function __handleRequestInner(request, env, ctx) {
         routes: __routingForRequest,
         invokeMiddleware: wrappedMiddlewareHandler,
       });
+      let resolvedViaConfigRewrite = false;
       if (mwModifiedRequestHeaders) {
         result = { ...result, mwRequestHeaders: mwModifiedRequestHeaders };
       }
@@ -5469,6 +5588,7 @@ async function __handleRequestInner(request, env, ctx) {
             }
           }
           if (matchedPathname) {
+            resolvedViaConfigRewrite = true;
             result = {
               ...result,
               resolvedPathname: matchedPathname,
@@ -6306,6 +6426,9 @@ async function __handleRequestInner(request, env, ctx) {
             }
           }
         }
+        if (resolvedViaConfigRewrite && staticEntry) {
+          staticEntryFromConfigRewrite = true;
+        }
         // Pages Router root-index alias: resolveRoutes turns \`/\` into
         // \`/index\` (HANDLERS key is \`/index\`) but the prerender entry is
         // under the literal \`/\`. Without this, POST \`/\` (and any other
@@ -6327,10 +6450,18 @@ async function __handleRequestInner(request, env, ctx) {
         // Fixes prerender.test.ts "should allow rewriting to SSG page
         // with fallback: false" (\`/about\` → \`/lang/en/about\`) and the
         // blocking-fallback variant.
-        if (!staticEntry && ROUTING) {
+        const staticEntryIsSyntheticNotFound =
+          !!staticEntry &&
+          (servePath === "/404" || servePath === "/_error") &&
+          url.pathname !== "/404" &&
+          url.pathname !== "/_error";
+        if ((!staticEntry || staticEntryIsSyntheticNotFound) && ROUTING) {
+          let foundStaticConfigRewrite = false;
           const canApplyAfterFilesRewrite = (() => {
+            const sourcePathname = assetPath || url.pathname;
+            if (!__creekSourceHasConcreteStaticOrPage(sourcePathname)) return true;
             if (!HANDLERS[servePath]) return true;
-            let matchPathname = assetPath || url.pathname;
+            let matchPathname = sourcePathname;
             if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
               const firstSeg = matchPathname.split("/")[1] || "";
               if (I18N.locales.includes(firstSeg)) {
@@ -6389,12 +6520,39 @@ async function __handleRequestInner(request, env, ctx) {
                 servePath = candidatePath;
                 staticEntry = STATIC_PAGES[candidatePath];
                 staticEntryFromConfigRewrite = true;
+                foundStaticConfigRewrite = true;
                 break;
               }
-              if (staticEntry) break;
+              if (foundStaticConfigRewrite) break;
             }
-            if (staticEntry) break;
+            if (foundStaticConfigRewrite) break;
           }
+        }
+      }
+      if (resolvedIsBracketShell && !staticEntry && ROUTING) {
+        const canApplyAfterFilesRewrite = (() => {
+          const sourcePathname = assetPath || url.pathname;
+          if (!__creekSourceHasConcreteStaticOrPage(sourcePathname)) return true;
+          let matchPathname = sourcePathname;
+          if (I18N && Array.isArray(I18N.locales) && I18N.locales.length > 0) {
+            const firstSeg = matchPathname.split("/")[1] || "";
+            if (I18N.locales.includes(firstSeg)) {
+              matchPathname = matchPathname.slice(firstSeg.length + 1) || "/";
+            }
+          }
+          const dyn = __matchDynamicRoute(matchPathname);
+          return !!dyn && dyn.page === servePath;
+        })();
+        const rewrittenStatic = __creekResolveStaticConfigRewrite(
+          [servePath, url.pathname],
+          url,
+          request.headers,
+          canApplyAfterFilesRewrite
+        );
+        if (rewrittenStatic) {
+          servePath = rewrittenStatic.pathname;
+          staticEntry = rewrittenStatic.entry;
+          staticEntryFromConfigRewrite = true;
         }
       }
       if (
@@ -6480,6 +6638,9 @@ async function __handleRequestInner(request, env, ctx) {
       const isAppRouterRSCRequest =
         request.headers.has("rsc") ||
         request.headers.has("next-router-state-tree");
+      const isAppRouterPrefetchRequest =
+        request.headers.get("next-router-prefetch") === "1" ||
+        request.headers.has("next-router-segment-prefetch");
       // When routing rewrote the URL, skip the prerendered-HTML serve so
       // the handler is invoked dynamically. The prerendered HTML has the
       // REWRITE TARGET's pathname baked in (via \`usePathname\` / metadata),
@@ -6514,6 +6675,8 @@ async function __handleRequestInner(request, env, ctx) {
         }
         return true;
       })();
+      const hasMiddlewareRewrite =
+        typeof result?.mwRewrite === "string" && result.mwRewrite.length > 0;
       // Only skip the prerendered-HTML serve for rewrites when we have
       // a HANDLER we can invoke dynamically. For Pages Router auto-
       // optimized / purely static App Router pages, there's no handler
@@ -6612,6 +6775,8 @@ async function __handleRequestInner(request, env, ctx) {
         resolvedPathname = staticEntryHandlerPathname;
       }
       const hasHandler = resolvedPathname && HANDLERS[resolvedPathname];
+      const canServeStaticConfigRewriteTarget =
+        staticEntryFromConfigRewrite && staticEntry?.routerType === "PAGES";
       const isAppRouterBracketShell =
         staticEntry?.routerType === "APP" && isServingBracketShell && !!hasHandler;
       const isConcreteAppPPRPage =
@@ -6620,15 +6785,21 @@ async function __handleRequestInner(request, env, ctx) {
         !isServingBracketShell &&
         __creekHasPostponedPrerenderForPathname(url.pathname, decodedPathname, servePath);
       const shouldBypassStaticForISR = isISRPage && hasHandler && !isConcreteAppPPRPage;
+      const targetHandlerType = hasHandler ? HANDLERS[resolvedPathname]?.type : undefined;
+      const fallbackFalseCheckPathname = staticEntryFromConfigRewrite
+        ? servePath
+        : url.pathname;
+      const isFallbackFalseMiss =
+        !!hasHandler && __creekIsFallbackFalseMiss(resolvedPathname, fallbackFalseCheckPathname);
       if (
         hasHandler &&
-        HANDLERS[resolvedPathname]?.type === "PAGES" &&
+        (targetHandlerType === "PAGES" || targetHandlerType === "APP_PAGE") &&
         (request.method === "GET" || request.method === "HEAD") &&
         !request.headers.has("next-action") &&
         !isAppRouterRSCRequest &&
         !nextDataAppRouterPath &&
         !staticEntryFromConfigRewrite &&
-        __creekIsFallbackFalseMiss(resolvedPathname, url.pathname)
+        isFallbackFalseMiss
       ) {
         return await __creekStaticNotFoundResponse(env, url, result, request.method);
       }
@@ -6682,9 +6853,12 @@ async function __handleRequestInner(request, env, ctx) {
         !isDraftModeRequest &&
         !(isCrawlerRequest && isServingBracketShell) &&
         !isAppRouterBracketShell &&
-        (!isRewritten || !hasHandlerForTarget) &&
+        !isConcreteAppPPRPage &&
+        (!hasMiddlewareRewrite || !hasHandlerForTarget || canServeStaticConfigRewriteTarget) &&
+        (!isRewritten || !hasHandlerForTarget || canServeStaticConfigRewriteTarget) &&
         // ISR pages bypass static assets when a handler exists.
         !shouldBypassStaticForISR &&
+        !isFallbackFalseMiss &&
         // A previous revalidateTag/updateTag marked one of this page's
         // tags stale — fall through to handler so the fresh render runs.
         !staleByTag &&
@@ -6732,9 +6906,12 @@ async function __handleRequestInner(request, env, ctx) {
         !request.headers.has("next-action") &&
         !nextDataAppRouterPath &&
         !shouldBypassStaticForISR &&
+        (!isConcreteAppPPRPage || isAppRouterPrefetchRequest) &&
+        !isFallbackFalseMiss &&
         !staleByTag &&
         !staleByOnDemand &&
-        (!isRewritten || !hasHandlerForTarget)
+        (!hasMiddlewareRewrite || !hasHandlerForTarget || canServeStaticConfigRewriteTarget) &&
+        (!isRewritten || !hasHandlerForTarget || canServeStaticConfigRewriteTarget)
       ) {
         try {
           // For nested paths (\`/foo/index.html\`) the RSC sibling is
@@ -6940,7 +7117,7 @@ async function __handleRequestInner(request, env, ctx) {
             // status determines whether we return 404/307/308 vs 200, and the
             // headers carry the redirect Location.
             const prerenderStatus = staticEntry.status;
-            const finalStatus = prerenderStatus ?? result.status ?? 200;
+            const finalStatus = prerenderStatus ?? (staticEntryFromConfigRewrite ? 200 : result.status) ?? 200;
             if (staticEntry.headers) {
               for (const [k, v] of Object.entries(staticEntry.headers)) {
                 if (Array.isArray(v)) {
@@ -9538,8 +9715,9 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
     // those Pages Router wants the ORIGINAL URL on req.url (so
     // \`appProps.url\` / \`asPath\` / \`resolvedUrl\` all line up with
     // what the client saw) and it'll re-run the rewrite itself.
-    const isMiddlewareRewrite = isRewrite && !!routeResult?.mwRewrite;
-    if (isRewrite && isAppRouterHandler) {
+    const isMiddlewareRewrite =
+      typeof routeResult?.mwRewrite === "string" && routeResult.mwRewrite.length > 0;
+    if ((isRewrite || isMiddlewareRewrite) && isAppRouterHandler) {
       // App Router rewrite: keep the ORIGINAL pathname (for
       // \`usePathname()\` canonical) but MERGE the nxtP-prefixed route
       // param captures into the query string. Next.js's internal
@@ -9575,6 +9753,20 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
       // Fixes app/index "should have the correct search params on
       // middleware rewrite" (client + server variants).
       if (isMiddlewareRewrite) {
+        try {
+          const rewriteUrl = routeResult.mwRewrite.startsWith("/")
+            ? new URL(routeResult.mwRewrite, url.origin)
+            : new URL(routeResult.mwRewrite);
+          for (const key of new Set(Array.from(rewriteUrl.searchParams.keys()))) {
+            existing.delete(key);
+            const values = rewriteUrl.searchParams.getAll(key);
+            if (values.length === 0) {
+              existing.set(key, "");
+            } else {
+              for (const value of values) existing.append(key, value);
+            }
+          }
+        } catch {}
         for (const [key, value] of Object.entries(rawQueryForUrl)) {
           if (key === "nextLocale") continue;
           if (/^[0-9]+$/.test(key)) continue;
