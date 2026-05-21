@@ -4296,6 +4296,8 @@ async function __handleRequestInner(request, env, ctx) {
       // by checking BASE_PATH-aware url.pathname later.
       let staticPagesDataRoutePath = null;
       let pagesFallbackDataRoutePath = null;
+      let rootIndexStaticDataRoutePath = null;
+      let rootIndexStaticDataAssetCandidates = null;
       if (assetPath.startsWith("/_next/data/")) {
         const dataMatch = assetPath.match(/^\\/_next\\/data\\/([^/]+)\\/(.+)\\.json$/);
         if (dataMatch && dataMatch[1] === BUILD_ID) {
@@ -4414,11 +4416,30 @@ async function __handleRequestInner(request, env, ctx) {
             staticDataCandidates.push(withBasePath, lookupWithBasePath);
           }
           const staticDataEntry = staticDataCandidates.find((p) => STATIC_PAGES[p]);
-          if (
+          const isStaticPagesDataRoute =
             staticDataEntry &&
             !handler &&
             !staticPagesDataRoutePath &&
-            !pagesFallbackDataRoutePath &&
+            !pagesFallbackDataRoutePath;
+          if (isStaticPagesDataRoute && candidate === "/") {
+            rootIndexStaticDataRoutePath = "/";
+            const dataAssetCandidates = [];
+            const addDataAssetCandidate = (pathname) => {
+              if (
+                typeof pathname === "string" &&
+                pathname.startsWith("/") &&
+                !dataAssetCandidates.includes(pathname)
+              ) {
+                dataAssetCandidates.push(pathname);
+              }
+            };
+            addDataAssetCandidate(url.pathname);
+            addDataAssetCandidate(assetPath);
+            if (BASE_PATH) addDataAssetCandidate(BASE_PATH + assetPath);
+            rootIndexStaticDataAssetCandidates = dataAssetCandidates;
+          }
+          if (
+            isStaticPagesDataRoute &&
             !(HAS_MIDDLEWARE && __shouldRunMiddleware(url, request.headers))
           ) {
             const dataAssetCandidates = [];
@@ -5538,9 +5559,11 @@ async function __handleRequestInner(request, env, ctx) {
         if (result.mwRewrite) {
           mwPrefetchHeaders.set("x-nextjs-rewrite", result.mwRewrite);
         }
-        const matchedPath = __normalizeNextDataMatchedPath(
-          result.resolvedPathname || result.invocationTarget?.pathname
-        );
+        const matchedPath =
+          (!result.mwRewrite && !result.mwRedirect && rootIndexStaticDataRoutePath) ||
+          __normalizeNextDataMatchedPath(
+            result.resolvedPathname || result.invocationTarget?.pathname
+          );
         if (matchedPath) {
           mwPrefetchHeaders.set("x-nextjs-matched-path", matchedPath);
         }
@@ -5550,6 +5573,68 @@ async function __handleRequestInner(request, env, ctx) {
           });
         }
         return new Response("{}", { status: 200, headers: mwPrefetchHeaders });
+      }
+
+      // With basePath + middleware, @next/routing can normalize
+      // /docs/_next/data/<build>/index.json back to /docs and then let a
+      // catch-all Pages route win. The browser sees
+      // x-nextjs-matched-path: /[...path] for the root data probe and
+      // hydrates /docs as the catch-all page instead of the index page.
+      // Middleware has already run at this point, so preserve its headers
+      // but answer the root static data URL as Pages Router expects.
+      if (
+        rootIndexStaticDataRoutePath &&
+        nextDataAppRouterPath === "/" &&
+        !result.mwRewrite &&
+        !result.mwRedirect
+      ) {
+        const mergeResolvedHeaders = (headers) => {
+          if (result.resolvedHeaders) {
+            result.resolvedHeaders.forEach((val, key) => {
+              if (key.toLowerCase() === "set-cookie") {
+                headers.append(key, val);
+              } else if (!headers.has(key)) {
+                headers.set(key, val);
+              }
+            });
+          }
+        };
+        if (Array.isArray(rootIndexStaticDataAssetCandidates)) {
+          for (const dataAssetPath of rootIndexStaticDataAssetCandidates) {
+            try {
+              const dataAssetRes = await env.ASSETS.fetch(
+                new Request(new URL(dataAssetPath, url.origin), { headers: request.headers })
+              );
+              if (dataAssetRes.status === 304) return dataAssetRes;
+              if (dataAssetRes.ok) {
+                const headers = new Headers(dataAssetRes.headers);
+                headers.set("content-type", headers.get("content-type") || "application/json; charset=utf-8");
+                headers.set("x-nextjs-matched-path", rootIndexStaticDataRoutePath);
+                headers.set("x-nextjs-cache", "HIT");
+                headers.set("cache-control", "public, max-age=0, must-revalidate");
+                mergeResolvedHeaders(headers);
+                return new Response(
+                  request.method === "HEAD" ? null : dataAssetRes.body,
+                  {
+                    status: dataAssetRes.status,
+                    statusText: dataAssetRes.statusText,
+                    headers,
+                  },
+                );
+              }
+            } catch {}
+          }
+        }
+        const headers = new Headers();
+        headers.set("content-type", "application/json; charset=utf-8");
+        headers.set("x-nextjs-matched-path", rootIndexStaticDataRoutePath);
+        headers.set("cache-control", "public, max-age=0, must-revalidate");
+        headers.set("x-nextjs-cache", "HIT");
+        mergeResolvedHeaders(headers);
+        return new Response(
+          request.method === "HEAD" ? null : JSON.stringify({ pageProps: {} }),
+          { status: 200, headers },
+        );
       }
 
       {
