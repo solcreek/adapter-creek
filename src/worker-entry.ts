@@ -3231,9 +3231,17 @@ function __creekWrapAppPageFetchCache(patchedFetch) {
   const shimFetch = async function fetch(input, init) {
     let store = null;
     try { store = __INTERNAL_FETCH_CONTEXT.getStore(); } catch {}
+    const method = String(
+      init?.method ||
+      (input && typeof input === "object" ? input.method : "") ||
+      "GET",
+    ).toUpperCase();
     const isShimmedAppPage =
       store?.handlerType === "APP_PAGE" &&
-      (store?.handlerRuntime === "edge" || store?.handlerRuntime === "nodejs");
+      (
+        store?.handlerRuntime === "edge" ||
+        (store?.handlerRuntime === "nodejs" && method !== "GET" && method !== "HEAD")
+      );
     const nextConfig = init?.next || (input && typeof input === "object" ? input.next : undefined);
     const revalidate = nextConfig?.revalidate;
     if (
@@ -3325,19 +3333,26 @@ function __creekWrapAppPageFetchCache(patchedFetch) {
 }
 
 function __creekInstallAppPageFetchCacheShim() {
+  const previousFetchDescriptor = Object.getOwnPropertyDescriptor(globalThis, "fetch");
+  const previousPatchState = globalThis[__NEXT_PATCH_SYMBOL];
   const currentFetch = globalThis.fetch;
   const wrappedFetch = __creekWrapAppPageFetchCache(currentFetch);
   const restore = () => {
     delete globalThis.__CREEK_APP_PAGE_FETCH_CACHE_TRAP;
     try {
-      Object.defineProperty(globalThis, "fetch", {
-        configurable: true,
-        writable: true,
-        value: __ourFetchWrapper,
-      });
-      globalThis[__NEXT_PATCH_SYMBOL] = false;
+      if (previousFetchDescriptor) {
+        Object.defineProperty(globalThis, "fetch", previousFetchDescriptor);
+      } else {
+        delete globalThis.fetch;
+      }
+      globalThis[__NEXT_PATCH_SYMBOL] = previousPatchState;
     } catch {
-      try { globalThis.fetch = __ourFetchWrapper; } catch {}
+      try {
+        globalThis.fetch = previousFetchDescriptor && "value" in previousFetchDescriptor
+          ? previousFetchDescriptor.value
+          : __ourFetchWrapper;
+        globalThis[__NEXT_PATCH_SYMBOL] = previousPatchState;
+      } catch {}
     }
   };
   if (wrappedFetch !== currentFetch) {
@@ -3362,6 +3377,20 @@ function __creekInstallAppPageFetchCacheShim() {
   });
   globalThis.__CREEK_APP_PAGE_FETCH_CACHE_TRAP = true;
   return restore;
+}
+
+function __creekShouldInstallNodeAppPageFetchCacheShim(handlerPathname, request) {
+  const requestMethod = String(request?.method || "").toUpperCase();
+  if (requestMethod !== "GET" && requestMethod !== "HEAD") return false;
+  // The node shim is only needed for dynamic page renders that perform
+  // cached non-GET fetches. Installing it on action POSTs or seeded
+  // static/PPR/ISR pages changes Next's RSC/RDC revalidation behavior.
+  let pathname = "";
+  try { pathname = new URL(request.url).pathname; } catch {}
+  for (const candidate of [pathname, handlerPathname]) {
+    if (candidate && __creekPrerenderEntryForPathname(candidate)) return false;
+  }
+  return true;
 }
 
 // =====================================================================
@@ -11348,7 +11377,10 @@ async function invokeNodeHandler(request, mod, ctx, routeResult, handlerPathname
   }, 30000);
 
   try {
-    if (handlerType === "APP_PAGE") {
+    if (
+      handlerType === "APP_PAGE" &&
+      __creekShouldInstallNodeAppPageFetchCacheShim(handlerPathname, request)
+    ) {
       __restoreAppPageFetchCacheShim = __creekInstallAppPageFetchCacheShim();
     }
     // Do NOT set \`query\` here. Next.js's RouteModule.prepare() falls back to
