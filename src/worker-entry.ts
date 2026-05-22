@@ -3175,9 +3175,6 @@ function __creekOriginalFetchArgs(input, init) {
     }
     delete fetchInit.next;
     delete fetchInit.cache;
-    try {
-      return [new Request(input, fetchInit), undefined];
-    } catch {}
     return [input, fetchInit];
   }
   return [input, init];
