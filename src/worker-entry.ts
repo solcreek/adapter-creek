@@ -2842,6 +2842,10 @@ function __creekValueWithCacheTags(value, tags) {
 function __creekScopedCacheKey(key, ctx, value) {
   const isFetchEntry = ctx?.kind === "FETCH" || value?.kind === "FETCH";
   if (!isFetchEntry) return key;
+  const ctxRuntime = ctx?.runtime;
+  if (ctxRuntime === "edge" || ctxRuntime === "nodejs") {
+    return "__fetch:" + ctxRuntime + ":" + key;
+  }
   try {
     const runtime = __INTERNAL_FETCH_CONTEXT.getStore()?.handlerRuntime;
     if (runtime === "edge" || runtime === "nodejs") {
@@ -3277,9 +3281,11 @@ function __creekWrapAppPageFetchCache(patchedFetch) {
     if (!cacheKey) return patchedFetch(input, init);
 
     const tags = Array.isArray(nextConfig?.tags) ? nextConfig.tags : [];
+    const cacheRuntime = store?.handlerRuntime === "edge" ? "edge" : "nodejs";
     const cache = new CreekCacheHandler();
     const cacheCtx = {
       kind: "FETCH",
+      runtime: cacheRuntime,
       revalidate,
       fetchUrl,
       tags,
@@ -8380,7 +8386,7 @@ async function __handleRequestInner(request, env, ctx) {
       try {
         const store = __INTERNAL_FETCH_CONTEXT.getStore();
         if (store) {
-          store.handlerRuntime = handler.runtime;
+          store.handlerRuntime = handler.runtime === "edge" ? "edge" : "nodejs";
           store.handlerType = handler.type;
         }
       } catch {}
