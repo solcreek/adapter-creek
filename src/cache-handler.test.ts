@@ -1,16 +1,16 @@
 import { describe, expect, it } from "vitest";
 
 import CacheHandler from "./cache-handler.js";
-import CoreCacheHandler from "@solcreek/adapter-core/cache-handler";
+import CoreCacheHandler from "@solcreek/adapter-next-core/cache-handler";
 
 // Smoke test: the cache-handler subpath export on @solcreek/adapter-creek
-// must resolve to the same class @solcreek/adapter-core ships. The full
-// behavioural test suite for CacheHandler lives in adapter-core; here we
+// must resolve to the same class @solcreek/adapter-next-core ships. The
+// full behavioural test suite for CacheHandler lives there; here we
 // only verify the re-export is intact so legacy
 //   cacheHandler: require.resolve("@solcreek/adapter-creek/cache-handler")
 // users keep working.
 describe("cache-handler re-export", () => {
-  it("is the same class as @solcreek/adapter-core/cache-handler", () => {
+  it("is the same class as @solcreek/adapter-next-core/cache-handler", () => {
     expect(CacheHandler).toBe(CoreCacheHandler);
   });
 
