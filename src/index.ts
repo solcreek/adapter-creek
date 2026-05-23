@@ -2,21 +2,21 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { copyFileSync, existsSync } from "node:fs";
 import type { NextAdapter } from "next";
-import { applyBaseModifyConfig } from "@solcreek/adapter-core";
+import { applyBaseModifyConfig } from "@solcreek/adapter-next-core";
 import { handleBuild } from "./build.js";
 
-// Dev-fallback path to the cache handler shipped by @solcreek/adapter-core.
+// Dev-fallback path to the cache handler shipped by @solcreek/adapter-next-core.
 // applyBaseModifyConfig prefers the node_modules-installed copy when one
 // exists (the production path); this resolves the package's own bundled
 // copy as a last resort for the rare case where the adapter is used
 // without `npm install`ing it.
 const coreEntryUrl = new URL(
-  "../node_modules/@solcreek/adapter-core/dist/cache-handler.js",
+  "../node_modules/@solcreek/adapter-next-core/dist/cache-handler.js",
   import.meta.url,
 );
 const fallbackCacheHandlerPath = existsSync(fileURLToPath(coreEntryUrl))
   ? fileURLToPath(coreEntryUrl)
-  : path.join(process.cwd(), "node_modules", "@solcreek", "adapter-core", "dist", "cache-handler.js");
+  : path.join(process.cwd(), "node_modules", "@solcreek", "adapter-next-core", "dist", "cache-handler.js");
 
 function mirrorCacheHandlerIntoProject(cacheHandlerPath: string): string {
   if (!existsSync(cacheHandlerPath)) return cacheHandlerPath;

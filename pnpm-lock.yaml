@@ -14,6 +14,9 @@ importers:
       '@solcreek/adapter-core':
         specifier: ^0.2.0
         version: 0.2.0(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))
+      '@solcreek/adapter-next-core':
+        specifier: ^0.1.0
+        version: 0.1.0(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))
       sql.js:
         specifier: ^1.14.1
         version: 1.14.1
@@ -696,6 +699,14 @@ packages:
     resolution: {integrity: sha512-dWkiZRAPj+Ji/aCI6cTKY4LJcMRRGkacQ0Bn0B/yNbeVB+mAfg+LUYrvuzArgPAMPugDPBilGsIoLrxbqV3B+A==}
     peerDependencies:
       next: '>=16.2.3'
+
+  '@solcreek/adapter-next-core@0.1.0':
+    resolution: {integrity: sha512-ioZGI5/k4BqY975CHV0TpMXu4VyBfTPWX2LAH9UdeVdxKmXAuRL2ulPD6GXu3oDoMK2I2ig3RJU5twfJM0xxWA==}
+    peerDependencies:
+      next: '>=15'
+    peerDependenciesMeta:
+      next:
+        optional: true
 
   '@speed-highlight/core@1.2.15':
     resolution: {integrity: sha512-BMq1K3DsElxDWawkX6eLg9+CKJrTVGCBAWVuHXVUV2u0s2711qiChLSId6ikYPfxhdYocLNt3wWwSvDiTvFabw==}
@@ -1576,6 +1587,12 @@ snapshots:
 
   '@solcreek/adapter-core@0.2.0(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))':
     dependencies:
+      next: 16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
+
+  '@solcreek/adapter-next-core@0.1.0(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))':
+    dependencies:
+      '@solcreek/adapter-core': 0.2.0(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))
+    optionalDependencies:
       next: 16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
 
   '@speed-highlight/core@1.2.15': {}
