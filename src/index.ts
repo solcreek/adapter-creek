@@ -53,13 +53,14 @@ const adapter: NextAdapter = {
     // for other phases, so guarding here matches its behaviour.
     if (ctx.phase !== "phase-production-build") return baseConfig;
 
-    const resolvedBaseCacheHandlerPath =
-      typeof baseConfig.cacheHandler === "string"
-        ? baseConfig.cacheHandler
-        : fallbackCacheHandlerPath;
-    const cacheHandlerPath = mirrorCacheHandlerIntoProject(
-      resolvedBaseCacheHandlerPath,
-    );
+    // Keep the mirrored handler anchored to this adapter's dependency tree,
+    // not the consumer project's shared @solcreek/adapter-next-core copy.
+    // For Workers the project-local .solcreek-cache-handler.mjs path is a
+    // bundler sentinel: dynamic imports of that path are redirected to the
+    // inline CreekCacheHandler in worker-entry. If we mirror an arbitrary
+    // project copy here, Node App Page fetch-cache paths can bypass the
+    // Workers-specific runtime cache implementation.
+    const cacheHandlerPath = mirrorCacheHandlerIntoProject(fallbackCacheHandlerPath);
 
     return {
       ...baseConfig,
