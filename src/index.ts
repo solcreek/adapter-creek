@@ -53,12 +53,13 @@ const adapter: NextAdapter = {
     // for other phases, so guarding here matches its behaviour.
     if (ctx.phase !== "phase-production-build") return baseConfig;
 
-    // Keep the mirrored handler anchored to adapter-next-core. adapter-next-core
-    // 0.1.0 still resolves the historical adapter-core/cache-handler path in
-    // its base config; copying that deprecated package here reintroduces a
-    // split-era mismatch between the Next config handler and the worker-inline
-    // CreekCacheHandler.
-    const cacheHandlerPath = mirrorCacheHandlerIntoProject(fallbackCacheHandlerPath);
+    const resolvedBaseCacheHandlerPath =
+      typeof baseConfig.cacheHandler === "string"
+        ? baseConfig.cacheHandler
+        : fallbackCacheHandlerPath;
+    const cacheHandlerPath = mirrorCacheHandlerIntoProject(
+      resolvedBaseCacheHandlerPath,
+    );
 
     return {
       ...baseConfig,
