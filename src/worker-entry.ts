@@ -3173,12 +3173,18 @@ function __creekOriginalFetchArgs(input, init) {
   }
   if (init && typeof init === "object") {
     const fetchInit = { ...init };
+    const hasOriginalBody = "_ogBody" in fetchInit;
     if ("_ogBody" in fetchInit) {
       fetchInit.body = fetchInit._ogBody;
       delete fetchInit._ogBody;
     }
     delete fetchInit.next;
     delete fetchInit.cache;
+    if (hasOriginalBody && fetchInit.body !== undefined && fetchInit.body !== null) {
+      try {
+        return [new Request(input, fetchInit), undefined];
+      } catch {}
+    }
     return [input, fetchInit];
   }
   return [input, init];
