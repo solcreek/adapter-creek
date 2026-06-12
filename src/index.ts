@@ -1,22 +1,29 @@
 import * as path from "node:path";
-import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { copyFileSync, existsSync } from "node:fs";
 import type { NextAdapter } from "next";
 import { applyBaseModifyConfig } from "@solcreek/adapter-next-core";
 import { handleBuild } from "./build.js";
 
-// Dev-fallback path to the cache handler shipped by @solcreek/adapter-next-core.
-// applyBaseModifyConfig prefers the node_modules-installed copy when one
-// exists (the production path); this resolves the package's own bundled
-// copy as a last resort for the rare case where the adapter is used
-// without `npm install`ing it.
-const coreEntryUrl = new URL(
-  "../node_modules/@solcreek/adapter-next-core/dist/cache-handler.js",
-  import.meta.url,
-);
-const fallbackCacheHandlerPath = existsSync(fileURLToPath(coreEntryUrl))
-  ? fileURLToPath(coreEntryUrl)
-  : path.join(process.cwd(), "node_modules", "@solcreek", "adapter-next-core", "dist", "cache-handler.js");
+// Path to the cache handler shipped by @solcreek/adapter-next-core, resolved
+// from THIS module's location — not from the consumer project. The adapter is
+// not always installed in the project's own node_modules: the Creek CLI
+// lazy-installs it into <project>/.creek/node_modules, which is outside the
+// project's require walk. Resolving from import.meta.url walks up from
+// wherever the adapter actually lives, so it finds the dependency under npm
+// hoisting, pnpm's content-addressed store, and the CLI's .creek install
+// alike.
+function resolveCacheHandlerPath(): string {
+  try {
+    return createRequire(import.meta.url).resolve(
+      "@solcreek/adapter-next-core/cache-handler",
+    );
+  } catch {
+    // Last resort: assume a flat install in the consumer project.
+    return path.join(process.cwd(), "node_modules", "@solcreek", "adapter-next-core", "dist", "cache-handler.js");
+  }
+}
+const fallbackCacheHandlerPath = resolveCacheHandlerPath();
 
 function mirrorCacheHandlerIntoProject(cacheHandlerPath: string): string {
   if (!existsSync(cacheHandlerPath)) return cacheHandlerPath;
