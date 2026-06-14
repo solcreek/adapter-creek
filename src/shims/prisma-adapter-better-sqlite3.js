@@ -13,6 +13,11 @@
 // Prisma reads `provider` synchronously at PrismaClient construction and only
 // calls `connect()` at the first query (request time), so D1 is resolved
 // lazily inside connect() — never at construction.
+//
+// `@prisma/adapter-d1` is an OPTIONAL peer of adapter-creek: it isn't shipped
+// to non-Prisma projects. The Creek CLI installs it into .creek on demand when
+// it detects a Prisma-on-D1 project (matching the project's Prisma version),
+// so this import resolves at build time only when the swap is actually used.
 import { PrismaD1 } from "@prisma/adapter-d1";
 
 function resolveD1() {

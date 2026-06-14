@@ -14,9 +14,6 @@ importers:
       '@node-rs/xxhash':
         specifier: ^1.7.6
         version: 1.7.6
-      '@prisma/adapter-d1':
-        specifier: ^7.8.0
-        version: 7.8.0
       '@solcreek/adapter-core':
         specifier: ^0.2.0
         version: 0.2.0(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))
@@ -30,6 +27,9 @@ importers:
         specifier: ^4.82.2
         version: 4.82.2(@cloudflare/workers-types@4.20260613.1)
     devDependencies:
+      '@prisma/adapter-d1':
+        specifier: ^7.8.0
+        version: 7.8.0
       '@types/node':
         specifier: ^22.13.10
         version: 22.19.17
