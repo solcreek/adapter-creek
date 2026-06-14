@@ -374,8 +374,21 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // exposes these per-output as `output.assets` (the result of file tracing).
   // We embed them in __USER_FILES so the fs shim can serve them in workerd.
   const userFiles = await collectUserFiles(ctx.outputs, ctx.distDir, ctx.projectDir);
-  if (Object.keys(userFiles).length > 0) {
-    console.log(`  [Creek Adapter] ${Object.keys(userFiles).length} user data files embedded`);
+  const userFilePaths = Object.keys(userFiles).sort();
+  if (userFilePaths.length > 0) {
+    // List the paths: these are non-code files your routes read at runtime
+    // (file-traced from your code), embedded so the workerd fs shim can serve
+    // them. Listing them lets you spot anything unexpected (e.g. a stray .env).
+    console.log(
+      `  [Creek Adapter] ${userFilePaths.length} user data files embedded (files read at runtime via fs):`,
+    );
+    const SHOWN = 30;
+    for (const p of userFilePaths.slice(0, SHOWN)) {
+      console.log(`    - ${p}`);
+    }
+    if (userFilePaths.length > SHOWN) {
+      console.log(`    ... and ${userFilePaths.length - SHOWN} more`);
+    }
   }
 
   // Step 4: Generate worker entry
