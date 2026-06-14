@@ -10,8 +10,37 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { builtinModules, createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+
+/**
+ * Resolve wrangler's CLI entry script through Node module resolution.
+ *
+ * Never guess `<adapterDir>/node_modules/.bin/wrangler`: npm hoists
+ * wrangler to the top of the install tree (under the Creek CLI's lazy
+ * install that's `.creek/node_modules/.bin`), so the nested path only
+ * exists when hoisting is defeated by a version conflict. Resolving
+ * `wrangler/package.json` and reading its `bin` field finds the real
+ * entry under npm hoisting, pnpm's virtual store, and link installs
+ * alike — and running it with process.execPath sidesteps `.bin` shell
+ * shims entirely (which also don't exist as POSIX scripts on Windows).
+ *
+ * Exported for tests.
+ */
+export async function resolveWranglerEntry(
+  requireFn: Pick<NodeRequire, "resolve">,
+): Promise<string> {
+  const pkgPath = requireFn.resolve("wrangler/package.json");
+  const pkg = JSON.parse(await fs.readFile(pkgPath, "utf-8")) as {
+    bin?: string | Record<string, string>;
+  };
+  const binRel = typeof pkg.bin === "string" ? pkg.bin : pkg.bin?.wrangler;
+  if (!binRel) {
+    throw new Error(`wrangler package.json at ${pkgPath} has no usable bin field`);
+  }
+  return path.join(path.dirname(pkgPath), binRel);
+}
 
 export interface BundleOptions {
   workerSource: string;
@@ -898,8 +927,9 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     await fs.copyFile(absPath, destPath);
   }
 
-  // Resolve adapter paths
-  const adapterDir = path.dirname(path.dirname(new URL(import.meta.url).pathname));
+  // Resolve adapter paths. fileURLToPath, not URL#pathname — the latter
+  // yields "/C:/..." on Windows, which every alias below would inherit.
+  const adapterDir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
   // Generate wrangler config for the bundle step
   const wranglerConfig = {
@@ -1036,12 +1066,12 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   }
 
   const bundleDir = path.join(opts.outputDir, "__bundle");
-  // Resolve wrangler binary from the adapter's own node_modules
-  const wranglerBin = path.join(adapterDir, "node_modules", ".bin", "wrangler");
+  const wranglerEntry = await resolveWranglerEntry(adapterRequire);
 
   try {
-    execSync(
-      `"${wranglerBin}" deploy --dry-run --outdir "${bundleDir}" --config "${configPath}"`,
+    execFileSync(
+      process.execPath,
+      [wranglerEntry, "deploy", "--dry-run", "--outdir", bundleDir, "--config", configPath],
       {
         cwd: path.dirname(opts.distDir),
         stdio: "pipe",

@@ -1,9 +1,86 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { createRequire } from "node:module";
+import * as path from "node:path";
 import {
   patchAppPageRevalidationPostponedState,
   patchNullFallbackPartialShellBlocking,
   patchUseCachePrerenderDanglingPromiseBailout,
+  resolveWranglerEntry,
 } from "./bundler";
+
+describe("resolveWranglerEntry", () => {
+  let treeDir: string;
+
+  beforeEach(() => {
+    // realpath the tmpdir up front — require.resolve returns realpaths,
+    // and macOS's tmpdir lives behind a /var → /private/var symlink.
+    treeDir = mkdtempSync(path.join(realpathSync(tmpdir()), "adapter-creek-wrangler-"));
+  });
+
+  afterEach(() => {
+    rmSync(treeDir, { recursive: true, force: true });
+  });
+
+  /** Write a fake package into <root>/node_modules and return its dir. */
+  function writePkg(root: string, name: string, pkg: object): string {
+    const dir = path.join(root, "node_modules", ...name.split("/"));
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name, ...pkg }));
+    return dir;
+  }
+
+  // Reproduces the Creek CLI lazy-install layout: npm hoists wrangler to
+  // the TOP of .creek/node_modules, as a sibling of @solcreek/adapter-creek
+  // — the adapter's own nested node_modules/.bin doesn't exist. Resolution
+  // must walk up from the adapter, not guess a nested path.
+  it("resolves a wrangler hoisted to the top of the install tree", async () => {
+    const adapterDir = writePkg(treeDir, "@solcreek/adapter-creek", { version: "0.0.0" });
+    const wranglerDir = writePkg(treeDir, "wrangler", {
+      version: "4.82.2",
+      bin: { wrangler: "bin/wrangler.js" },
+    });
+    mkdirSync(path.join(wranglerDir, "bin"), { recursive: true });
+    writeFileSync(path.join(wranglerDir, "bin", "wrangler.js"), "");
+
+    const adapterRequire = createRequire(path.join(adapterDir, "package.json"));
+    await expect(resolveWranglerEntry(adapterRequire)).resolves.toBe(
+      path.join(wranglerDir, "bin", "wrangler.js"),
+    );
+  });
+
+  it("supports a string-form bin field", async () => {
+    const adapterDir = writePkg(treeDir, "@solcreek/adapter-creek", { version: "0.0.0" });
+    const wranglerDir = writePkg(treeDir, "wrangler", {
+      version: "4.82.2",
+      bin: "bin/wrangler.js",
+    });
+    mkdirSync(path.join(wranglerDir, "bin"), { recursive: true });
+    writeFileSync(path.join(wranglerDir, "bin", "wrangler.js"), "");
+
+    const adapterRequire = createRequire(path.join(adapterDir, "package.json"));
+    await expect(resolveWranglerEntry(adapterRequire)).resolves.toBe(
+      path.join(wranglerDir, "bin", "wrangler.js"),
+    );
+  });
+
+  it("throws a descriptive error when the bin field is unusable", async () => {
+    const adapterDir = writePkg(treeDir, "@solcreek/adapter-creek", { version: "0.0.0" });
+    writePkg(treeDir, "wrangler", { version: "4.82.2" });
+
+    const adapterRequire = createRequire(path.join(adapterDir, "package.json"));
+    await expect(resolveWranglerEntry(adapterRequire)).rejects.toThrow(
+      /no usable bin field/,
+    );
+  });
+
+  it("resolves the real wrangler dependency from this repo's install", async () => {
+    const selfRequire = createRequire(import.meta.url);
+    const entry = await resolveWranglerEntry(selfRequire);
+    expect(entry).toMatch(/wrangler/);
+  });
+});
 
 describe("patchUseCachePrerenderDanglingPromiseBailout", () => {
   it("patches readable Next use-cache wrapper output", () => {
