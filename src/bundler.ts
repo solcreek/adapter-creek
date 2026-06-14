@@ -982,6 +982,12 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       // webpack-layer alias doesn't catch the already-resolved native require.
       "better-sqlite3": path.join(adapterDir, "src", "shims", "better-sqlite3-stub.js"),
       "node:better-sqlite3": path.join(adapterDir, "src", "shims", "better-sqlite3-stub.js"),
+      // Prisma's ~4.7MB query-compiler base64. @prisma/client is externalized
+      // by Next, so its `runtime/*.wasm-base64.mjs` is pulled in at THIS
+      // (esbuild) layer, not webpack — alias it here to the tiny sentinel stub.
+      // build.ts registers the precompiled compiler under the sentinel length,
+      // so the Module patch returns it; the real base64 never ships.
+      "@prisma/client/runtime/query_compiler_fast_bg.sqlite.wasm-base64.mjs": path.join(adapterDir, "src", "shims", "prisma-wasm-base64-stub.mjs"),
       // Some packages intentionally leave unreachable dynamic imports such as
       // `if (Math.random() < 0) import("fail")` in their ESM entry. Turbopack
       // externalizes the package and never resolves that branch, but wrangler

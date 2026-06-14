@@ -13,7 +13,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createRequire } from "node:module";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import type { NextAdapter } from "next";
 import { generateWorkerEntry } from "./worker-entry.js";
 import { bundleForWorkers } from "./bundler.js";
@@ -42,13 +42,13 @@ async function collectPrismaCompilerWasm(
   projectDir: string,
   outputDir: string,
   wasmFiles: Map<string, string>,
-): Promise<void> {
+): Promise<string | null> {
   let runtimeDir: string;
   try {
     const req = createRequire(path.join(projectDir, "noop.js"));
     runtimeDir = path.join(path.dirname(req.resolve("@prisma/client/package.json")), "runtime");
   } catch {
-    return; // Not a Prisma project.
+    return null; // Not a Prisma project.
   }
 
   const base = "query_compiler_fast_bg.sqlite";
@@ -56,19 +56,39 @@ async function collectPrismaCompilerWasm(
   try {
     // Import the base64 module's `wasm` named export (no regex parsing).
     const mod = (await import(pathToFileURL(mjs).href)) as { wasm?: string };
-    if (!mod.wasm) return;
+    if (!mod.wasm) return null;
     const bytes = Buffer.from(mod.wasm, "base64");
     const stageDir = path.join(outputDir, ".prisma-wasm");
     await fs.mkdir(stageDir, { recursive: true });
-    const dest = path.join(stageDir, `${base}.wasm`);
+    const destName = `${base}.wasm`;
+    const dest = path.join(stageDir, destName);
     await fs.writeFile(dest, bytes);
-    wasmFiles.set(`${base}.wasm`, dest);
+    wasmFiles.set(destName, dest);
     console.log(`  [Creek Adapter] Prisma compiler wasm staged: ${base} (${bytes.byteLength} bytes)`);
+    return destName;
   } catch {
     // Absent/unreadable (or not a sqlite Prisma project) — skip. A genuinely
     // missing compiler surfaces as the original workerd error at runtime,
     // which is the pre-existing behaviour.
+    return null;
   }
+}
+
+/**
+ * Decoded byte length of the Prisma base64 sentinel stub
+ * (src/shims/prisma-wasm-base64-stub.mjs). The generated client constructs
+ * `new WebAssembly.Module(<sentinel bytes>)`; registering the precompiled
+ * compiler under this length lets the worker-entry Module patch return it
+ * while the bundle ships the tiny sentinel instead of the ~4.7MB real base64.
+ * Read from the stub itself so it stays the single source of truth.
+ */
+async function prismaWasmSentinelLength(): Promise<number> {
+  const stubPath = path.join(
+    path.dirname(fileURLToPath(import.meta.url)),
+    "..", "src", "shims", "prisma-wasm-base64-stub.mjs",
+  );
+  const stub = (await import(pathToFileURL(stubPath).href)) as { wasm: string };
+  return Buffer.from(stub.wasm, "base64").byteLength;
 }
 
 interface ExternalModuleLoader {
@@ -163,7 +183,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // Stage Prisma 7's query-compiler WASM (sqlite) so a Prisma app runs on D1
   // unchanged: its base64-embedded compiler is precompiled here and swapped in
   // at runtime by the worker-entry WebAssembly.Module patch. No-op otherwise.
-  await collectPrismaCompilerWasm(ctx.projectDir, outputDir, wasmFiles);
+  const prismaWasmDest = await collectPrismaCompilerWasm(ctx.projectDir, outputDir, wasmFiles);
 
   // Step 3: Collect manifests from .next/ for embedding in the worker.
   // Next.js route modules call loadManifest() which uses fs.readFileSync().
@@ -198,6 +218,40 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
       console.log(`  [Creek Adapter] ${wasmHashToFilename.size} wasm edge var mappings computed`);
     }
   } catch {}
+
+  // Prisma sentinel redirect: the client bundles the tiny sentinel stub
+  // (aliased in modifyConfig) instead of the real ~4.7MB base64, so at runtime
+  // it constructs `new WebAssembly.Module(<sentinel bytes>)`. Register the
+  // precompiled compiler under the sentinel length too, so the Module patch
+  // returns it. The real-length entry above stays as a harmless fallback.
+  if (prismaWasmDest) {
+    try {
+      const sentinel = await prismaWasmSentinelLength();
+      const collision = wasmLengthToFilename.get(sentinel);
+      if (collision && collision !== prismaWasmDest) {
+        // Astronomically unlikely, but fail loud rather than silently swap the
+        // wrong module: bump the stub size in prisma-wasm-base64-stub.mjs.
+        throw new Error(
+          `Prisma wasm sentinel length ${sentinel} collides with ${collision}`,
+        );
+      }
+      // Drop the real-length entry so ONLY the sentinel maps to this file:
+      // the worker-entry registry keeps one length per wasm file, and the
+      // client now constructs the Module from the sentinel-sized stub bytes.
+      for (const [len, fn] of [...wasmLengthToFilename]) {
+        if (fn === prismaWasmDest && len !== sentinel) wasmLengthToFilename.delete(len);
+      }
+      wasmLengthToFilename.set(sentinel, prismaWasmDest);
+      console.log(`  [Creek Adapter] Prisma compiler wasm sentinel: length ${sentinel} → ${prismaWasmDest}`);
+    } catch (err) {
+      console.error(
+        `  [Creek Adapter] Prisma wasm sentinel registration failed: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      throw err;
+    }
+  }
 
   // Step 3b: Collect prerender entries for ISR cache seeding.
   // Each prerender with a fallback file gets seeded into the cache at startup.

@@ -19,6 +19,12 @@ const DB_DRIVER_ALIASES: Record<string, string> = {
   // The query-compiler WASM is precompiled in build.ts and swapped in by the
   // worker-entry WebAssembly.Module patch.
   "@prisma/adapter-better-sqlite3$": path.join(SHIMS_DIR, "prisma-adapter-better-sqlite3.js"),
+  // Prisma 7: replace the ~4.7MB query-compiler base64 string the generated
+  // client would bundle with a tiny sentinel. The compiler is shipped as a
+  // precompiled CompiledWasm module instead; the worker-entry Module patch
+  // matches by byte length (the sentinel), so the base64 content is unused.
+  // build.ts registers the precompiled module under the sentinel length.
+  "@prisma/client/runtime/query_compiler_fast_bg.sqlite.wasm-base64.mjs$": path.join(SHIMS_DIR, "prisma-wasm-base64-stub.mjs"),
   // The native better-sqlite3 client the user passes to drizzle() — stubbed,
   // since the swap ignores it and uses env.DB. Keeps the native .node out of
   // the Workers bundle.

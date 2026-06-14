@@ -52,6 +52,21 @@ describe("DB driver-swap aliases (modifyConfig)", () => {
     expect(alias["better-sqlite3$"]).toBe(
       path.join(SHIMS_DIR, "better-sqlite3-stub.js"),
     );
+    // Prisma query-compiler base64 → tiny sentinel stub (size optimization).
+    expect(alias["@prisma/client/runtime/query_compiler_fast_bg.sqlite.wasm-base64.mjs$"]).toBe(
+      path.join(SHIMS_DIR, "prisma-wasm-base64-stub.mjs"),
+    );
+  });
+
+  it("ships a small sentinel stub for the Prisma compiler base64", async () => {
+    const { wasm } = await import("./prisma-wasm-base64-stub.mjs");
+    // Must be valid base64 that decodes to a fixed, non-trivial sentinel
+    // length (build.ts registers the precompiled compiler under it), and far
+    // smaller than the real ~4.7MB base64 it replaces.
+    expect(typeof wasm).toBe("string");
+    expect(wasm.length).toBeLessThan(20_000);
+    const decoded = Buffer.from(wasm as string, "base64").byteLength;
+    expect(decoded).toBeGreaterThan(0);
   });
 
   it("preserves a base webpack fn while adding the DB aliases", () => {
