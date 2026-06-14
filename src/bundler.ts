@@ -15,6 +15,11 @@ import { builtinModules, createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { WORKER_COMPATIBILITY_DATE, WORKER_COMPATIBILITY_FLAGS } from "./compat.js";
 
+/** Escape a string for safe interpolation into a RegExp source. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /**
  * Resolve wrangler's CLI entry script through Node module resolution.
  *
@@ -1407,6 +1412,31 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   await fs.rm(entryPath, { force: true });
   await fs.rm(configPath, { force: true });
   await fs.rm(bundleDir, { recursive: true, force: true });
+
+  // Prune orphaned plain wasm copies. We write each wasm under its plain name
+  // (above) so wrangler can resolve `import __wasm from "./<name>.wasm"`;
+  // wrangler then emits a content-hashed sibling `<hash>-<name>.wasm` and
+  // rewrites the import to it. The plain copy is left behind unreferenced —
+  // dead weight in the uploaded script (significant for large wasm like
+  // Prisma's ~3.5MB query compiler). Delete a plain copy only when a hashed
+  // sibling exists AND the bundled worker no longer imports the plain path, so
+  // wasm that wrangler kept un-hashed is never touched.
+  try {
+    const outFiles = await fs.readdir(opts.outputDir);
+    const workerCode = await fs.readFile(path.join(opts.outputDir, "worker.js"), "utf-8");
+    for (const [name] of opts.wasmFiles) {
+      const plain = name.endsWith(".wasm") ? name : name + ".wasm";
+      if (!outFiles.includes(plain)) continue;
+      const hashedSibling = new RegExp(`^[0-9a-f]{6,}-${escapeRegExp(plain)}$`);
+      const hasHashed = outFiles.some((f) => hashedSibling.test(f));
+      const stillImportsPlain = workerCode.includes(`./${plain}`);
+      if (hasHashed && !stillImportsPlain) {
+        await fs.rm(path.join(opts.outputDir, plain), { force: true });
+      }
+    }
+  } catch {
+    // Best-effort: if worker.js is absent or readdir fails, keep all files.
+  }
 
   // List output files
   const files = await fs.readdir(opts.outputDir);
