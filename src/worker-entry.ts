@@ -502,6 +502,31 @@ if (typeof WebAssembly !== "undefined" && typeof WebAssembly.instantiate === "fu
       return __origCompile(bytes);
     };
   }
+  // Prisma 7's query compiler instantiates its wasm synchronously via
+  // \`new WebAssembly.Module(bytes)\` (decoded from a base64 module), which
+  // workerd also rejects. Swap in the pre-compiled CompiledWasm module
+  // (registered by byte length at build time) when the bytes match; a
+  // constructor returning an object yields that object to the \`new\`
+  // expression. Falls back to the original elsewhere.
+  if (typeof WebAssembly.Module === "function") {
+    const __OrigModule = WebAssembly.Module;
+    const __ModulePatched = function(bytes) {
+      const precompiled = __findPrecompiled(bytes);
+      if (precompiled) return precompiled;
+      return Reflect.construct(__OrigModule, arguments, __ModulePatched);
+    };
+    __ModulePatched.prototype = __OrigModule.prototype;
+    if (typeof __OrigModule.imports === "function") {
+      __ModulePatched.imports = function(m) { return __OrigModule.imports(m); };
+    }
+    if (typeof __OrigModule.exports === "function") {
+      __ModulePatched.exports = function(m) { return __OrigModule.exports(m); };
+    }
+    if (typeof __OrigModule.customSections === "function") {
+      __ModulePatched.customSections = function(m, n) { return __OrigModule.customSections(m, n); };
+    }
+    WebAssembly.Module = __ModulePatched;
+  }
 }
 
 // Polyfill process methods and env that Next.js uses.

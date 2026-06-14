@@ -12,6 +12,8 @@
 
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { createRequire } from "node:module";
+import { pathToFileURL } from "node:url";
 import type { NextAdapter } from "next";
 import { generateWorkerEntry } from "./worker-entry.js";
 import { bundleForWorkers } from "./bundler.js";
@@ -20,6 +22,54 @@ import { writeManifest } from "./manifest.js";
 type BuildContext = Parameters<NonNullable<NextAdapter["onBuildComplete"]>>[0];
 
 const OUTPUT_DIR = ".creek/adapter-output";
+
+/**
+ * Decode Prisma 7's query-compiler WASM and stage it as a real `.wasm` file so
+ * it flows through the CompiledWasm pipeline (precompiled at bundle time,
+ * registered by byte length). Prisma's client instantiates the compiler via
+ * `new WebAssembly.Module(bytes)` from a base64-embedded `.mjs`, which workerd
+ * rejects at runtime ("Wasm code generation disallowed by embedder"); the
+ * worker-entry Module patch swaps the matching precompiled module in by length.
+ *
+ * Only the sqlite `fast` variant matters on D1: it is the generator default
+ * and the only base64 module the generated client imports (so the only byte
+ * length queried at runtime). Staging `small` too would just add an
+ * unreferenced CompiledWasm module to the bundle — dead weight — so we don't.
+ * A project that overrides `compilerBuild = "small"` is unsupported for now.
+ * No-op when @prisma/client isn't installed.
+ */
+async function collectPrismaCompilerWasm(
+  projectDir: string,
+  outputDir: string,
+  wasmFiles: Map<string, string>,
+): Promise<void> {
+  let runtimeDir: string;
+  try {
+    const req = createRequire(path.join(projectDir, "noop.js"));
+    runtimeDir = path.join(path.dirname(req.resolve("@prisma/client/package.json")), "runtime");
+  } catch {
+    return; // Not a Prisma project.
+  }
+
+  const base = "query_compiler_fast_bg.sqlite";
+  const mjs = path.join(runtimeDir, `${base}.wasm-base64.mjs`);
+  try {
+    // Import the base64 module's `wasm` named export (no regex parsing).
+    const mod = (await import(pathToFileURL(mjs).href)) as { wasm?: string };
+    if (!mod.wasm) return;
+    const bytes = Buffer.from(mod.wasm, "base64");
+    const stageDir = path.join(outputDir, ".prisma-wasm");
+    await fs.mkdir(stageDir, { recursive: true });
+    const dest = path.join(stageDir, `${base}.wasm`);
+    await fs.writeFile(dest, bytes);
+    wasmFiles.set(`${base}.wasm`, dest);
+    console.log(`  [Creek Adapter] Prisma compiler wasm staged: ${base} (${bytes.byteLength} bytes)`);
+  } catch {
+    // Absent/unreadable (or not a sqlite Prisma project) — skip. A genuinely
+    // missing compiler surfaces as the original workerd error at runtime,
+    // which is the pre-existing behaviour.
+  }
+}
 
 interface ExternalModuleLoader {
   id: string;
@@ -109,6 +159,11 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
       }
     }
   }
+
+  // Stage Prisma 7's query-compiler WASM (sqlite) so a Prisma app runs on D1
+  // unchanged: its base64-embedded compiler is precompiled here and swapped in
+  // at runtime by the worker-entry WebAssembly.Module patch. No-op otherwise.
+  await collectPrismaCompilerWasm(ctx.projectDir, outputDir, wasmFiles);
 
   // Step 3: Collect manifests from .next/ for embedding in the worker.
   // Next.js route modules call loadManifest() which uses fs.readFileSync().

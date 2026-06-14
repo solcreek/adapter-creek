@@ -12,6 +12,17 @@ vi.mock("drizzle-orm/d1", () => ({
   drizzle: (client: unknown, config: unknown) => ({ __d1Client: client, __config: config }),
 }));
 
+// The Prisma shim imports `@prisma/adapter-d1` (an adapter-creek dependency).
+// Mock PrismaD1 so connect() can be asserted without a live D1 binding.
+vi.mock("@prisma/adapter-d1", () => ({
+  PrismaD1: class {
+    db: unknown;
+    constructor(db: unknown) { this.db = db; }
+    connect() { return { kind: "d1-adapter", db: this.db }; }
+    connectToShadowDb() { return { kind: "d1-shadow", db: this.db }; }
+  },
+}));
+
 const SHIMS_DIR = path.dirname(fileURLToPath(import.meta.url));
 
 afterEach(() => {
@@ -34,6 +45,9 @@ describe("DB driver-swap aliases (modifyConfig)", () => {
 
     expect(alias["drizzle-orm/better-sqlite3$"]).toBe(
       path.join(SHIMS_DIR, "drizzle-better-sqlite3.js"),
+    );
+    expect(alias["@prisma/adapter-better-sqlite3$"]).toBe(
+      path.join(SHIMS_DIR, "prisma-adapter-better-sqlite3.js"),
     );
     expect(alias["better-sqlite3$"]).toBe(
       path.join(SHIMS_DIR, "better-sqlite3-stub.js"),
@@ -100,6 +114,38 @@ describe("drizzle-better-sqlite3 shim", () => {
     // Binding appears on a later request → resolves without rebuilding.
     current = { DB: { tag: "req-2", prepare: () => "ok" } };
     expect((db.__d1Client.prepare as () => string)()).toBe("ok");
+  });
+});
+
+describe("prisma-adapter-better-sqlite3 shim", () => {
+  it("exposes provider synchronously and ignores the local config", async () => {
+    const { PrismaBetterSqlite3 } = await import("./prisma-adapter-better-sqlite3.js");
+    // Constructed at module scope, before any request env exists.
+    const adapter = new PrismaBetterSqlite3({ url: "file:./dev.db" });
+    expect(adapter.provider).toBe("sqlite");
+    expect(adapter.adapterName).toBe("@prisma/adapter-d1");
+  });
+
+  it("connects against env.DB lazily (at first query, not construction)", async () => {
+    const { PrismaBetterSqlite3 } = await import("./prisma-adapter-better-sqlite3.js");
+    const adapter = new PrismaBetterSqlite3({ url: "file:./dev.db" });
+
+    const fakeD1 = { tag: "d1" };
+    (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({ DB: fakeD1 });
+
+    const conn = adapter.connect() as { kind: string; db: unknown };
+    expect(conn.kind).toBe("d1-adapter");
+    expect(conn.db).toBe(fakeD1);
+
+    const shadow = adapter.connectToShadowDb() as { kind: string };
+    expect(shadow.kind).toBe("d1-shadow");
+  });
+
+  it("throws a helpful error when env.DB is unavailable at connect()", async () => {
+    const { PrismaBetterSqlite3 } = await import("./prisma-adapter-better-sqlite3.js");
+    const adapter = new PrismaBetterSqlite3({ url: "file:./dev.db" });
+    (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({});
+    expect(() => adapter.connect()).toThrow(/D1 binding `env\.DB` is unavailable/);
   });
 });
 

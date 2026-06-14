@@ -15,6 +15,10 @@ const SHIMS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", 
 const DB_DRIVER_ALIASES: Record<string, string> = {
   // Drizzle: `drizzle-orm/better-sqlite3` → D1-backed drizzle. No WASM.
   "drizzle-orm/better-sqlite3$": path.join(SHIMS_DIR, "drizzle-better-sqlite3.js"),
+  // Prisma 7: `@prisma/adapter-better-sqlite3` → D1-backed PrismaD1 adapter.
+  // The query-compiler WASM is precompiled in build.ts and swapped in by the
+  // worker-entry WebAssembly.Module patch.
+  "@prisma/adapter-better-sqlite3$": path.join(SHIMS_DIR, "prisma-adapter-better-sqlite3.js"),
   // The native better-sqlite3 client the user passes to drizzle() — stubbed,
   // since the swap ignores it and uses env.DB. Keeps the native .node out of
   // the Workers bundle.
