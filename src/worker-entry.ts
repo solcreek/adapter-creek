@@ -2122,6 +2122,14 @@ function __creekCurrentEnv() {
   }
 }
 
+// Expose the current request's Cloudflare env (incl. bindings like DB) to
+// bundled user code and the build-time DB driver-swap shims (Drizzle/Prisma),
+// which resolve env.DB lazily at query time. AsyncLocalStorage-backed, so it
+// is request-safe under concurrency.
+if (typeof globalThis !== "undefined") {
+  globalThis.__creekEnv = __creekCurrentEnv;
+}
+
 // Group tags into {shardKey: tags[]} so we hit each DO instance at most
 // once per operation (avoids fan-out + 2x/3x RPC cost for entries that
 // carry many tags).

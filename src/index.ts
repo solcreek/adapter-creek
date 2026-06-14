@@ -1,9 +1,25 @@
 import * as path from "node:path";
 import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
 import { copyFileSync, existsSync } from "node:fs";
 import type { NextAdapter } from "next";
 import { applyBaseModifyConfig } from "@solcreek/adapter-next-core";
 import { handleBuild } from "./build.js";
+
+// Build-time DB driver swaps: in the Workers build only, redirect a local
+// SQLite driver import to a Creek shim that backs the same ORM with the
+// request's D1 binding (env.DB, resolved lazily). Local dev is untouched —
+// the adapter only runs under the Creek build. Aliases are harmless when the
+// module isn't imported, so they apply unconditionally.
+const SHIMS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "shims");
+const DB_DRIVER_ALIASES: Record<string, string> = {
+  // Drizzle: `drizzle-orm/better-sqlite3` → D1-backed drizzle. No WASM.
+  "drizzle-orm/better-sqlite3$": path.join(SHIMS_DIR, "drizzle-better-sqlite3.js"),
+  // The native better-sqlite3 client the user passes to drizzle() — stubbed,
+  // since the swap ignores it and uses env.DB. Keeps the native .node out of
+  // the Workers bundle.
+  "better-sqlite3$": path.join(SHIMS_DIR, "better-sqlite3-stub.js"),
+};
 
 // Path to the cache handler shipped by @solcreek/adapter-next-core, resolved
 // from THIS module's location — not from the consumer project. The adapter is
@@ -87,6 +103,17 @@ const adapter: NextAdapter = {
       experimental: {
         ...(baseConfig.experimental ?? {}),
         maxPostponedStateSize: "20mb",
+      },
+      // Swap local SQLite ORM drivers → D1-backed shims (Workers build only).
+      // Compose with any webpack fn the base config already set.
+      webpack(webpackConfig: any, webpackCtx: any) {
+        const cfg =
+          typeof (baseConfig as { webpack?: unknown }).webpack === "function"
+            ? (baseConfig as { webpack: (c: unknown, x: unknown) => any }).webpack(webpackConfig, webpackCtx)
+            : webpackConfig;
+        cfg.resolve = cfg.resolve ?? {};
+        cfg.resolve.alias = { ...(cfg.resolve.alias ?? {}), ...DB_DRIVER_ALIASES };
+        return cfg;
       },
     };
   },

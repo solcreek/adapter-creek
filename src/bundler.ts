@@ -970,6 +970,13 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       // throws \`sharp is not a function\`. Aliasing to a shim whose default
       // is undefined makes \`@vercel/og\` fall back to its resvg.wasm path.
       "sharp": path.join(adapterDir, "src", "shims", "sharp.js"),
+      // better-sqlite3 is a native module that can't run on workerd. The DB
+      // driver swap (Drizzle/Prisma) ignores the local client and uses env.DB,
+      // so stub better-sqlite3 to keep its native .node out of the bundle.
+      // Aliased here (esbuild) because Next bundles its JS inline — the
+      // webpack-layer alias doesn't catch the already-resolved native require.
+      "better-sqlite3": path.join(adapterDir, "src", "shims", "better-sqlite3-stub.js"),
+      "node:better-sqlite3": path.join(adapterDir, "src", "shims", "better-sqlite3-stub.js"),
       // Some packages intentionally leave unreachable dynamic imports such as
       // `if (Math.random() < 0) import("fail")` in their ESM entry. Turbopack
       // externalizes the package and never resolves that branch, but wrangler

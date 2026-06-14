@@ -8,3 +8,6 @@ nextjs/
 .wrangler/
 .test-fixtures/
 .claude/
+
+# Build artifact: cache-handler sentinel mirrored into project root by modifyConfig
+.solcreek-cache-handler.mjs

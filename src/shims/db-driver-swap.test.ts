@@ -1,0 +1,116 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+
+import adapter from "../index.js";
+
+// The drizzle shim imports `drizzle-orm/d1`, which is resolved from the user's
+// project at build time (drizzle-orm is not an adapter-creek dependency). Mock
+// it so the swap logic can be unit-tested in isolation: the mock drizzle()
+// just records the client + config it was handed.
+vi.mock("drizzle-orm/d1", () => ({
+  drizzle: (client: unknown, config: unknown) => ({ __d1Client: client, __config: config }),
+}));
+
+const SHIMS_DIR = path.dirname(fileURLToPath(import.meta.url));
+
+afterEach(() => {
+  delete (globalThis as { __creekEnv?: unknown }).__creekEnv;
+});
+
+describe("DB driver-swap aliases (modifyConfig)", () => {
+  it("aliases the local SQLite drivers to Creek shims in the Workers build", () => {
+    const config = adapter.modifyConfig?.(
+      {},
+      { phase: "phase-production-build" } as never,
+    );
+
+    // The adapter exposes webpack(cfg, ctx); applying it surfaces the aliases.
+    const webpack = (config as { webpack?: (c: unknown, x: unknown) => any }).webpack;
+    expect(typeof webpack).toBe("function");
+
+    const built = webpack!({ resolve: {} }, {});
+    const alias = built.resolve.alias as Record<string, string>;
+
+    expect(alias["drizzle-orm/better-sqlite3$"]).toBe(
+      path.join(SHIMS_DIR, "drizzle-better-sqlite3.js"),
+    );
+    expect(alias["better-sqlite3$"]).toBe(
+      path.join(SHIMS_DIR, "better-sqlite3-stub.js"),
+    );
+  });
+
+  it("preserves a base webpack fn while adding the DB aliases", () => {
+    // modifyConfig composes its webpack on top of whatever the base set; verify
+    // a pre-existing alias survives alongside the swap aliases.
+    const config = adapter.modifyConfig?.(
+      {},
+      { phase: "phase-production-build" } as never,
+    );
+    const webpack = (config as { webpack?: (c: unknown, x: unknown) => any }).webpack;
+    const built = webpack!({ resolve: { alias: { "pre-existing": "/x" } } }, {});
+    const alias = built.resolve.alias as Record<string, string>;
+    expect(alias["pre-existing"]).toBe("/x");
+    expect(alias["drizzle-orm/better-sqlite3$"]).toContain("drizzle-better-sqlite3.js");
+  });
+
+  it("does not add the aliases outside the production build phase", () => {
+    const config = adapter.modifyConfig?.({}, { phase: "phase-development-server" } as never);
+    // Dev passthrough should not install the Workers-only webpack swap.
+    expect((config as { webpack?: unknown }).webpack).toBeUndefined();
+  });
+});
+
+describe("drizzle-better-sqlite3 shim", () => {
+  it("backs drizzle with env.DB (resolved lazily) and ignores the local client", async () => {
+    const { drizzle } = await import("./drizzle-better-sqlite3.js");
+
+    const fakeD1 = { __isD1: true, prepare: () => "stmt" };
+    (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({ DB: fakeD1 });
+
+    const localClient = { native: true };
+    const db = drizzle(localClient as never, { schema: {} }) as {
+      __d1Client: Record<string, unknown>;
+      __config: unknown;
+    };
+
+    // The user's local better-sqlite3 client is ignored; config flows through.
+    expect(db.__config).toEqual({ schema: {} });
+    // The D1 client is a lazy proxy that resolves env.DB per property access.
+    expect((db.__d1Client as { __isD1: boolean }).__isD1).toBe(true);
+    expect(typeof db.__d1Client.prepare).toBe("function");
+    expect((db.__d1Client.prepare as () => string)()).toBe("stmt");
+  });
+
+  it("throws a helpful error when env.DB is unavailable", async () => {
+    const { drizzle } = await import("./drizzle-better-sqlite3.js");
+    (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({});
+    const db = drizzle({} as never, {}) as { __d1Client: Record<string, unknown> };
+    expect(() => db.__d1Client.prepare).toThrow(/D1 binding `env\.DB` is unavailable/);
+  });
+
+  it("resolves env per access (request-scoped), not once at construction", async () => {
+    const { drizzle } = await import("./drizzle-better-sqlite3.js");
+    let current: { DB?: unknown } = {};
+    (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => current;
+    const db = drizzle({} as never, {}) as { __d1Client: Record<string, unknown> };
+
+    // No binding yet → throws.
+    expect(() => db.__d1Client.prepare).toThrow();
+    // Binding appears on a later request → resolves without rebuilding.
+    current = { DB: { tag: "req-2", prepare: () => "ok" } };
+    expect((db.__d1Client.prepare as () => string)()).toBe("ok");
+  });
+});
+
+describe("better-sqlite3 stub", () => {
+  it("constructs but refuses queries (swap uses D1 instead)", async () => {
+    const { default: Database } = await import("./better-sqlite3-stub.js");
+    const dbInst = new Database();
+    expect(dbInst).toBeInstanceOf(Database);
+    expect(() => dbInst.prepare()).toThrow(/not available on Workers/);
+    // Lifecycle no-ops don't throw.
+    expect(() => dbInst.exec()).not.toThrow();
+    expect(() => dbInst.close()).not.toThrow();
+  });
+});
