@@ -1,0 +1,12 @@
+{
+  "name": "lazy-install-fixture",
+  "private": true,
+  "scripts": {
+    "build": "next build --webpack"
+  },
+  "dependencies": {
+    "next": "16.2.3",
+    "react": "19.2.1",
+    "react-dom": "19.2.1"
+  }
+}
