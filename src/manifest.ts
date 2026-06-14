@@ -9,6 +9,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createRequire } from "node:module";
 import type { DeployManifestBase } from "@solcreek/adapter-core";
+import { WORKER_COMPATIBILITY_DATE, WORKER_COMPATIBILITY_FLAGS } from "./compat.js";
 
 const require = createRequire(import.meta.url);
 const adapterPackage = require("../package.json") as { name?: string; version?: string };
@@ -54,8 +55,8 @@ export async function writeManifest(
     entrypoint: opts.entrypoint,
     serverFiles: opts.serverFiles,
     assetDir: "assets",
-    compatibilityDate: "2026-03-28",
-    compatibilityFlags: ["nodejs_compat_v2"],
+    compatibilityDate: WORKER_COMPATIBILITY_DATE,
+    compatibilityFlags: [...WORKER_COMPATIBILITY_FLAGS],
     hasMiddleware: opts.hasMiddleware,
     hasPrerender: opts.hasPrerender,
     // Always inject DO bindings for Next.js SSR (ISR cache support)

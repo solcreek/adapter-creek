@@ -13,6 +13,7 @@ import * as path from "node:path";
 import { execFileSync } from "node:child_process";
 import { builtinModules, createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
+import { WORKER_COMPATIBILITY_DATE, WORKER_COMPATIBILITY_FLAGS } from "./compat.js";
 
 /**
  * Resolve wrangler's CLI entry script through Node module resolution.
@@ -935,8 +936,8 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   const wranglerConfig = {
     name: "creek-adapter-build",
     main: entryPath,
-    compatibility_date: "2026-03-28",
-    compatibility_flags: ["nodejs_compat"],
+    compatibility_date: WORKER_COMPATIBILITY_DATE,
+    compatibility_flags: [...WORKER_COMPATIBILITY_FLAGS],
     define: {
       __dirname: '""',
       __filename: '""',
