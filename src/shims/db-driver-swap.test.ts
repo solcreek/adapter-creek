@@ -111,11 +111,20 @@ describe("drizzle-better-sqlite3 shim", () => {
     expect((db.__d1Client.prepare as () => string)()).toBe("stmt");
   });
 
-  it("throws a helpful error when env.DB is unavailable", async () => {
+  it("throws a helpful error when env.DB is unavailable (deployed, no binding)", async () => {
     const { drizzle } = await import("./drizzle-better-sqlite3.js");
     (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({});
     const db = drizzle({} as never, {}) as { __d1Client: Record<string, unknown> };
     expect(() => db.__d1Client.prepare).toThrow(/D1 binding `env\.DB` is unavailable/);
+  });
+
+  it("explains the build-time (SSG) case when there is no request env accessor", async () => {
+    const { drizzle } = await import("./drizzle-better-sqlite3.js");
+    // No __creekEnv (afterEach deleted it) → running outside a request, i.e.
+    // Next static generation during build.
+    const db = drizzle({} as never, {}) as { __d1Client: Record<string, unknown> };
+    expect(() => db.__d1Client.all).toThrow(/static generation/);
+    expect(() => db.__d1Client.all).toThrow(/force-dynamic/);
   });
 
   it("resolves env per access (request-scoped), not once at construction", async () => {
@@ -156,11 +165,19 @@ describe("prisma-adapter-better-sqlite3 shim", () => {
     expect(shadow.kind).toBe("d1-shadow");
   });
 
-  it("throws a helpful error when env.DB is unavailable at connect()", async () => {
+  it("throws a helpful error when env.DB is unavailable at connect() (deployed, no binding)", async () => {
     const { PrismaBetterSqlite3 } = await import("./prisma-adapter-better-sqlite3.js");
     const adapter = new PrismaBetterSqlite3({ url: "file:./dev.db" });
     (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({});
     expect(() => adapter.connect()).toThrow(/D1 binding `env\.DB` is unavailable/);
+  });
+
+  it("explains the build-time (SSG) case when there is no request env accessor", async () => {
+    const { PrismaBetterSqlite3 } = await import("./prisma-adapter-better-sqlite3.js");
+    const adapter = new PrismaBetterSqlite3({ url: "file:./dev.db" });
+    // No __creekEnv → build-time (static generation) query.
+    expect(() => adapter.connect()).toThrow(/static generation/);
+    expect(() => adapter.connect()).toThrow(/force-dynamic/);
   });
 });
 

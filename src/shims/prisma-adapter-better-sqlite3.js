@@ -20,9 +20,22 @@
 // so this import resolves at build time only when the swap is actually used.
 import { PrismaD1 } from "@prisma/adapter-d1";
 
+// Resolve the request's D1 binding, distinguishing the two failure modes so the
+// error is actionable:
+//   - no `__creekEnv` accessor  → running outside a request, i.e. at BUILD time
+//     (Next runs DB code during static generation; D1 only exists at runtime).
+//   - accessor present, no DB   → deployed, but no database resource is bound.
 function resolveD1() {
-  const env = (globalThis.__creekEnv && globalThis.__creekEnv()) || {};
-  const db = env.DB;
+  const accessor = globalThis.__creekEnv;
+  if (typeof accessor !== "function") {
+    throw new Error(
+      "[creek] Database accessed during build (static generation). The D1 " +
+        "binding only exists at request time on Workers — mark this route/page " +
+        '`export const dynamic = "force-dynamic"` (or move the query into a ' +
+        "request handler) so it runs on D1 at runtime.",
+    );
+  }
+  const db = (accessor() || {}).DB;
   if (!db) {
     throw new Error(
       "[creek] D1 binding `env.DB` is unavailable. Add `database = true` under [resources] in creek.toml.",
