@@ -1379,7 +1379,7 @@ async function assertWorkerWithinLimit(serverDir: string, serverFiles: string[])
  * Collect all JSON manifests from .next/ for embedding in the worker.
  * Returns a map of absolute path → file content string.
  */
-async function collectManifests(distDir: string): Promise<Record<string, string>> {
+export async function collectManifests(distDir: string): Promise<Record<string, string>> {
   const manifests: Record<string, string> = {};
 
   // Recursively find all .json files in .next/ and .next/server/
@@ -1402,7 +1402,12 @@ async function collectManifests(distDir: string): Promise<Record<string, string>
         // as "Could not find the module ... in the React Client Manifest"
         // on middleware rewrites into that route.
         const rel = path.relative(distDir, fullPath);
-        if (rel === "static" || rel === "cache" || rel === "server/chunks" || rel === "server/edge-chunks") continue;
+        // `.next/dev` is Turbopack DEV-server output (from `next dev`); a
+        // production build never writes it, but a stale copy from a prior
+        // `npm run dev` can be GBs of unminified, dev-runtime, triple-bundled
+        // chunks. Never scan it — embedding its manifests bloats the worker by
+        // orders of magnitude (a real deploy hit 202MB worker.js from this).
+        if (rel === "static" || rel === "cache" || rel === "dev" || rel === "server/chunks" || rel === "server/edge-chunks") continue;
         await walk(fullPath);
       } else if (entry.name === "BUILD_ID" || entry.name === "package.json") {
         manifests[fullPath] = await fs.readFile(fullPath, "utf-8").catch(() => "");

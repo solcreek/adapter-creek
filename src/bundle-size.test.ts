@@ -32,19 +32,20 @@ describe("evaluateBundleSize", () => {
     expect(v.message).toMatch(/50\.0 MB/);
   });
 
-  it("adds a native-module hint when .node references are present", () => {
+  it("lists likely causes (stale .next/dev + native module) and a clean-build remedy", () => {
     const v = evaluateBundleSize([{ name: "worker.js", gzipSize: 60 * MB }], { nativeRefs: 310 });
     expect(v.level).toBe("over-limit");
-    expect(v.message).toMatch(/310 "\.node" reference/);
+    expect(v.message).toMatch(/\.next\/dev/);              // the real-world top cause
     expect(v.message).toMatch(/better-sqlite3/);
     expect(v.message).toMatch(/CK-SYNC-SQLITE/);
-    expect(v.message).toMatch(/rm -rf \.creek/);
+    expect(v.message).toMatch(/rm -rf \.next \.creek/);     // remedy now clears .next too
+    expect(v.message).toMatch(/310 "\.node" string reference/); // softened, parenthetical
   });
 
-  it("omits the native hint when there are no .node references", () => {
+  it("omits the .node parenthetical when there are no .node references", () => {
     const v = evaluateBundleSize([{ name: "worker.js", gzipSize: 60 * MB }], { nativeRefs: 0 });
     expect(v.level).toBe("over-limit");
-    expect(v.message).not.toMatch(/\.node/);
+    expect(v.message).not.toMatch(/"\.node" string reference/);
   });
 
   it("lists at most the three largest files", () => {

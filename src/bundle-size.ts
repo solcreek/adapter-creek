@@ -61,14 +61,12 @@ export function evaluateBundleSize(
     let message =
       `Worker bundle is ${fmtMB(totalGzip)} gzipped, over the Cloudflare Workers ` +
       `script limit (${fmtMB(paidLimit)}). It would be rejected at upload.\n` +
-      `    Largest files:\n${biggest}`;
+      `    Largest files:\n${biggest}\n` +
+      `    Common causes: a stale \`.next/dev\` dev build being scanned, or a native ` +
+      `module inlined (e.g. better-sqlite3 — the Creek adapter swaps it for D1, see ` +
+      `CK-SYNC-SQLITE). Try a clean build: \`rm -rf .next .creek && npx creek@latest deploy\`.`;
     if (nativeRefs > 0) {
-      message +=
-        `\n    ${nativeRefs} ".node" reference(s) in the worker — a native module ` +
-        `looks inlined into the bundle. Native modules can't run on Workers. If you ` +
-        `use better-sqlite3 (directly or via Prisma/Drizzle), the Creek adapter swaps ` +
-        `it for D1 (see CK-SYNC-SQLITE); if you deployed before, take a clean build: ` +
-        `\`rm -rf .creek && npx creek@latest deploy\`.`;
+      message += `\n    (${nativeRefs} ".node" string reference(s) seen — a hint, not a guarantee.)`;
     }
     return { level: "over-limit", totalGzip, message };
   }
