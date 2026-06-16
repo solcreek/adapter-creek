@@ -545,6 +545,13 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     standaloneDir: ctx.distDir,
   });
 
+  // The Prisma compiler wasm was staged to .prisma-wasm/ only so the bundler
+  // could read it; bundleForWorkers has now copied the (hashed) module into
+  // server/, so the staging copy is a redundant intermediate. Remove it — it's
+  // local-only (not in serverFiles, never uploaded), but leaving a second 3.5MB
+  // copy in the output is confusing.
+  await fs.rm(path.join(outputDir, ".prisma-wasm"), { recursive: true, force: true });
+
   const totalSize = await getTotalSize(serverDir, serverFiles);
   console.log(`  [Creek Adapter] Worker bundled: ${serverFiles.length} files (${formatSize(totalSize)})`);
 
