@@ -39,13 +39,13 @@ describe("evaluateBundleSize", () => {
     expect(v.message).toMatch(/better-sqlite3/);
     expect(v.message).toMatch(/CK-SYNC-SQLITE/);
     expect(v.message).toMatch(/rm -rf \.next \.creek/);     // remedy now clears .next too
-    expect(v.message).toMatch(/310 "\.node" string reference/); // softened, parenthetical
+    expect(v.message).toMatch(/310 inlined native-module reference/); // softened, parenthetical
   });
 
-  it("omits the .node parenthetical when there are no .node references", () => {
+  it("omits the .node parenthetical when there are no native-module references", () => {
     const v = evaluateBundleSize([{ name: "worker.js", gzipSize: 60 * MB }], { nativeRefs: 0 });
     expect(v.level).toBe("over-limit");
-    expect(v.message).not.toMatch(/"\.node" string reference/);
+    expect(v.message).not.toMatch(/native-module reference/);
   });
 
   it("lists at most the three largest files", () => {

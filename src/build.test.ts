@@ -2,7 +2,32 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { collectManifests } from "./build.js";
+import { collectManifests, countNativeModuleRefs } from "./build.js";
+
+// Regression for the misleading "N native modules" hint: an oversized bundle
+// whose real cause was a stale `.next/dev` reported dozens of phantom natives
+// because the count matched bare `.node` property access. The count must only
+// see quoted `.node` filenames (actual inlined binaries).
+describe("countNativeModuleRefs", () => {
+  it("does not count bare member access like tree.node / this.node", () => {
+    const js = "const a = tree.node; if (this.node) walk(parent.node);";
+    expect(countNativeModuleRefs(js)).toBe(0);
+  });
+
+  it("counts quoted .node filenames (require / path strings)", () => {
+    const js = `require("build/Release/better_sqlite3.node"); const p = 'a/b/sharp.node';`;
+    expect(countNativeModuleRefs(js)).toBe(2);
+  });
+
+  it("ignores .node that merely appears inside a longer string", () => {
+    expect(countNativeModuleRefs(`const s = "see foo.node for details";`)).toBe(0);
+  });
+
+  it("mixes real refs and property access without double-counting", () => {
+    const js = `x.node; require("better_sqlite3.node"); y.node; load("z.node");`;
+    expect(countNativeModuleRefs(js)).toBe(2);
+  });
+});
 
 // Regression: a stale `.next/dev` (Turbopack dev-server output left by
 // `npm run dev`) must never be scanned into the worker — a real deploy bundled

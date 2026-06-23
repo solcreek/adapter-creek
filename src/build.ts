@@ -1330,7 +1330,25 @@ async function getTotalSize(dir: string, files: string[]): Promise<number> {
 const RAW_GZIP_SKIP = 50 * 1024 * 1024;
 const NATIVE_SCAN_BYTES = 8 * 1024 * 1024;
 
-/** Count ".node" references in a file's first NATIVE_SCAN_BYTES (bounded). */
+/**
+ * Count native-module references in bundled JS text: quoted string literals
+ * whose path ends in `.node` (e.g. `require("build/Release/better_sqlite3.node")`).
+ *
+ * Deliberately does NOT match bare member access like `tree.node` or
+ * `this.node` — those are ordinary JS, not native binaries. The old naive
+ * `/\.node\b/` count conflated the two, so an oversized bundle whose real cause
+ * was a stale `.next/dev` reported dozens of phantom "native modules" and sent
+ * people down the wrong path. Matching only quoted `.node` filenames keeps the
+ * hint pointed at actual inlined binaries. Pure + exported for testing.
+ */
+export function countNativeModuleRefs(text: string): number {
+  // A quoted token — length-bounded so a minified blob stays linear — that ends
+  // in `.node` immediately before its closing quote, i.e. a filename, not a
+  // `.node` that merely appears somewhere inside the string.
+  return (text.match(/["'][^"'\n]{0,512}?\.node["']/g) ?? []).length;
+}
+
+/** Native-module refs in a file's first NATIVE_SCAN_BYTES (bounded I/O). */
 async function countNativeRefs(filePath: string): Promise<number> {
   let fh: Awaited<ReturnType<typeof fs.open>> | undefined;
   try {
@@ -1338,7 +1356,7 @@ async function countNativeRefs(filePath: string): Promise<number> {
     const size = (await fh.stat()).size;
     const buf = Buffer.alloc(Math.min(NATIVE_SCAN_BYTES, size));
     if (buf.length > 0) await fh.read(buf, 0, buf.length, 0);
-    return (buf.toString("latin1").match(/\.node\b/g) ?? []).length;
+    return countNativeModuleRefs(buf.toString("latin1"));
   } catch {
     return 0;
   } finally {

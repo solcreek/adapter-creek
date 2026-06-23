@@ -37,7 +37,8 @@ function fmtMB(bytes: number): string {
 
 /**
  * Classify a bundled worker's gzipped script size against the Workers limits.
- * `nativeRefs` (count of ".node" references found in the worker) drives a
+ * `nativeRefs` (count of quoted `.node` filename references in the worker —
+ * inlined native modules, not bare `.node` property access) drives a
  * native-module hint on the over-limit message.
  */
 export function evaluateBundleSize(
@@ -66,7 +67,7 @@ export function evaluateBundleSize(
       `module inlined (e.g. better-sqlite3 — the Creek adapter swaps it for D1, see ` +
       `CK-SYNC-SQLITE). Try a clean build: \`rm -rf .next .creek && npx creek@latest deploy\`.`;
     if (nativeRefs > 0) {
-      message += `\n    (${nativeRefs} ".node" string reference(s) seen — a hint, not a guarantee.)`;
+      message += `\n    (${nativeRefs} inlined native-module reference(s) (\`.node\`) seen — a hint, not a guarantee.)`;
     }
     return { level: "over-limit", totalGzip, message };
   }
