@@ -73,10 +73,23 @@ export async function minifyWorker(
   if (process.env.CREEK_ADAPTER_MINIFY === "0") {
     return { minified: false, reason: "disabled via CREEK_ADAPTER_MINIFY=0" };
   }
-  let transform: typeof import("esbuild").transform;
+  // Structurally typed: esbuild is not a direct dependency (only wrangler's
+  // transitive copy), so it has no type declarations to import. Declare just
+  // the slice of the transform() signature we call.
+  type EsbuildTransform = (
+    input: string,
+    options: {
+      minify: boolean;
+      format: "esm";
+      target: string;
+      legalComments: "none";
+      logLevel: "silent";
+    },
+  ) => Promise<{ code: string }>;
+  let transform: EsbuildTransform;
   try {
     const wranglerRequire = createRequire(requireFn.resolve("wrangler/package.json"));
-    ({ transform } = wranglerRequire("esbuild") as typeof import("esbuild"));
+    ({ transform } = wranglerRequire("esbuild") as { transform: EsbuildTransform });
   } catch (err) {
     return { minified: false, reason: `esbuild unresolvable: ${err}` };
   }
