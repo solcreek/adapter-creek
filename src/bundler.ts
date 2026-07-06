@@ -48,6 +48,54 @@ export async function resolveWranglerEntry(
   return path.join(path.dirname(pkgPath), binRel);
 }
 
+/**
+ * Minify the final worker.js in place with a standalone esbuild pass.
+ *
+ * Wrangler's dry-run bundle is unminified, and the adapter's glue layer
+ * alone runs tens of MB on a mid-size Next.js app — enough to blow the
+ * 50MB deploy limit even though Next's own chunks are already minified.
+ * Minifying cannot happen during the wrangler step: every regex patch in
+ * the post-processing block below matches the unminified output, so this
+ * runs last, on the fully patched worker (~30MB → ~24MB in practice).
+ *
+ * esbuild is not a direct dependency — it is resolved from the copy
+ * wrangler ships. Minification is an optimization: any failure (esbuild
+ * unresolvable, parse error) ships the unminified worker instead of
+ * failing the build. Set CREEK_ADAPTER_MINIFY=0 to opt out, e.g. when
+ * debugging the emitted worker.
+ *
+ * Exported for tests.
+ */
+export async function minifyWorker(
+  workerPath: string,
+  requireFn: Pick<NodeRequire, "resolve">,
+): Promise<{ minified: boolean; reason?: string }> {
+  if (process.env.CREEK_ADAPTER_MINIFY === "0") {
+    return { minified: false, reason: "disabled via CREEK_ADAPTER_MINIFY=0" };
+  }
+  let transform: typeof import("esbuild").transform;
+  try {
+    const wranglerRequire = createRequire(requireFn.resolve("wrangler/package.json"));
+    ({ transform } = wranglerRequire("esbuild") as typeof import("esbuild"));
+  } catch (err) {
+    return { minified: false, reason: `esbuild unresolvable: ${err}` };
+  }
+  try {
+    const code = await fs.readFile(workerPath, "utf-8");
+    const result = await transform(code, {
+      minify: true,
+      format: "esm",
+      target: "es2022",
+      legalComments: "none",
+      logLevel: "silent",
+    });
+    await fs.writeFile(workerPath, result.code);
+    return { minified: true };
+  } catch (err) {
+    return { minified: false, reason: `esbuild transform failed: ${err}` };
+  }
+}
+
 export interface BundleOptions {
   workerSource: string;
   outputDir: string;
@@ -1393,6 +1441,21 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
 
     await fs.writeFile(workerPath, workerCode);
   } catch {}
+
+  // Minify last — after every regex patch above has run against the
+  // unminified output. See minifyWorker for why this is a separate pass.
+  {
+    const before = (await fs.stat(workerPath).catch(() => null))?.size ?? 0;
+    const outcome = await minifyWorker(workerPath, adapterRequire);
+    if (outcome.minified) {
+      const after = (await fs.stat(workerPath).catch(() => null))?.size ?? 0;
+      console.log(
+        `  [Creek Adapter] worker.js minified: ${(before / 1024 / 1024).toFixed(1)}MB → ${(after / 1024 / 1024).toFixed(1)}MB`,
+      );
+    } else if (outcome.reason && process.env.CREEK_ADAPTER_MINIFY !== "0") {
+      console.warn(`  [Creek Adapter] worker.js left unminified (${outcome.reason})`);
+    }
+  }
 
   // Emit wrangler.toml that covers both local dev (workerd via wrangler dev)
   // and \`wrangler deploy\`. Dev and prod MUST share the same config so

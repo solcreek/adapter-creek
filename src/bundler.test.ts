@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import {
+  minifyWorker,
   patchAppPageRevalidationPostponedState,
   patchNullFallbackPartialShellBlocking,
   patchUseCachePrerenderDanglingPromiseBailout,
@@ -183,5 +184,84 @@ describe("patchAppPageRevalidationPostponedState", () => {
     expect(output).toContain("__creekRevalidationPostponedState");
     expect(output).toContain('e2.value.kind==="APP_PAGE"');
     expect(output).toContain("q2=e2.value.postponed");
+  });
+});
+
+describe("minifyWorker", () => {
+  let workDir: string;
+  const selfRequire = createRequire(import.meta.url);
+
+  beforeEach(() => {
+    workDir = mkdtempSync(path.join(realpathSync(tmpdir()), "adapter-creek-minify-"));
+  });
+
+  afterEach(() => {
+    rmSync(workDir, { recursive: true, force: true });
+    delete process.env.CREEK_ADAPTER_MINIFY;
+  });
+
+  // B9 regression: the wrangler dry-run bundle ships unminified and the
+  // glue layer alone can blow the 50MB deploy limit. The final worker
+  // must go through a real esbuild minify pass.
+  it("minifies worker.js in place via wrangler's esbuild", async () => {
+    const workerPath = path.join(workDir, "worker.js");
+    const verbose =
+      "// a comment that must not survive\n" +
+      "export function handler ( request ) {\n" +
+      "  const   greeting   =   'hello' ;\n" +
+      "  /* block comment */\n" +
+      "  return greeting + String( request ) ;\n" +
+      "}\n";
+    writeFileSync(workerPath, verbose);
+
+    const outcome = await minifyWorker(workerPath, selfRequire);
+
+    expect(outcome).toEqual({ minified: true });
+    const output = readFileSync(workerPath, "utf-8");
+    expect(output.length).toBeLessThan(verbose.length);
+    expect(output).not.toContain("block comment");
+    expect(output).toContain("export"); // still ESM
+  });
+
+  it("is a no-op when CREEK_ADAPTER_MINIFY=0", async () => {
+    const workerPath = path.join(workDir, "worker.js");
+    const source = "export const x = 1;  // keep me\n";
+    writeFileSync(workerPath, source);
+    process.env.CREEK_ADAPTER_MINIFY = "0";
+
+    const outcome = await minifyWorker(workerPath, selfRequire);
+
+    expect(outcome.minified).toBe(false);
+    expect(outcome.reason).toMatch(/CREEK_ADAPTER_MINIFY=0/);
+    expect(readFileSync(workerPath, "utf-8")).toBe(source);
+  });
+
+  it("ships unminified instead of failing when esbuild is unresolvable", async () => {
+    const workerPath = path.join(workDir, "worker.js");
+    const source = "export const x = 1;\n";
+    writeFileSync(workerPath, source);
+    const brokenRequire = {
+      resolve: () => {
+        throw new Error("Cannot find module 'wrangler/package.json'");
+      },
+    } as unknown as Pick<NodeRequire, "resolve">;
+
+    const outcome = await minifyWorker(workerPath, brokenRequire);
+
+    expect(outcome.minified).toBe(false);
+    expect(outcome.reason).toMatch(/esbuild unresolvable/);
+    expect(readFileSync(workerPath, "utf-8")).toBe(source);
+  });
+
+  it("ships unminified instead of failing on unparseable output", async () => {
+    const workerPath = path.join(workDir, "worker.js");
+    const source = "export const = broken syntax {{{\n";
+    writeFileSync(workerPath, source);
+
+    const outcome = await minifyWorker(workerPath, selfRequire);
+
+    expect(outcome.minified).toBe(false);
+    expect(outcome.reason).toMatch(/transform failed/);
+    expect(readFileSync(workerPath, "utf-8")).toBe(source);
   });
 });
