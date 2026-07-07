@@ -69,11 +69,12 @@ node -e "
 " "$TARBALL"
 (cd .creek && npm install --no-audit --no-fund --ignore-scripts)
 
-# wrangler is a runtime dependency of the adapter, so it lands in the .creek
-# lazy-install tree at a pinned version — use that binary rather than a
-# floating `npx wrangler` download so the gate exercises a known toolchain.
+# wrangler is a runtime dependency of the adapter, so it's resolved from the
+# adapter's own .creek dependency tree — use that binary rather than a floating
+# `npx wrangler` download so the gate exercises the same wrangler a real deploy
+# would, not whatever npx fetches.
 WRANGLER="$APP/.creek/node_modules/.bin/wrangler"
-test -x "$WRANGLER" || fail "pinned wrangler not found at $WRANGLER"
+test -x "$WRANGLER" || fail "wrangler not found in the adapter's .creek dependency tree at $WRANGLER"
 
 ADAPTER_PATH="$(node -e "
   const { createRequire } = require('node:module');
@@ -144,6 +145,9 @@ if echo "$BODY" | grep -q "PRISMA_D1_FAIL"; then
   fail "Prisma-D1 query broke at runtime (the 0.2.13-class regression): $BODY"
 fi
 [ "$CODE" = "200" ] || fail "expected HTTP 200 from $ROUTE, got $CODE"
-echo "$BODY" | grep -q '"ok":true' || fail "route did not report ok:true — body: $BODY"
+# Parse the JSON and assert ok === true — robust to whitespace / key ordering,
+# unlike a substring grep for `"ok":true`.
+node -e 'process.exit(JSON.parse(process.argv[1]).ok === true ? 0 : 1)' "$BODY" \
+  || fail "route did not report ok:true — body: $BODY"
 
 log "PASS — Prisma-D1 route constructed and served 200 in workerd"

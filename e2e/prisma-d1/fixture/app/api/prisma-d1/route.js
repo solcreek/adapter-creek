@@ -12,7 +12,11 @@ export async function GET() {
     // same path Better Auth's getSession uses (session.findFirst).
     await prisma.note.create({ data: { text: "pong" } });
     const notes = await prisma.note.findMany({ take: 1 });
-    return Response.json({ ok: true, note: notes?.[0]?.text ?? null, hasAuth: typeof auth?.api?.getSession });
+    return Response.json({
+      ok: true,
+      note: notes?.[0]?.text ?? null,
+      hasAuth: typeof auth?.api?.getSession === "function",
+    });
   } catch (e) {
     return new Response(`PRISMA_D1_FAIL: ${e?.message ?? e}`, { status: 500 });
   }
