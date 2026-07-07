@@ -77,6 +77,61 @@ async function collectPrismaCompilerWasm(
 }
 
 /**
+ * Content-dedup a wasm file map in place. The Prisma query-compiler can be
+ * collected twice under different names — Next.js traces it as
+ * `query_compiler_fast_bg.wasm` while `collectPrismaCompilerWasm` stages the
+ * identical bytes as `query_compiler_fast_bg.sqlite.wasm`. They hash to the
+ * same content, so shipping both wastes ~3.5MB of the size-capped bundle on
+ * every deploy. Keep one file per unique payload, preferring `prismaWasmDest`
+ * (the staged name the sentinel redirect references). Returns the count dropped.
+ *
+ * Exported for tests.
+ */
+export async function dedupeWasmByContent(
+  wasmFiles: Map<string, string>,
+  prismaWasmDest: string | null,
+): Promise<number> {
+  let dropped = 0;
+  try {
+    const { xxh3 } = await import("@node-rs/xxhash");
+    const keptByHash = new Map<string, string>(); // content hash -> kept name
+    for (const [name, absPath] of [...wasmFiles]) {
+      let hex: string;
+      try {
+        hex = xxh3.xxh128(await fs.readFile(absPath)).toString(16).padStart(32, "0");
+      } catch {
+        // Can't read this one to hash it — skip dedup for it only. It stays in
+        // wasmFiles; if it's genuinely unreadable, the later copy step surfaces
+        // that (we don't silently treat it as handled overall here).
+        continue;
+      }
+      const kept = keptByHash.get(hex);
+      if (kept === undefined) {
+        keptByHash.set(hex, name);
+      } else if (name === prismaWasmDest && kept !== prismaWasmDest) {
+        // Staged Prisma wasm wins over an earlier-seen duplicate.
+        wasmFiles.delete(kept);
+        keptByHash.set(hex, name);
+        dropped++;
+        console.log(`  [Creek Adapter] wasm dedup: dropped ${kept} (identical to ${name})`);
+      } else {
+        wasmFiles.delete(name);
+        dropped++;
+        console.log(`  [Creek Adapter] wasm dedup: dropped ${name} (identical to ${kept})`);
+      }
+    }
+  } catch (err) {
+    // Dedup is a size optimization, not correctness — never fail the build on
+    // it. But warn why it didn't run (e.g. @node-rs/xxhash unavailable): the
+    // silent symptom would be an oversized bundle with the B11 duplicate back.
+    console.warn(
+      `  [Creek Adapter] wasm dedup skipped: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  return dropped;
+}
+
+/**
  * Decoded byte length of the Prisma base64 sentinel stub
  * (src/shims/prisma-wasm-base64-stub.mjs). The generated client constructs
  * `new WebAssembly.Module(<sentinel bytes>)`; registering the precompiled
@@ -186,6 +241,11 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // unchanged: its base64-embedded compiler is precompiled here and swapped in
   // at runtime by the worker-entry WebAssembly.Module patch. No-op otherwise.
   const prismaWasmDest = await collectPrismaCompilerWasm(ctx.projectDir, outputDir, wasmFiles);
+
+  // Content-dedup the collected wasm — the Prisma query-compiler can arrive
+  // twice under different names (see dedupeWasmByContent), wasting ~3.5MB of
+  // the size-capped bundle every deploy.
+  await dedupeWasmByContent(wasmFiles, prismaWasmDest);
 
   // Step 3: Collect manifests from .next/ for embedding in the worker.
   // Next.js route modules call loadManifest() which uses fs.readFileSync().
