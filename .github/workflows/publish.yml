@@ -57,9 +57,22 @@ jobs:
 
       # The publish gate for the 0.2.13-class regression: unit tests pass but the
       # emitted worker can still break at runtime. Build the Prisma-on-D1 fixture
-      # and assert its D1 route returns 200 in workerd BEFORE publishing.
-      - name: E2E — Prisma-on-D1 runtime gate
+      # and assert its D1 route returns 200 in workerd BEFORE publishing — for
+      # both minify off (the default) and on (the opt-in worker.js minify).
+      - name: E2E — Prisma-on-D1 runtime gate (minify off)
         run: e2e/prisma-d1/run.sh
+        env:
+          E2E_MINIFY: '0'  # explicit, so a leaked env can't minify the "off" leg
+          E2E_PORT: '8799'
+
+      - name: E2E — Prisma-on-D1 runtime gate (minify on)
+        run: e2e/prisma-d1/run.sh
+        env:
+          E2E_MINIFY: '1'
+          # Distinct port from the off leg: these two run sequentially in one
+          # job, and run.sh's trap-kill of wrangler doesn't wait for the port to
+          # be released, so reusing 8799 could flake with "address already in use".
+          E2E_PORT: '8800'
 
       # Use `npm publish` rather than `pnpm publish` — npm has the most
       # mature OIDC trusted-publishing implementation, and pnpm just

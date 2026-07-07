@@ -38,10 +38,18 @@ jobs:
   # the D1 route returns 200. Separate from the matrix because it's much slower
   # (real Next build + wrangler dev) and needs network. Catches runtime-only
   # regressions (e.g. the 0.2.13 minify break) that typecheck/test/build miss.
+  # Runs both minify modes: off (the default) AND on (the opt-in worker.js
+  # minify), so a minify pass that corrupts the Prisma-D1 interop can't slip in.
   prisma-d1-e2e:
-    name: prisma-d1-e2e
+    name: prisma-d1-e2e (minify ${{ matrix.label }})
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { minify: '0', label: 'off' }
+          - { minify: '1', label: 'on' }
     steps:
       - uses: actions/checkout@v6
 
@@ -53,3 +61,5 @@ jobs:
 
       - name: Prisma-on-D1 runtime gate
         run: e2e/prisma-d1/run.sh
+        env:
+          E2E_MINIFY: ${{ matrix.minify }}
