@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { collectManifests, countNativeModuleRefs } from "./build.js";
+import { collectManifests, countNativeModuleRefs, dedupeWasmByContent } from "./build.js";
 
 // Regression for the misleading "N native modules" hint: an oversized bundle
 // whose real cause was a stale `.next/dev` reported dozens of phantom natives
@@ -77,5 +77,60 @@ describe("collectManifests", () => {
     const m = await collectManifests(distDir);
     const keys = Object.keys(m).map((k) => path.relative(distDir, k));
     expect(keys.some((k) => k.startsWith("static/") || k.startsWith("cache/"))).toBe(false);
+  });
+});
+
+describe("dedupeWasmByContent", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "wasm-dedup-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  function write(name: string, bytes: Buffer): [string, string] {
+    const p = path.join(dir, name);
+    writeFileSync(p, bytes);
+    return [name, p];
+  }
+
+  it("drops the duplicate-byte wasm, keeping the staged Prisma name", async () => {
+    // The real B11 case: Next traces query_compiler_fast_bg.wasm (added first),
+    // collectPrismaCompilerWasm stages identical bytes as …sqlite.wasm (last).
+    const prismaBytes = Buffer.from("PRISMA_QUERY_COMPILER_BYTES");
+    const wasmFiles = new Map([
+      write("query_compiler_fast_bg.wasm", prismaBytes),
+      write("resvg.wasm", Buffer.from("A_DIFFERENT_WASM")),
+      write("query_compiler_fast_bg.sqlite.wasm", prismaBytes),
+    ]);
+
+    const dropped = await dedupeWasmByContent(wasmFiles, "query_compiler_fast_bg.sqlite.wasm");
+
+    expect(dropped).toBe(1);
+    expect([...wasmFiles.keys()].sort()).toEqual([
+      "query_compiler_fast_bg.sqlite.wasm",
+      "resvg.wasm",
+    ]);
+  });
+
+  it("keeps the first-seen when neither duplicate is the staged Prisma wasm", async () => {
+    const bytes = Buffer.from("SAME_BYTES");
+    const wasmFiles = new Map([write("a.wasm", bytes), write("b.wasm", bytes)]);
+
+    const dropped = await dedupeWasmByContent(wasmFiles, null);
+
+    expect(dropped).toBe(1);
+    expect([...wasmFiles.keys()]).toEqual(["a.wasm"]);
+  });
+
+  it("leaves distinct-content wasm untouched", async () => {
+    const wasmFiles = new Map([
+      write("x.wasm", Buffer.from("XXXX")),
+      write("y.wasm", Buffer.from("YYYY")),
+    ]);
+
+    const dropped = await dedupeWasmByContent(wasmFiles, null);
+
+    expect(dropped).toBe(0);
+    expect(wasmFiles.size).toBe(2);
   });
 });
