@@ -18,12 +18,29 @@ release instead of shipping. It serves the emitted `worker.js` via
 `wrangler dev --no-bundle`, so it tests the exact artifact WfP uploads (not a
 wrangler re-bundle).
 
+## Minify modes
+
+The gate runs **both** ways (CI matrix + both steps in `publish.yml`):
+
+- **minify off** — the default since 0.2.14.
+- **minify on** — `E2E_MINIFY=1` sets `CREEK_ADAPTER_MINIFY=1`, exercising the
+  opt-in worker.js minify pass and asserting the same 200. This is the
+  "Prisma-D1 e2e test" that `minifyWorker` was waiting on: it proves the
+  minify pass doesn't reproduce the 0.2.13 interop break on this path, and
+  guards it going forward. On this fixture minify shrinks worker.js ~5.2MB →
+  3.3MB (−36%).
+
+Minify stays **opt-in** (default off): it is validated safe here, but 0.2.13
+showed a real app can break where a fixture doesn't, so we don't flip the
+default — the switch is for someone who verifies their own worker end-to-end
+(this gate now makes that safe to recommend).
+
 ## Status / known limitation
 
-This gate does NOT currently reproduce the specific 0.2.13 regression
-("PrismaD1 is not a constructor"). That break was minifier-input-dependent:
-it did not manifest here even with the customer's exact package versions,
+This gate does NOT reproduce the *specific* 0.2.13 failure
+("PrismaD1 is not a constructor") — that break was minifier-input-dependent
+and did not manifest here even with the customer's exact package versions,
 Better Auth in the bundle, the model-query path, and 0.2.13's byte-identical
-minify pass. It appears to require the fuller module graph of a real
-production app. This fixture is therefore a general Prisma-D1-on-workerd smoke
-test and a foundation to extend, not yet a reproduction of that bug.
+minify pass; it appears to need the fuller module graph of a real production
+app. So this is a general Prisma-D1-on-workerd runtime gate (now covering both
+minify modes), not a reproduction of that one bug.

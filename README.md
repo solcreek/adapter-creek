@@ -107,6 +107,18 @@ Output goes to `.creek/adapter-output/`:
   assets/ …
 ```
 
+### Opt-in worker minify
+
+`CREEK_ADAPTER_MINIFY=1` minifies the emitted `worker.js` (typically ~35%
+smaller — useful when a dependency-heavy app approaches the bundle size limit).
+
+**Off by default.** 0.2.13 shipped it on and broke Prisma driver-adapter apps at
+runtime (`PrismaD1 is not a constructor`). It's now covered by a Prisma-on-D1
+runtime e2e gate that runs in **both** modes (see `e2e/prisma-d1`), so the
+minify pass is verified against that break on every publish — but the default
+stays off, because a real app can still hit an edge a fixture doesn't. Enable it
+when you've verified your own deploy end-to-end.
+
 ## How It Works
 
 ```

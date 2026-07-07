@@ -30,6 +30,18 @@ ROUTE="/api/prisma-d1"
 # dependency tree below, not a floating `npx` download.
 export WRANGLER_SEND_METRICS=false
 
+# Minify mode. Default OFF (the safe default shipped since 0.2.14). Set
+# E2E_MINIFY=1 to exercise the opt-in minify pass (CREEK_ADAPTER_MINIFY) so the
+# gate proves minify-ON *also* serves Prisma-D1 — i.e. it does not reproduce the
+# 0.2.13 "PrismaD1 is not a constructor" runtime break. Same 200 assertion both
+# ways; the adapter logs the size reduction.
+if [ "${E2E_MINIFY:-0}" = "1" ]; then
+  export CREEK_ADAPTER_MINIFY=1
+  MINIFY_MODE="ON (CREEK_ADAPTER_MINIFY=1)"
+else
+  MINIFY_MODE="off (default)"
+fi
+
 log() { printf '\n\033[1m[e2e:prisma-d1] %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[31m[e2e:prisma-d1] FAIL: %s\033[0m\n' "$*" >&2; exit 1; }
 
@@ -83,10 +95,9 @@ ADAPTER_PATH="$(node -e "
     .resolve('@solcreek/adapter-creek'));
 ")"
 
-# Default build path: minify is OFF by default (that's the fix). The gate
-# asserts the DEFAULT build serves the D1 route, so any future change that
-# breaks the default Prisma-D1 path is caught before publish.
-log "Building fixture with the adapter (default settings)"
+# The gate asserts the built worker serves the D1 route, so any future change
+# that breaks the Prisma-D1 path (minify off OR on) is caught before publish.
+log "Building fixture with the adapter — minify $MINIFY_MODE"
 NEXT_ADAPTER_PATH="$ADAPTER_PATH" npx next build --webpack
 
 SERVER_DIR="$APP/.creek/adapter-output/server"
