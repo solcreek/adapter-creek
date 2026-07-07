@@ -200,10 +200,22 @@ describe("minifyWorker", () => {
     delete process.env.CREEK_ADAPTER_MINIFY;
   });
 
-  // B9 regression: the wrangler dry-run bundle ships unminified and the
-  // glue layer alone can blow the 50MB deploy limit. The final worker
-  // must go through a real esbuild minify pass.
-  it("minifies worker.js in place via wrangler's esbuild", async () => {
+  // Off by default: 0.2.13 shipped minify ON and broke Prisma-D1 apps at
+  // runtime, so nothing minifies unless a build explicitly opts in.
+  it("is off by default (no opt-in) and leaves the worker untouched", async () => {
+    const workerPath = path.join(workDir, "worker.js");
+    const source = "export const x = 1;  // keep me\n";
+    writeFileSync(workerPath, source);
+
+    const outcome = await minifyWorker(workerPath, selfRequire);
+
+    expect(outcome.minified).toBe(false);
+    expect(outcome.reason).toMatch(/off by default/);
+    expect(readFileSync(workerPath, "utf-8")).toBe(source);
+  });
+
+  it("minifies in place when opted in via CREEK_ADAPTER_MINIFY=1", async () => {
+    process.env.CREEK_ADAPTER_MINIFY = "1";
     const workerPath = path.join(workDir, "worker.js");
     const verbose =
       "// a comment that must not survive\n" +
@@ -223,20 +235,8 @@ describe("minifyWorker", () => {
     expect(output).toContain("export"); // still ESM
   });
 
-  it("is a no-op when CREEK_ADAPTER_MINIFY=0", async () => {
-    const workerPath = path.join(workDir, "worker.js");
-    const source = "export const x = 1;  // keep me\n";
-    writeFileSync(workerPath, source);
-    process.env.CREEK_ADAPTER_MINIFY = "0";
-
-    const outcome = await minifyWorker(workerPath, selfRequire);
-
-    expect(outcome.minified).toBe(false);
-    expect(outcome.reason).toMatch(/CREEK_ADAPTER_MINIFY=0/);
-    expect(readFileSync(workerPath, "utf-8")).toBe(source);
-  });
-
   it("ships unminified instead of failing when esbuild is unresolvable", async () => {
+    process.env.CREEK_ADAPTER_MINIFY = "1";
     const workerPath = path.join(workDir, "worker.js");
     const source = "export const x = 1;\n";
     writeFileSync(workerPath, source);
@@ -254,6 +254,7 @@ describe("minifyWorker", () => {
   });
 
   it("ships unminified instead of failing on unparseable output", async () => {
+    process.env.CREEK_ADAPTER_MINIFY = "1";
     const workerPath = path.join(workDir, "worker.js");
     const source = "export const = broken syntax {{{\n";
     writeFileSync(workerPath, source);

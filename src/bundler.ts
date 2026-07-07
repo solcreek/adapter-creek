@@ -51,18 +51,23 @@ export async function resolveWranglerEntry(
 /**
  * Minify the final worker.js in place with a standalone esbuild pass.
  *
- * Wrangler's dry-run bundle is unminified, and the adapter's glue layer
- * alone runs tens of MB on a mid-size Next.js app — enough to blow the
- * 50MB deploy limit even though Next's own chunks are already minified.
- * Minifying cannot happen during the wrangler step: every regex patch in
- * the post-processing block below matches the unminified output, so this
- * runs last, on the fully patched worker (~30MB → ~24MB in practice).
+ * OFF BY DEFAULT — opt in with CREEK_ADAPTER_MINIFY=1.
  *
- * esbuild is not a direct dependency — it is resolved from the copy
- * wrangler ships. Minification is an optimization: any failure (esbuild
- * unresolvable, parse error) ships the unminified worker instead of
- * failing the build. Set CREEK_ADAPTER_MINIFY=0 to opt out, e.g. when
- * debugging the emitted worker.
+ * Re-minifying the already-bundled, regex-patched worker is unsafe: 0.2.13
+ * shipped this ON by default and broke Prisma driver-adapter apps at runtime
+ * ("PrismaD1 is not a constructor" — the minified `__toESM` interop moved the
+ * export onto `.default`), taking down every D1-backed page. It's a subtle
+ * interaction between esbuild's minify, the adapter's own `__toESM` patch, and
+ * `@prisma/adapter-d1`'s namespace shape that plain minify of a simple bundle
+ * doesn't reproduce — so it must not run by default. The 50MB-limit motivation
+ * (a mid-size worker's unminified glue layer) is real but far rarer than the
+ * breakage; the proper fix is bundle-time minify with a Prisma-D1 e2e test,
+ * tracked separately. Until then, opt-in only, for someone who can verify the
+ * emitted worker end-to-end.
+ *
+ * esbuild is not a direct dependency — it is resolved from the copy wrangler
+ * ships. Even when enabled, any failure (esbuild unresolvable, parse error)
+ * ships the unminified worker rather than failing the build.
  *
  * Exported for tests.
  */
@@ -70,8 +75,8 @@ export async function minifyWorker(
   workerPath: string,
   requireFn: Pick<NodeRequire, "resolve">,
 ): Promise<{ minified: boolean; reason?: string }> {
-  if (process.env.CREEK_ADAPTER_MINIFY === "0") {
-    return { minified: false, reason: "disabled via CREEK_ADAPTER_MINIFY=0" };
+  if (process.env.CREEK_ADAPTER_MINIFY !== "1") {
+    return { minified: false, reason: "off by default (set CREEK_ADAPTER_MINIFY=1 to opt in)" };
   }
   // Structurally typed: esbuild is not a direct dependency (only wrangler's
   // transitive copy), so it has no type declarations to import. Declare just
@@ -1455,9 +1460,10 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     await fs.writeFile(workerPath, workerCode);
   } catch {}
 
-  // Minify last — after every regex patch above has run against the
-  // unminified output. See minifyWorker for why this is a separate pass.
-  {
+  // Optional, opt-in minify (CREEK_ADAPTER_MINIFY=1). Runs last, after every
+  // regex patch above has matched the unminified output. Off by default —
+  // see minifyWorker for why. Only warn when it was asked for but couldn't run.
+  if (process.env.CREEK_ADAPTER_MINIFY === "1") {
     const before = (await fs.stat(workerPath).catch(() => null))?.size ?? 0;
     const outcome = await minifyWorker(workerPath, adapterRequire);
     if (outcome.minified) {
@@ -1465,7 +1471,7 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       console.log(
         `  [Creek Adapter] worker.js minified: ${(before / 1024 / 1024).toFixed(1)}MB → ${(after / 1024 / 1024).toFixed(1)}MB`,
       );
-    } else if (outcome.reason && process.env.CREEK_ADAPTER_MINIFY !== "0") {
+    } else if (outcome.reason) {
       console.warn(`  [Creek Adapter] worker.js left unminified (${outcome.reason})`);
     }
   }
