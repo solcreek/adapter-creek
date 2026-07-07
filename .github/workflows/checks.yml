@@ -33,3 +33,23 @@ jobs:
 
       - name: pnpm ${{ matrix.script }}
         run: pnpm ${{ matrix.script }}
+
+  # Runtime gate: build the Prisma-on-D1 fixture and run it in workerd, asserting
+  # the D1 route returns 200. Separate from the matrix because it's much slower
+  # (real Next build + wrangler dev) and needs network. Catches runtime-only
+  # regressions (e.g. the 0.2.13 minify break) that typecheck/test/build miss.
+  prisma-d1-e2e:
+    name: prisma-d1-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/install-dependencies
+        with:
+          # Match publish.yml (Node 24) so a green PR check can't diverge from
+          # the publish-time gate — Prisma/Next/wrangler are Node-version sensitive.
+          node-version: '24'
+
+      - name: Prisma-on-D1 runtime gate
+        run: e2e/prisma-d1/run.sh

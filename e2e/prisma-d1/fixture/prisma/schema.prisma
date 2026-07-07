@@ -1,0 +1,13 @@
+// Prisma 7 driver-adapter schema. No datasource url (Prisma 7 moved it to the
+// client constructor / config). The generated client is TS under ./generated.
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+datasource db {
+  provider = "sqlite"
+}
+model Note {
+  id   Int    @id @default(autoincrement())
+  text String
+}
