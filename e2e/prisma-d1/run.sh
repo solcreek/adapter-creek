@@ -25,6 +25,11 @@ FIXTURE_DIR="$REPO_ROOT/e2e/prisma-d1/fixture"
 PORT="${E2E_PORT:-8799}"
 ROUTE="/api/prisma-d1"
 
+# CI robustness: no interactive metrics prompt from wrangler (would hang a
+# non-TTY run). The wrangler binary itself is taken from the adapter's pinned
+# dependency below, not a floating `npx` download.
+export WRANGLER_SEND_METRICS=false
+
 log() { printf '\n\033[1m[e2e:prisma-d1] %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[31m[e2e:prisma-d1] FAIL: %s\033[0m\n' "$*" >&2; exit 1; }
 
@@ -64,6 +69,12 @@ node -e "
 " "$TARBALL"
 (cd .creek && npm install --no-audit --no-fund --ignore-scripts)
 
+# wrangler is a runtime dependency of the adapter, so it lands in the .creek
+# lazy-install tree at a pinned version — use that binary rather than a
+# floating `npx wrangler` download so the gate exercises a known toolchain.
+WRANGLER="$APP/.creek/node_modules/.bin/wrangler"
+test -x "$WRANGLER" || fail "pinned wrangler not found at $WRANGLER"
+
 ADAPTER_PATH="$(node -e "
   const { createRequire } = require('node:module');
   const { join } = require('node:path');
@@ -95,12 +106,15 @@ TOML
 
 log "Seeding the Note table into the local D1 (model queries need it)"
 cd "$SERVER_DIR"
-npx wrangler d1 execute e2e-prisma-d1 --local \
+"$WRANGLER" d1 execute e2e-prisma-d1 --local \
   --command "CREATE TABLE IF NOT EXISTS Note (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL)" \
   >"$WORK/seed.log" 2>&1 || { cat "$WORK/seed.log" >&2; fail "could not seed local D1"; }
 
 log "Starting workerd via wrangler dev on :$PORT"
-npx wrangler dev --port "$PORT" >"$WORK/wrangler.log" 2>&1 &
+# --no-bundle: serve the adapter's EMITTED worker.js as-is (matching the
+# WfP upload path, which does not re-bundle), so the gate tests the real
+# artifact rather than a wrangler re-bundle that could mask emitted-bundle bugs.
+"$WRANGLER" dev --port "$PORT" --no-bundle >"$WORK/wrangler.log" 2>&1 &
 WRANGLER_PID=$!
 
 log "Waiting for the worker to come up"

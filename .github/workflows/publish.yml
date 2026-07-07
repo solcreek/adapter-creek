@@ -28,7 +28,9 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Includes the Prisma-on-D1 runtime e2e below, which builds a fixture and
+    # runs it in workerd — much slower than the unit tests.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
 
@@ -52,6 +54,12 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      # The publish gate for the 0.2.13-class regression: unit tests pass but the
+      # emitted worker can still break at runtime. Build the Prisma-on-D1 fixture
+      # and assert its D1 route returns 200 in workerd BEFORE publishing.
+      - name: E2E — Prisma-on-D1 runtime gate
+        run: e2e/prisma-d1/run.sh
 
       # Use `npm publish` rather than `pnpm publish` — npm has the most
       # mature OIDC trusted-publishing implementation, and pnpm just
