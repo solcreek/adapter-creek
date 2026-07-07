@@ -61,6 +61,8 @@ jobs:
       # both minify off (the default) and on (the opt-in worker.js minify).
       - name: E2E — Prisma-on-D1 runtime gate (minify off)
         run: e2e/prisma-d1/run.sh
+        env:
+          E2E_MINIFY: '0'  # explicit, so a leaked env can't minify the "off" leg
 
       - name: E2E — Prisma-on-D1 runtime gate (minify on)
         run: e2e/prisma-d1/run.sh

@@ -30,13 +30,18 @@ ROUTE="/api/prisma-d1"
 # dependency tree below, not a floating `npx` download.
 export WRANGLER_SEND_METRICS=false
 
-# Minify mode. Default OFF (the safe default shipped since 0.2.14). Set
-# E2E_MINIFY=1 to exercise the opt-in minify pass (CREEK_ADAPTER_MINIFY) so the
-# gate proves minify-ON *also* serves Prisma-D1 — i.e. it does not reproduce the
-# 0.2.13 "PrismaD1 is not a constructor" runtime break. Same 200 assertion both
-# ways; the adapter logs the size reduction.
-if [ "${E2E_MINIFY:-0}" = "1" ]; then
-  export CREEK_ADAPTER_MINIFY=1
+# Minify mode. Default OFF (the safe default shipped since 0.2.14). E2E_MINIFY,
+# when set, is the AUTHORITATIVE control: it forces CREEK_ADAPTER_MINIFY on/off
+# so neither gate leg can be corrupted by an inherited env (a leaked
+# CREEK_ADAPTER_MINIFY=1 must not silently minify the "off" run). When E2E_MINIFY
+# is unset, a directly-set CREEK_ADAPTER_MINIFY is honored (matches the docs'
+# `CREEK_ADAPTER_MINIFY=1 run.sh` invocation). The log reflects the resolved mode.
+# minify-ON proves the pass also serves Prisma-D1 — it does not reproduce the
+# 0.2.13 "PrismaD1 is not a constructor" break. Same 200 assertion both ways.
+if [ -n "${E2E_MINIFY:-}" ]; then
+  [ "$E2E_MINIFY" = "1" ] && export CREEK_ADAPTER_MINIFY=1 || export CREEK_ADAPTER_MINIFY=0
+fi
+if [ "${CREEK_ADAPTER_MINIFY:-0}" = "1" ]; then
   MINIFY_MODE="ON (CREEK_ADAPTER_MINIFY=1)"
 else
   MINIFY_MODE="off (default)"
