@@ -26,8 +26,8 @@ PORT="${E2E_PORT:-8799}"
 ROUTE="/api/prisma-d1"
 
 # CI robustness: no interactive metrics prompt from wrangler (would hang a
-# non-TTY run). The wrangler binary itself is taken from the adapter's pinned
-# dependency below, not a floating `npx` download.
+# non-TTY run). The wrangler binary itself is resolved from the adapter's .creek
+# dependency tree below, not a floating `npx` download.
 export WRANGLER_SEND_METRICS=false
 
 log() { printf '\n\033[1m[e2e:prisma-d1] %s\033[0m\n' "$*"; }

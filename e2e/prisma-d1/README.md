@@ -8,8 +8,9 @@ returns 200**. Unlike `e2e/lazy-install` (which only checks that `worker.js`
 was produced), this executes the worker, so it catches runtime-only breakage
 in the Prisma-on-D1 path.
 
-Run: `e2e/prisma-d1/run.sh` (needs network; wrangler comes from the adapter's
-pinned dependency). Opt into the minify pass with `CREEK_ADAPTER_MINIFY=1`.
+Run: `e2e/prisma-d1/run.sh` (needs network; wrangler is resolved from the
+adapter's own dependency tree via the `.creek` lazy-install, not `npx`). Opt
+into the minify pass with `CREEK_ADAPTER_MINIFY=1`.
 
 **CI:** this gate runs in `checks.yml` (every PR + push to `main`) and again in
 `publish.yml` right before `npm publish`, so a runtime regression blocks the
