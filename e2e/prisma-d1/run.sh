@@ -30,25 +30,32 @@ ROUTE="/api/prisma-d1"
 # dependency tree below, not a floating `npx` download.
 export WRANGLER_SEND_METRICS=false
 
+log() { printf '\n\033[1m[e2e:prisma-d1] %s\033[0m\n' "$*"; }
+fail() { printf '\n\033[31m[e2e:prisma-d1] FAIL: %s\033[0m\n' "$*" >&2; exit 1; }
+
 # Minify mode. Default OFF (the safe default shipped since 0.2.14). E2E_MINIFY,
 # when set, is the AUTHORITATIVE control: it forces CREEK_ADAPTER_MINIFY on/off
 # so neither gate leg can be corrupted by an inherited env (a leaked
-# CREEK_ADAPTER_MINIFY=1 must not silently minify the "off" run). When E2E_MINIFY
-# is unset, a directly-set CREEK_ADAPTER_MINIFY is honored (matches the docs'
+# CREEK_ADAPTER_MINIFY=1 must not silently minify the "off" run), and an invalid
+# value fails fast rather than quietly defaulting to off. When E2E_MINIFY is
+# unset, a directly-set CREEK_ADAPTER_MINIFY is honored (matches the docs'
 # `CREEK_ADAPTER_MINIFY=1 run.sh` invocation). The log reflects the resolved mode.
 # minify-ON proves the pass also serves Prisma-D1 — it does not reproduce the
 # 0.2.13 "PrismaD1 is not a constructor" break. Same 200 assertion both ways.
 if [ -n "${E2E_MINIFY:-}" ]; then
-  [ "$E2E_MINIFY" = "1" ] && export CREEK_ADAPTER_MINIFY=1 || export CREEK_ADAPTER_MINIFY=0
+  case "$E2E_MINIFY" in
+    0) export CREEK_ADAPTER_MINIFY=0 ;;
+    1) export CREEK_ADAPTER_MINIFY=1 ;;
+    *) fail "E2E_MINIFY must be 0 or 1 (got '$E2E_MINIFY')" ;;
+  esac
 fi
 if [ "${CREEK_ADAPTER_MINIFY:-0}" = "1" ]; then
   MINIFY_MODE="ON (CREEK_ADAPTER_MINIFY=1)"
+elif [ "${E2E_MINIFY:-}" = "0" ]; then
+  MINIFY_MODE="off (forced by E2E_MINIFY=0)"
 else
   MINIFY_MODE="off (default)"
 fi
-
-log() { printf '\n\033[1m[e2e:prisma-d1] %s\033[0m\n' "$*"; }
-fail() { printf '\n\033[31m[e2e:prisma-d1] FAIL: %s\033[0m\n' "$*" >&2; exit 1; }
 
 log "Building adapter and packing tarball (the EXACT bytes npm would publish)"
 cd "$REPO_ROOT"
