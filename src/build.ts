@@ -100,7 +100,10 @@ export async function dedupeWasmByContent(
       try {
         hex = xxh3.xxh128(await fs.readFile(absPath)).toString(16).padStart(32, "0");
       } catch {
-        continue; // unreadable — leave it for the mapping loop to skip too
+        // Can't read this one to hash it — skip dedup for it only. It stays in
+        // wasmFiles; if it's genuinely unreadable, the later copy step surfaces
+        // that (we don't silently treat it as handled overall here).
+        continue;
       }
       const kept = keptByHash.get(hex);
       if (kept === undefined) {
@@ -117,7 +120,14 @@ export async function dedupeWasmByContent(
         console.log(`  [Creek Adapter] wasm dedup: dropped ${name} (identical to ${kept})`);
       }
     }
-  } catch {}
+  } catch (err) {
+    // Dedup is a size optimization, not correctness — never fail the build on
+    // it. But warn why it didn't run (e.g. @node-rs/xxhash unavailable): the
+    // silent symptom would be an oversized bundle with the B11 duplicate back.
+    console.warn(
+      `  [Creek Adapter] wasm dedup skipped: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   return dropped;
 }
 
