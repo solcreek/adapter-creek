@@ -113,11 +113,12 @@ Output goes to `.creek/adapter-output/`:
 smaller — useful when a dependency-heavy app approaches the bundle size limit).
 
 **Off by default.** 0.2.13 shipped it on and broke Prisma driver-adapter apps at
-runtime (`PrismaD1 is not a constructor`). It's now covered by a Prisma-on-D1
-runtime e2e gate that runs in **both** modes (see `e2e/prisma-d1`), so the
-minify pass is verified against that break on every publish — but the default
-stays off, because a real app can still hit an edge a fixture doesn't. Enable it
-when you've verified your own deploy end-to-end.
+runtime (`PrismaD1 is not a constructor`). A Prisma-on-D1 runtime e2e gate now
+runs in **both** minify modes on every publish (see `e2e/prisma-d1`), guarding
+the Prisma-D1 path against a minify-induced runtime break. (It does not
+reproduce that exact 0.2.13 failure — that was minifier-input-dependent — so the
+default stays off: a real app can still hit an edge this fixture doesn't.)
+Enable it when you've verified your own deploy end-to-end.
 
 ## How It Works
 
