@@ -21,6 +21,129 @@ function escapeRegExp(s: string): string {
 }
 
 /**
+ * Content-dedup the wasm siblings wrangler emitted into the server output.
+ *
+ * The pre-bundle `dedupeWasmByContent` (build.ts) only sees wasm that flows
+ * through the adapter's `wasmFiles` map. But an identical payload can reach the
+ * bundle by a SECOND, independent path: Next's wasm worker-loader emits a
+ * dynamic `import("./<hash>-query_compiler_fast_bg.wasm")` while our staged
+ * CompiledWasm arrives as a static `import __wasm from
+ * "./<hash>-query_compiler_fast_bg.sqlite.wasm"`. wrangler content-hashes both,
+ * so they land as two 3.5MB files that share the same `<hash>-` prefix but
+ * differ in basename — the B11 duplicate a real Prisma-on-D1 app ships (a
+ * fixture that only exercises the map-path never reproduces it).
+ *
+ * wrangler's prefix IS a content hash, so a shared prefix means identical
+ * bytes; we still byte-compare before deleting. Keep one file per payload,
+ * rewrite every reference to the dropped basename (static or dynamic import,
+ * in worker.js and any chunk) to the kept one, and delete the extra. Prefer to
+ * keep a file that a static `import … from` targets — that's the CompiledWasm
+ * form workerd is happiest with; the dynamic-import site just repoints to it.
+ *
+ * Best-effort and content-safe: never merges files whose bytes differ, and
+ * applied write-before-delete so a mid-way failure leaves a valid output — at
+ * worst not-fully-deduped (a redundant wasm still present), never a JS import
+ * pointing at a deleted file. Returns the number of files dropped. Exported for
+ * tests.
+ */
+export async function dedupeEmittedWasm(outputDir: string): Promise<number> {
+  let dropped = 0;
+  const toDrop: [drop: string, keep: string][] = [];
+  try {
+    const outFiles = await fs.readdir(outputDir);
+    // `<content hash>-<basename>.wasm` — wrangler's hashed sibling. wrangler
+    // currently uses a 40-hex (sha1) prefix; match 7+ hex so a future hash
+    // length change doesn't silently disable dedup (we byte-verify before any
+    // delete regardless, so a looser prefix match can't merge wrong payloads).
+    const hashed = /^([0-9a-f]{7,})-(.+\.wasm)$/;
+    const byHash = new Map<string, string[]>(); // content hash -> filenames
+    for (const f of outFiles) {
+      const m = hashed.exec(f);
+      if (!m) continue;
+      const list = byHash.get(m[1]) ?? [];
+      list.push(f);
+      byHash.set(m[1], list);
+    }
+
+    const dupGroups = [...byHash.values()].filter((g) => g.length > 1);
+    if (dupGroups.length === 0) return 0;
+
+    // Rewrite every emitted code file, not just `.js`: the main entry is
+    // renamed to worker.js, but wrangler can move code-split chunks out as
+    // `.mjs`/`.cjs` siblings, and a wasm specifier living in one of those must
+    // be repointed too — otherwise we'd delete a still-referenced wasm and
+    // break the import at runtime.
+    const jsFiles = outFiles.filter(
+      (f) => f.endsWith(".js") || f.endsWith(".mjs") || f.endsWith(".cjs"),
+    );
+    const jsContents = new Map<string, string>();
+    for (const f of jsFiles) {
+      jsContents.set(f, await fs.readFile(path.join(outputDir, f), "utf-8"));
+    }
+    // Does any code statically `import … from "<spec ending in name>"`? Tolerate
+    // minified ESM (`import{a as b}from"./x.wasm"` — no space after `import` or
+    // before `from`), so keeper selection isn't defeated on a minified worker.js
+    // and left dependent on file ordering.
+    const staticImport = (contents: string, name: string): boolean =>
+      new RegExp(`import\\s*[^"';]*?from\\s*["'][^"']*${escapeRegExp(name)}["']`).test(contents);
+
+    for (const group of dupGroups) {
+      // Confirm identical bytes before collapsing (a hash-prefix match is
+      // wrangler's own content hash, but verify rather than trust).
+      const bufs = new Map<string, Buffer>();
+      for (const f of group) bufs.set(f, await fs.readFile(path.join(outputDir, f)));
+      const [first, ...rest] = group;
+      const allEqual = rest.every((f) => bufs.get(f)!.equals(bufs.get(first)!));
+      if (!allEqual) continue; // never merge differing payloads
+
+      // Keep a file some JS statically imports; else keep the first.
+      const keep =
+        group.find((f) => [...jsContents.values()].some((c) => staticImport(c, f))) ?? first;
+
+      for (const drop of group) {
+        if (drop === keep) continue;
+        // Repoint every reference to keep. wasm specifiers are always quoted
+        // (static `from "./<drop>"` and dynamic `import("./<drop>")` alike), so
+        // match a quote + optional `./`/`/` + the EXACT basename + closing
+        // quote. Anchoring on the quotes (not `(`/`)`) keeps it to real
+        // specifiers, and the exact name + closing quote stop a shorter name
+        // from partially matching a longer sibling.
+        const ref = new RegExp(`(["'](?:\\.?/)?)${escapeRegExp(drop)}(["'])`, "g");
+        for (const [f, c] of jsContents) {
+          const next = c.replace(ref, `$1${keep}$2`);
+          if (next !== c) jsContents.set(f, next);
+        }
+        toDrop.push([drop, keep]);
+      }
+    }
+
+    // Apply in a write-before-delete order so a mid-way failure can never
+    // orphan an import: flush the rewritten JS FIRST (until it lands, every
+    // dropped wasm still exists on disk, so both old and new references
+    // resolve), then delete the now-unreferenced wasm. A failure while
+    // deleting at worst leaves a redundant wasm file — never a JS reference to
+    // a missing one.
+    if (toDrop.length > 0) {
+      for (const [f, c] of jsContents) {
+        await fs.writeFile(path.join(outputDir, f), c);
+      }
+      for (const [drop, keep] of toDrop) {
+        await fs.rm(path.join(outputDir, drop), { force: true });
+        dropped++; // count only wasm actually removed, so the return can't over-report
+        console.log(`  [Creek Adapter] wasm dedup (emitted): dropped ${drop} → ${keep}`);
+      }
+    }
+  } catch (err) {
+    console.warn(
+      `  [Creek Adapter] emitted-wasm dedup skipped: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
+  return dropped;
+}
+
+/**
  * Resolve wrangler's CLI entry script through Node module resolution.
  *
  * Never guess `<adapterDir>/node_modules/.bin/wrangler`: npm hoists
@@ -1525,6 +1648,13 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   } catch {
     // Best-effort: if worker.js is absent or readdir fails, keep all files.
   }
+
+  // Collapse byte-identical wasm siblings wrangler emitted under different
+  // basenames (the B11 duplicate: Next's wasm worker-loader dynamic import vs
+  // our staged CompiledWasm static import — two 3.5MB copies of the Prisma
+  // query compiler). Runs on the FINAL artifacts so it catches duplicates from
+  // any emit path, not just the pre-bundle wasmFiles map.
+  await dedupeEmittedWasm(opts.outputDir);
 
   // List output files
   const files = await fs.readdir(opts.outputDir);

@@ -35,6 +35,25 @@ showed a real app can break where a fixture doesn't, so we don't flip the
 default — the switch is for someone who verifies their own worker end-to-end
 (this gate now makes that safe to recommend).
 
+## B11 duplicate-wasm gate
+
+After the build, `run.sh` md5s every `*.wasm` in the server output and fails if
+any two are byte-identical. The B11 bug shipped the ~3.5MB Prisma query compiler
+**twice** — once as our staged `CompiledWasm` static import
+(`…query_compiler_fast_bg.sqlite.wasm`) and once as Next's wasm worker-loader
+dynamic `import("./…query_compiler_fast_bg.wasm")`, same content, same wrangler
+hash prefix, different basename. The pre-bundle map dedup (`dedupeWasmByContent`)
+never saw the worker-loader copy; `dedupeEmittedWasm` collapses it on the final
+artifacts and repoints the loader to the kept file.
+
+**Honest coverage note:** this fixture emits only ONE wasm — it does *not*
+naturally reproduce the two-emit-path duplicate (that needs a real app's fuller
+Prisma client graph). So this assertion is a belt-and-suspenders regression
+guard; the actual collapse-and-repoint logic is verified deterministically in
+`src/bundler.test.ts` against a fixture built from a customer's real `worker.js`
+`.wasm` reference lines, plus an end-to-end run that injects the duplicate into
+a real build output and confirms the deduped worker still serves 200 in workerd.
+
 ## Status / known limitation
 
 This gate does NOT reproduce the *specific* 0.2.13 failure

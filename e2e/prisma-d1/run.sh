@@ -116,6 +116,23 @@ SERVER_DIR="$APP/.creek/adapter-output/server"
 test -f "$SERVER_DIR/worker.js" || fail "adapter did not emit worker.js"
 test -f "$SERVER_DIR/wrangler.toml" || fail "adapter did not emit wrangler.toml"
 
+# B11 regression gate: no two emitted wasm siblings may carry identical bytes.
+# The shipped-twice Prisma query compiler (a dynamic wasm-worker-loader import
+# AND our staged CompiledWasm static import, same content, ~3.5MB each) is the
+# exact duplicate `dedupeEmittedWasm` collapses — assert it stayed collapsed.
+# md5 each wasm; a repeated digest means a duplicate slipped back in.
+log "Asserting no byte-identical wasm siblings (B11 duplicate gate)"
+DUP_DIGESTS="$(
+  for w in "$SERVER_DIR"/*.wasm; do
+    [ -e "$w" ] || continue
+    md5 -q "$w" 2>/dev/null || md5sum "$w" | awk '{print $1}'
+  done | sort | uniq -d
+)"
+if [ -n "$DUP_DIGESTS" ]; then
+  log "emitted wasm:"; ls -la "$SERVER_DIR"/*.wasm >&2 || true
+  fail "byte-identical wasm siblings emitted (B11 duplicate regressed): digest(s) $DUP_DIGESTS"
+fi
+
 # Bind a local D1 named DB — the Prisma-on-D1 swap shim resolves the request's
 # binding as `env.DB`. In `wrangler dev`'s default local mode this is backed by
 # a throwaway sqlite under .wrangler/state.
