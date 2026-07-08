@@ -40,12 +40,15 @@ function escapeRegExp(s: string): string {
  * keep a file that a static `import … from` targets — that's the CompiledWasm
  * form workerd is happiest with; the dynamic-import site just repoints to it.
  *
- * Best-effort and content-safe: never merges files whose bytes differ, and on
- * any error leaves the output untouched. Returns the number of files dropped.
- * Exported for tests.
+ * Best-effort and content-safe: never merges files whose bytes differ, and
+ * applied write-before-delete so a mid-way failure leaves a valid output — at
+ * worst not-fully-deduped (a redundant wasm still present), never a JS import
+ * pointing at a deleted file. Returns the number of files dropped. Exported for
+ * tests.
  */
 export async function dedupeEmittedWasm(outputDir: string): Promise<number> {
   let dropped = 0;
+  const toDrop: [drop: string, keep: string][] = [];
   try {
     const outFiles = await fs.readdir(outputDir);
     // `<content hash>-<basename>.wasm` — wrangler's hashed sibling. wrangler
@@ -103,16 +106,24 @@ export async function dedupeEmittedWasm(outputDir: string): Promise<number> {
           const next = c.replace(ref, `$1${keep}$2`);
           if (next !== c) jsContents.set(f, next);
         }
-        await fs.rm(path.join(outputDir, drop), { force: true });
+        toDrop.push([drop, keep]);
         dropped++;
-        console.log(`  [Creek Adapter] wasm dedup (emitted): dropped ${drop} → ${keep}`);
       }
     }
 
-    // Flush rewritten JS only if we actually dropped something.
+    // Apply in a write-before-delete order so a mid-way failure can never
+    // orphan an import: flush the rewritten JS FIRST (until it lands, every
+    // dropped wasm still exists on disk, so both old and new references
+    // resolve), then delete the now-unreferenced wasm. A failure while
+    // deleting at worst leaves a redundant wasm file — never a JS reference to
+    // a missing one.
     if (dropped > 0) {
       for (const [f, c] of jsContents) {
         await fs.writeFile(path.join(outputDir, f), c);
+      }
+      for (const [drop, keep] of toDrop) {
+        await fs.rm(path.join(outputDir, drop), { force: true });
+        console.log(`  [Creek Adapter] wasm dedup (emitted): dropped ${drop} → ${keep}`);
       }
     }
   } catch (err) {
