@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import {
+  dedupeEmittedWasm,
   minifyWorker,
   patchAppPageRevalidationPostponedState,
   patchNullFallbackPartialShellBlocking,
@@ -264,5 +265,71 @@ describe("minifyWorker", () => {
     expect(outcome.minified).toBe(false);
     expect(outcome.reason).toMatch(/transform failed/);
     expect(readFileSync(workerPath, "utf-8")).toBe(source);
+  });
+});
+
+describe("dedupeEmittedWasm", () => {
+  let dir: string;
+  const HASH = "2e94aaed943b9bfe2dc051604e48ff4dd24e4f7b";
+  beforeEach(() => {
+    dir = mkdtempSync(path.join(realpathSync(tmpdir()), "adapter-creek-emitwasm-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("collapses the two-emit-path B11 duplicate and repoints both imports", async () => {
+    // Exactly the artifact a real Prisma-on-D1 app ships (customer grep of
+    // worker.js): one dynamic import() from Next's wasm worker-loader, one
+    // static import from our staged CompiledWasm — same content, same wrangler
+    // hash prefix, different basename. The pre-bundle map dedup can't see the
+    // dynamic-import copy; this final-artifact pass must.
+    const dyn = `${HASH}-query_compiler_fast_bg.wasm`;
+    const stat = `${HASH}-query_compiler_fast_bg.sqlite.wasm`;
+    const payload = Buffer.from("PRISMA_QUERY_COMPILER_3542050_BYTES");
+    writeFileSync(path.join(dir, dyn), payload);
+    writeFileSync(path.join(dir, stat), payload);
+    const worker =
+      `var wasm_worker_loader_default = import("./${dyn}");\n` +
+      `import __wasm_0 from "./${stat}";\n`;
+    writeFileSync(path.join(dir, "worker.js"), worker);
+
+    const dropped = await dedupeEmittedWasm(dir);
+
+    expect(dropped).toBe(1);
+    // The statically-imported file is kept; the dynamic-import copy is gone.
+    expect(readFileSync(path.join(dir, stat)).equals(payload)).toBe(true);
+    expect(() => readFileSync(path.join(dir, dyn))).toThrow();
+    // Both import sites now resolve to the single kept file.
+    const rewritten = readFileSync(path.join(dir, "worker.js"), "utf-8");
+    expect(rewritten).toContain(`import("./${stat}")`);
+    expect(rewritten).toContain(`import __wasm_0 from "./${stat}"`);
+    expect(rewritten).not.toContain(dyn);
+  });
+
+  it("never merges wasm siblings whose bytes differ (defensive)", async () => {
+    // Same hash prefix but different content must never be collapsed — we
+    // byte-compare before deleting, so both survive untouched.
+    const a = `${HASH}-a.wasm`;
+    const b = `${HASH}-b.wasm`;
+    writeFileSync(path.join(dir, a), Buffer.from("AAAA"));
+    writeFileSync(path.join(dir, b), Buffer.from("BBBB"));
+    writeFileSync(path.join(dir, "worker.js"), `import x from "./${a}"; import y from "./${b}";`);
+
+    const dropped = await dedupeEmittedWasm(dir);
+
+    expect(dropped).toBe(0);
+    expect(readFileSync(path.join(dir, a), "utf-8")).toBe("AAAA");
+    expect(readFileSync(path.join(dir, b), "utf-8")).toBe("BBBB");
+  });
+
+  it("leaves a single wasm and distinct-hash wasm untouched", async () => {
+    writeFileSync(path.join(dir, `${HASH}-only.wasm`), Buffer.from("X"));
+    writeFileSync(path.join(dir, `deadbeef1234567-other.wasm`), Buffer.from("Y"));
+    writeFileSync(path.join(dir, "worker.js"), "// no wasm imports");
+
+    const dropped = await dedupeEmittedWasm(dir);
+
+    expect(dropped).toBe(0);
+    expect(readFileSync(path.join(dir, `${HASH}-only.wasm`), "utf-8")).toBe("X");
+    expect(readFileSync(path.join(dir, `deadbeef1234567-other.wasm`), "utf-8")).toBe("Y");
   });
 });
