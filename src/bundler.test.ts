@@ -305,6 +305,29 @@ describe("dedupeEmittedWasm", () => {
     expect(rewritten).not.toContain(dyn);
   });
 
+  it("repoints a wasm reference living in a .mjs chunk (not just worker.js)", async () => {
+    // wrangler can move a code-split chunk out as a .mjs sibling; a wasm
+    // specifier there must be repointed too, or deleting the dropped file
+    // orphans the import. Here the ONLY reference to the dropped file is in the
+    // .mjs chunk — a .js-only pass would delete it and break the chunk.
+    const dyn = `${HASH}-query_compiler_fast_bg.wasm`;
+    const stat = `${HASH}-query_compiler_fast_bg.sqlite.wasm`;
+    const payload = Buffer.from("PRISMA_QUERY_COMPILER_BYTES");
+    writeFileSync(path.join(dir, dyn), payload);
+    writeFileSync(path.join(dir, stat), payload);
+    // worker.js statically imports the keeper; a .mjs chunk dynamic-imports the dup.
+    writeFileSync(path.join(dir, "worker.js"), `import __wasm_0 from "./${stat}";`);
+    writeFileSync(path.join(dir, "chunk-abc.mjs"), `export const w = () => import("./${dyn}");`);
+
+    const dropped = await dedupeEmittedWasm(dir);
+
+    expect(dropped).toBe(1);
+    expect(() => readFileSync(path.join(dir, dyn))).toThrow();
+    const chunk = readFileSync(path.join(dir, "chunk-abc.mjs"), "utf-8");
+    expect(chunk).toContain(`import("./${stat}")`);
+    expect(chunk).not.toContain(dyn);
+  });
+
   it("never merges wasm siblings whose bytes differ (defensive)", async () => {
     // Same hash prefix but different content must never be collapsed — we
     // byte-compare before deleting, so both survive untouched.

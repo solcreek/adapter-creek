@@ -48,7 +48,10 @@ export async function dedupeEmittedWasm(outputDir: string): Promise<number> {
   let dropped = 0;
   try {
     const outFiles = await fs.readdir(outputDir);
-    // `<40-hex-ish content hash>-<basename>.wasm` — wrangler's hashed sibling.
+    // `<content hash>-<basename>.wasm` — wrangler's hashed sibling. wrangler
+    // currently uses a 40-hex (sha1) prefix; match 7+ hex so a future hash
+    // length change doesn't silently disable dedup (we byte-verify before any
+    // delete regardless, so a looser prefix match can't merge wrong payloads).
     const hashed = /^([0-9a-f]{7,})-(.+\.wasm)$/;
     const byHash = new Map<string, string[]>(); // content hash -> filenames
     for (const f of outFiles) {
@@ -62,9 +65,14 @@ export async function dedupeEmittedWasm(outputDir: string): Promise<number> {
     const dupGroups = [...byHash.values()].filter((g) => g.length > 1);
     if (dupGroups.length === 0) return 0;
 
-    // Only rewrite JS (worker entry + any emitted chunks); the wasm filenames
-    // are unique long tokens, so a boundary-anchored replace is safe.
-    const jsFiles = outFiles.filter((f) => f.endsWith(".js"));
+    // Rewrite every emitted code file, not just `.js`: the main entry is
+    // renamed to worker.js, but wrangler can move code-split chunks out as
+    // `.mjs`/`.cjs` siblings, and a wasm specifier living in one of those must
+    // be repointed too — otherwise we'd delete a still-referenced wasm and
+    // break the import at runtime.
+    const jsFiles = outFiles.filter(
+      (f) => f.endsWith(".js") || f.endsWith(".mjs") || f.endsWith(".cjs"),
+    );
     const jsContents = new Map<string, string>();
     for (const f of jsFiles) {
       jsContents.set(f, await fs.readFile(path.join(outputDir, f), "utf-8"));
