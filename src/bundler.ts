@@ -80,8 +80,12 @@ export async function dedupeEmittedWasm(outputDir: string): Promise<number> {
     for (const f of jsFiles) {
       jsContents.set(f, await fs.readFile(path.join(outputDir, f), "utf-8"));
     }
+    // Does any code statically `import … from "<spec ending in name>"`? Tolerate
+    // minified ESM (`import{a as b}from"./x.wasm"` — no space after `import` or
+    // before `from`), so keeper selection isn't defeated on a minified worker.js
+    // and left dependent on file ordering.
     const staticImport = (contents: string, name: string): boolean =>
-      new RegExp(`import\\s+[^"';]+\\s+from\\s*["'][^"']*${escapeRegExp(name)}["']`).test(contents);
+      new RegExp(`import\\s*[^"';]*?from\\s*["'][^"']*${escapeRegExp(name)}["']`).test(contents);
 
     for (const group of dupGroups) {
       // Confirm identical bytes before collapsing (a hash-prefix match is
@@ -98,16 +102,18 @@ export async function dedupeEmittedWasm(outputDir: string): Promise<number> {
 
       for (const drop of group) {
         if (drop === keep) continue;
-        // Repoint every `./<drop>` reference (static or dynamic import) to keep.
-        // Anchor on the `/` before the basename and the closing quote so a
-        // shorter name can never partially match a longer sibling.
-        const ref = new RegExp(`(["'\\(]\\.?/?)${escapeRegExp(drop)}(["'\\)])`, "g");
+        // Repoint every reference to keep. wasm specifiers are always quoted
+        // (static `from "./<drop>"` and dynamic `import("./<drop>")` alike), so
+        // match a quote + optional `./`/`/` + the EXACT basename + closing
+        // quote. Anchoring on the quotes (not `(`/`)`) keeps it to real
+        // specifiers, and the exact name + closing quote stop a shorter name
+        // from partially matching a longer sibling.
+        const ref = new RegExp(`(["'](?:\\.?/)?)${escapeRegExp(drop)}(["'])`, "g");
         for (const [f, c] of jsContents) {
           const next = c.replace(ref, `$1${keep}$2`);
           if (next !== c) jsContents.set(f, next);
         }
         toDrop.push([drop, keep]);
-        dropped++;
       }
     }
 
@@ -117,12 +123,13 @@ export async function dedupeEmittedWasm(outputDir: string): Promise<number> {
     // resolve), then delete the now-unreferenced wasm. A failure while
     // deleting at worst leaves a redundant wasm file — never a JS reference to
     // a missing one.
-    if (dropped > 0) {
+    if (toDrop.length > 0) {
       for (const [f, c] of jsContents) {
         await fs.writeFile(path.join(outputDir, f), c);
       }
       for (const [drop, keep] of toDrop) {
         await fs.rm(path.join(outputDir, drop), { force: true });
+        dropped++; // count only wasm actually removed, so the return can't over-report
         console.log(`  [Creek Adapter] wasm dedup (emitted): dropped ${drop} → ${keep}`);
       }
     }

@@ -328,6 +328,32 @@ describe("dedupeEmittedWasm", () => {
     expect(chunk).not.toContain(dyn);
   });
 
+  it("prefers the statically-imported keeper even in minified ESM", async () => {
+    // Minified worker.js: `import{a}from"./x"` — no space after import or before
+    // from. Keeper selection must still recognize the static import and keep
+    // that file, independent of readdir ordering. Here the static import is the
+    // .wasm (not .sqlite.wasm), so a working detector keeps the plain one.
+    const a = `${HASH}-query_compiler_fast_bg.wasm`;
+    const b = `${HASH}-query_compiler_fast_bg.sqlite.wasm`;
+    const payload = Buffer.from("PRISMA_QUERY_COMPILER_BYTES");
+    writeFileSync(path.join(dir, a), payload);
+    writeFileSync(path.join(dir, b), payload);
+    // static import targets `a`; dynamic import targets `b`.
+    writeFileSync(
+      path.join(dir, "worker.js"),
+      `import{__wasm_0}from"./${a}";var l=()=>import("./${b}");`,
+    );
+
+    const dropped = await dedupeEmittedWasm(dir);
+
+    expect(dropped).toBe(1);
+    expect(readFileSync(path.join(dir, a)).equals(payload)).toBe(true); // kept
+    expect(() => readFileSync(path.join(dir, b))).toThrow(); // dropped
+    const w = readFileSync(path.join(dir, "worker.js"), "utf-8");
+    expect(w).toContain(`import("./${a}")`); // dynamic import repointed to keeper
+    expect(w).not.toContain(b);
+  });
+
   it("never merges wasm siblings whose bytes differ (defensive)", async () => {
     // Same hash prefix but different content must never be collapsed — we
     // byte-compare before deleting, so both survive untouched.
