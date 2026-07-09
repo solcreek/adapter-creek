@@ -92,12 +92,16 @@ log "Lazy-installing adapter + @prisma/adapter-d1 into .creek/node_modules (mirr
 # resolvePrismaD1Alias() forces it to bundle regardless; this gate now proves it.
 mkdir -p .creek
 node -e "
-  const { writeFileSync } = require('node:fs');
+  const { writeFileSync, readFileSync } = require('node:fs');
+  // Derive @prisma/adapter-d1's version from the fixture's @prisma/client, the
+  // same way the CLI's ensurePrismaD1 does — so it can't drift from the rest of
+  // the Prisma stack when the fixture is bumped.
+  const prismaVersion = JSON.parse(readFileSync('package.json', 'utf8')).dependencies['@prisma/client'];
   writeFileSync('.creek/package.json', JSON.stringify({
     private: true,
     dependencies: {
       '@solcreek/adapter-creek': 'file:' + process.argv[1],
-      '@prisma/adapter-d1': '7.8.0',
+      '@prisma/adapter-d1': prismaVersion,
     },
   }, null, 2));
 " "$TARBALL"
