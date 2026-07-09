@@ -31,6 +31,37 @@ const DB_DRIVER_ALIASES: Record<string, string> = {
   "better-sqlite3$": path.join(SHIMS_DIR, "better-sqlite3-stub.js"),
 };
 
+/**
+ * Force `@prisma/adapter-d1` to be BUNDLED, not externalized.
+ *
+ * The Prisma-on-D1 shim (prisma-adapter-better-sqlite3.js) imports `PrismaD1`
+ * from `@prisma/adapter-d1`, an optional peer the Creek CLI installs into
+ * `.creek/node_modules` (users don't add it themselves — the zero-change
+ * promise). Next's server build EXTERNALIZES bare node_modules imports, and on
+ * Workers there is no node_modules to require from, so the package collapses to
+ * an empty module: `new PrismaD1(...)` throws "PrismaD1 is not a constructor"
+ * on every D1-backed request (sign-in included).
+ *
+ * A project that happens to list `@prisma/adapter-d1` as a DIRECT dependency
+ * dodges this (webpack bundles it) — which is exactly why the e2e fixture, that
+ * did list it directly, never caught the bug that every real user hit.
+ *
+ * Aliasing the bare specifier to its resolved ABSOLUTE path (resolved from this
+ * adapter's own location, i.e. `.creek`) forces webpack to bundle the concrete
+ * file rather than externalize the bare name — the same trick the driver-swap
+ * aliases above already rely on. Returns {} when `@prisma/adapter-d1` isn't
+ * installed (a non-Prisma-on-D1 project), leaving other stacks untouched.
+ */
+function resolvePrismaD1Alias(): Record<string, string> {
+  try {
+    return {
+      "@prisma/adapter-d1$": createRequire(import.meta.url).resolve("@prisma/adapter-d1"),
+    };
+  } catch {
+    return {};
+  }
+}
+
 // Path to the cache handler shipped by @solcreek/adapter-next-core, resolved
 // from THIS module's location — not from the consumer project. The adapter is
 // not always installed in the project's own node_modules: the Creek CLI
@@ -122,7 +153,11 @@ const adapter: NextAdapter = {
             ? (baseConfig as { webpack: (c: unknown, x: unknown) => any }).webpack(webpackConfig, webpackCtx)
             : webpackConfig;
         cfg.resolve = cfg.resolve ?? {};
-        cfg.resolve.alias = { ...(cfg.resolve.alias ?? {}), ...DB_DRIVER_ALIASES };
+        cfg.resolve.alias = {
+          ...(cfg.resolve.alias ?? {}),
+          ...DB_DRIVER_ALIASES,
+          ...resolvePrismaD1Alias(),
+        };
         return cfg;
       },
     };

@@ -82,13 +82,23 @@ npm install --no-audit --no-fund --silent
 log "Generating the Prisma client (mirrors creek ensurePrismaClient)"
 npx --no-install prisma generate
 
-log "Lazy-installing adapter into .creek/node_modules (mirrors creek installCreekDep)"
+log "Lazy-installing adapter + @prisma/adapter-d1 into .creek/node_modules (mirrors creek installCreekDep + ensurePrismaD1)"
+# @prisma/adapter-d1 lives ONLY in .creek here, NOT as a fixture direct dep —
+# that's exactly how the Creek CLI provides it (users don't list it; the
+# zero-change promise). Listing it as a direct dep, as this fixture used to,
+# made webpack bundle it and silently masked the real-world bug: with it in
+# .creek only, Next's server build externalizes it to an empty module and every
+# D1-backed request 500s with "PrismaD1 is not a constructor". The adapter's
+# resolvePrismaD1Alias() forces it to bundle regardless; this gate now proves it.
 mkdir -p .creek
 node -e "
   const { writeFileSync } = require('node:fs');
   writeFileSync('.creek/package.json', JSON.stringify({
     private: true,
-    dependencies: { '@solcreek/adapter-creek': 'file:' + process.argv[1] },
+    dependencies: {
+      '@solcreek/adapter-creek': 'file:' + process.argv[1],
+      '@prisma/adapter-d1': '7.8.0',
+    },
   }, null, 2));
 " "$TARBALL"
 (cd .creek && npm install --no-audit --no-fund --ignore-scripts)
@@ -115,6 +125,18 @@ NEXT_ADAPTER_PATH="$ADAPTER_PATH" npx next build --webpack
 SERVER_DIR="$APP/.creek/adapter-output/server"
 test -f "$SERVER_DIR/worker.js" || fail "adapter did not emit worker.js"
 test -f "$SERVER_DIR/wrangler.toml" || fail "adapter did not emit wrangler.toml"
+
+# @prisma/adapter-d1 bundled-not-externalized gate. When the package sits only
+# in .creek (the real CLI flow, as set up above), Next's server build
+# externalizes the bare import to an empty module and `new PrismaD1(...)` throws
+# "PrismaD1 is not a constructor" at runtime. resolvePrismaD1Alias() forces it
+# to bundle. `PrismaD1Http` is a sibling export that appears ONLY when the
+# package's real code is bundled — the shim's own `new n.PrismaD1(...)` refs
+# don't include it — and it survives minify as a string label. Its absence
+# means the externalize-to-empty regression is back. The runtime 200 below is
+# the ultimate proof, but this fails fast with a precise message.
+log "Asserting @prisma/adapter-d1 is bundled (not externalized to an empty module)"
+grep -q "PrismaD1Http" "$SERVER_DIR/worker.js" || fail "@prisma/adapter-d1 was externalized to an empty module — PrismaD1 is not bundled (the sign-in 'PrismaD1 is not a constructor' regression)"
 
 # B11 regression gate: no two emitted wasm siblings may carry identical bytes.
 # The shipped-twice Prisma query compiler (a dynamic wasm-worker-loader import
