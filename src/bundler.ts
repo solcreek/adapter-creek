@@ -206,9 +206,11 @@ export async function resolveWranglerEntry(
 export async function minifyWorker(
   workerPath: string,
   requireFn: Pick<NodeRequire, "resolve">,
-): Promise<{ minified: boolean; reason?: string }> {
+): Promise<{ minified: boolean; reason?: string; disabled?: boolean }> {
   if (process.env.CREEK_ADAPTER_MINIFY === "0") {
-    return { minified: false, reason: "disabled via CREEK_ADAPTER_MINIFY=0" };
+    // `disabled` marks the intentional opt-out so the call site can log it
+    // as information rather than warning about a normal configuration.
+    return { minified: false, disabled: true, reason: "disabled via CREEK_ADAPTER_MINIFY=0" };
   }
   // Structurally typed: esbuild is not a direct dependency (only wrangler's
   // transitive copy), so it has no type declarations to import. Declare just
@@ -1603,6 +1605,9 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       console.log(
         `  [Creek Adapter] worker.js minified: ${(before / 1024 / 1024).toFixed(1)}MB → ${(after / 1024 / 1024).toFixed(1)}MB`,
       );
+    } else if (outcome.disabled) {
+      // Intentional opt-out — expected configuration, not a build problem.
+      console.log(`  [Creek Adapter] worker.js left unminified (${outcome.reason})`);
     } else if (outcome.reason) {
       console.warn(`  [Creek Adapter] worker.js left unminified (${outcome.reason})`);
     }

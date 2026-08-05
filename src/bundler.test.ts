@@ -224,8 +224,21 @@ describe("minifyWorker", () => {
     const outcome = await minifyWorker(workerPath, selfRequire);
 
     expect(outcome.minified).toBe(false);
+    // `disabled` distinguishes the intentional opt-out from a transform
+    // failure — the call site logs it as info, not a warning.
+    expect(outcome.disabled).toBe(true);
     expect(outcome.reason).toMatch(/disabled via CREEK_ADAPTER_MINIFY=0/);
     expect(readFileSync(workerPath, "utf-8")).toBe(source);
+  });
+
+  it("does not mark genuine transform failures as disabled", async () => {
+    const workerPath = path.join(workDir, "worker.js");
+    writeFileSync(workerPath, "export const = broken syntax {{{\n");
+
+    const outcome = await minifyWorker(workerPath, selfRequire);
+
+    expect(outcome.minified).toBe(false);
+    expect(outcome.disabled).toBeUndefined();
   });
 
   it("still minifies when explicitly set to 1 (back-compat with the opt-in era)", async () => {

@@ -133,7 +133,16 @@ WRANGLER_ENTRY="$(node -e "
   // exported entry ('.') and walk up to the package root instead.
   const adapterEntry = appRequire.resolve('@solcreek/adapter-creek');
   let dir = path.dirname(adapterEntry);
-  while (!fs.existsSync(path.join(dir, 'package.json'))) dir = path.dirname(dir);
+  // Root guard: path.dirname('/') === '/', so a broken install with no
+  // package.json on the walk-up path must fail fast, not spin forever.
+  while (!fs.existsSync(path.join(dir, 'package.json'))) {
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      console.error('no package.json found walking up from ' + adapterEntry);
+      process.exit(1);
+    }
+    dir = parent;
+  }
   const adapterRequire = createRequire(path.join(dir, 'package.json'));
   const wranglerPkgPath = adapterRequire.resolve('wrangler/package.json');
   const binField = JSON.parse(fs.readFileSync(wranglerPkgPath, 'utf8')).bin;
