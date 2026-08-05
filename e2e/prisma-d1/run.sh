@@ -108,11 +108,30 @@ node -e "
 (cd .creek && npm install --no-audit --no-fund --ignore-scripts)
 
 # wrangler is a runtime dependency of the adapter, so it's resolved from the
-# adapter's own .creek dependency tree — use that binary rather than a floating
-# `npx wrangler` download so the gate exercises the same wrangler a real deploy
-# would, not whatever npx fetches.
-WRANGLER="$APP/.creek/node_modules/.bin/wrangler"
-test -x "$WRANGLER" || fail "wrangler not found in the adapter's .creek dependency tree at $WRANGLER"
+# adapter's own .creek dependency tree — the same wrangler a real deploy would
+# use, not whatever npx fetches. Resolve it via module resolution from the
+# adapter's package root (mirroring src/bundler.ts resolveWranglerEntry), NOT a
+# hardcoded node_modules/.bin path: npm is free to nest wrangler under the
+# adapter instead of hoisting it (observed with npm 11's file:-tarball
+# install, where .creek/node_modules/.bin has no wrangler link), so the .bin
+# location is layout-dependent. Same lesson as adapter 0.2.2 in the creek CLI.
+WRANGLER_ENTRY="$(node -e "
+  const { createRequire } = require('node:module');
+  const path = require('node:path');
+  const fs = require('node:fs');
+  const appRequire = createRequire(path.join(process.argv[1], '.creek', 'package.json'));
+  // The adapter's exports map doesn't expose './package.json' — resolve the
+  // exported entry ('.') and walk up to the package root instead.
+  const adapterEntry = appRequire.resolve('@solcreek/adapter-creek');
+  let dir = path.dirname(adapterEntry);
+  while (!fs.existsSync(path.join(dir, 'package.json'))) dir = path.dirname(dir);
+  const adapterRequire = createRequire(path.join(dir, 'package.json'));
+  const wranglerPkgPath = adapterRequire.resolve('wrangler/package.json');
+  const binField = JSON.parse(fs.readFileSync(wranglerPkgPath, 'utf8')).bin;
+  const binRel = typeof binField === 'string' ? binField : binField.wrangler;
+  console.log(path.join(path.dirname(wranglerPkgPath), binRel));
+" "$APP")" || fail "could not resolve wrangler through the adapter's dependency tree"
+test -f "$WRANGLER_ENTRY" || fail "wrangler entry not found at $WRANGLER_ENTRY"
 
 ADAPTER_PATH="$(node -e "
   const { createRequire } = require('node:module');
@@ -173,7 +192,7 @@ TOML
 
 log "Seeding the Note table into the local D1 (model queries need it)"
 cd "$SERVER_DIR"
-"$WRANGLER" d1 execute e2e-prisma-d1 --local \
+node "$WRANGLER_ENTRY" d1 execute e2e-prisma-d1 --local \
   --command "CREATE TABLE IF NOT EXISTS Note (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL)" \
   >"$WORK/seed.log" 2>&1 || { cat "$WORK/seed.log" >&2; fail "could not seed local D1"; }
 
@@ -181,7 +200,7 @@ log "Starting workerd via wrangler dev on :$PORT"
 # --no-bundle: serve the adapter's EMITTED worker.js as-is (matching the
 # WfP upload path, which does not re-bundle), so the gate tests the real
 # artifact rather than a wrangler re-bundle that could mask emitted-bundle bugs.
-"$WRANGLER" dev --port "$PORT" --no-bundle >"$WORK/wrangler.log" 2>&1 &
+node "$WRANGLER_ENTRY" dev --port "$PORT" --no-bundle >"$WORK/wrangler.log" 2>&1 &
 WRANGLER_PID=$!
 
 log "Waiting for the worker to come up"
