@@ -174,32 +174,43 @@ export async function resolveWranglerEntry(
 /**
  * Minify the final worker.js in place with a standalone esbuild pass.
  *
- * OFF BY DEFAULT — opt in with CREEK_ADAPTER_MINIFY=1.
+ * ON BY DEFAULT — opt out with CREEK_ADAPTER_MINIFY=0.
  *
- * Re-minifying the already-bundled, regex-patched worker is unsafe: 0.2.13
- * shipped this ON by default and broke Prisma driver-adapter apps at runtime
- * ("PrismaD1 is not a constructor" — the minified `__toESM` interop moved the
- * export onto `.default`), taking down every D1-backed page. It's a subtle
- * interaction between esbuild's minify, the adapter's own `__toESM` patch, and
- * `@prisma/adapter-d1`'s namespace shape that plain minify of a simple bundle
- * doesn't reproduce — so it must not run by default. The 50MB-limit motivation
- * (a mid-size worker's unminified glue layer) is real but far rarer than the
- * breakage; the proper fix is bundle-time minify with a Prisma-D1 e2e test,
- * tracked separately. Until then, opt-in only, for someone who can verify the
- * emitted worker end-to-end.
+ * History, so the default is never flipped on bad evidence again: 0.2.13
+ * shipped this ON, users hit "PrismaD1 is not a constructor" on every
+ * D1-backed page, and 0.2.14 turned it off blaming a minify/`__toESM`
+ * interop. That attribution was WRONG — the 0.2.17 root-cause analysis
+ * (commit 0dfa03e, verified by pulling the deployed worker and A/B
+ * reproduction) showed the breakage was Next externalizing
+ * `@prisma/adapter-d1` to an empty module, present since 0.2.10 and
+ * identical with minify off ("minify was a red herring — 0.2.16 unminified
+ * broke identically", creek repo packages/cli/src/utils/nextjs.ts). The
+ * e2e/prisma-d1 gate has run the minify-ON leg green in CI since 0.2.15.
+ *
+ * Two invariants keep this safe:
+ * - ORDER: minify runs AFTER the post-bundle regex patch chain. The patches
+ *   match identifiers in unminified output; minifying first silently no-ops
+ *   them (measured: split-mode POC 500s on the fast-set-immediate patch).
+ *   Do NOT move this to bundle-time (`wrangler deploy --minify` /
+ *   esbuild `minify: true` during bundling) without making every patch
+ *   minify-agnostic.
+ * - The e2e/prisma-d1 CI matrix runs {minify off, minify on}; a real interop
+ *   break blocks release.
  *
  * esbuild is not a direct dependency — it is resolved from the copy wrangler
- * ships. Even when enabled, any failure (esbuild unresolvable, parse error)
- * ships the unminified worker rather than failing the build.
+ * ships. Any failure (esbuild unresolvable, parse error) ships the
+ * unminified worker rather than failing the build.
  *
  * Exported for tests.
  */
 export async function minifyWorker(
   workerPath: string,
   requireFn: Pick<NodeRequire, "resolve">,
-): Promise<{ minified: boolean; reason?: string }> {
-  if (process.env.CREEK_ADAPTER_MINIFY !== "1") {
-    return { minified: false, reason: "off by default (set CREEK_ADAPTER_MINIFY=1 to opt in)" };
+): Promise<{ minified: boolean; reason?: string; disabled?: boolean }> {
+  if (process.env.CREEK_ADAPTER_MINIFY === "0") {
+    // `disabled` marks the intentional opt-out so the call site can log it
+    // as information rather than warning about a normal configuration.
+    return { minified: false, disabled: true, reason: "disabled via CREEK_ADAPTER_MINIFY=0" };
   }
   // Structurally typed: esbuild is not a direct dependency (only wrangler's
   // transitive copy), so it has no type declarations to import. Declare just
@@ -1583,10 +1594,10 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     await fs.writeFile(workerPath, workerCode);
   } catch {}
 
-  // Optional, opt-in minify (CREEK_ADAPTER_MINIFY=1). Runs last, after every
-  // regex patch above has matched the unminified output. Off by default —
-  // see minifyWorker for why. Only warn when it was asked for but couldn't run.
-  if (process.env.CREEK_ADAPTER_MINIFY === "1") {
+  // Minify, ON by default (opt out with CREEK_ADAPTER_MINIFY=0). Runs last,
+  // after every regex patch above has matched the unminified output — this
+  // ordering is load-bearing, see minifyWorker.
+  {
     const before = (await fs.stat(workerPath).catch(() => null))?.size ?? 0;
     const outcome = await minifyWorker(workerPath, adapterRequire);
     if (outcome.minified) {
@@ -1594,6 +1605,9 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       console.log(
         `  [Creek Adapter] worker.js minified: ${(before / 1024 / 1024).toFixed(1)}MB → ${(after / 1024 / 1024).toFixed(1)}MB`,
       );
+    } else if (outcome.disabled) {
+      // Intentional opt-out — expected configuration, not a build problem.
+      console.log(`  [Creek Adapter] worker.js left unminified (${outcome.reason})`);
     } else if (outcome.reason) {
       console.warn(`  [Creek Adapter] worker.js left unminified (${outcome.reason})`);
     }

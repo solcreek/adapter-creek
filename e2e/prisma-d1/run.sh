@@ -3,13 +3,15 @@
 # E2E: build a Prisma-on-D1 Next.js fixture through the Creek lazy-install
 # layout, then RUN the emitted worker in workerd and hit the D1 route.
 #
-# This is the publish gate for the class of bug that shipped in 0.2.13: the
-# build produced a valid-looking worker.js, but at runtime `new n.PrismaD1(...)`
-# threw "PrismaD1 is not a constructor" (the default-on minify pass corrupted
-# the @prisma/adapter-d1 interop), 500-ing every D1-backed page. A build-only
-# check (does worker.js exist?) cannot catch a runtime-only break — only
-# executing the worker in the real runtime does. That is the whole point of
-# this script: it does not stop at "built", it asserts the route returns 200.
+# This is the publish gate for the class of bug that shipped in 0.2.10–0.2.16:
+# the build produced a valid-looking worker.js, but at runtime
+# `new n.PrismaD1(...)` threw "PrismaD1 is not a constructor", 500-ing every
+# D1-backed page. (First blamed on 0.2.13's minify; the 0.2.17 root cause was
+# @prisma/adapter-d1 externalized to an empty module — minify was a red
+# herring.) A build-only check (does worker.js exist?) cannot catch a
+# runtime-only break — only executing the worker in the real runtime does. That
+# is the whole point of this script: it does not stop at "built", it asserts
+# the route returns 200.
 #
 # The build steps mirror creek's packages/cli/src/utils/nextjs.ts
 # (installCreekDep + buildWithAdapter) — same manifest shape, npm flags, and
@@ -33,15 +35,16 @@ export WRANGLER_SEND_METRICS=false
 log() { printf '\n\033[1m[e2e:prisma-d1] %s\033[0m\n' "$*"; }
 fail() { printf '\n\033[31m[e2e:prisma-d1] FAIL: %s\033[0m\n' "$*" >&2; exit 1; }
 
-# Minify mode. Default OFF (the safe default shipped since 0.2.14). E2E_MINIFY,
-# when set, is the AUTHORITATIVE control: it forces CREEK_ADAPTER_MINIFY on/off
-# so neither gate leg can be corrupted by an inherited env (a leaked
-# CREEK_ADAPTER_MINIFY=1 must not silently minify the "off" run), and an invalid
-# value fails fast rather than quietly defaulting to off. When E2E_MINIFY is
-# unset, a directly-set CREEK_ADAPTER_MINIFY is honored (matches the docs'
-# `CREEK_ADAPTER_MINIFY=1 run.sh` invocation). The log reflects the resolved mode.
-# minify-ON proves the pass also serves Prisma-D1 — it does not reproduce the
-# 0.2.13 "PrismaD1 is not a constructor" break. Same 200 assertion both ways.
+# Minify mode. Default ON (the 0.2.13 blame was overturned — 0.2.17 root cause
+# was adapter-d1 externalization, not minify; see minifyWorker in src/bundler.ts).
+# E2E_MINIFY, when set, is the AUTHORITATIVE control: it forces
+# CREEK_ADAPTER_MINIFY on/off so neither gate leg can be corrupted by an
+# inherited env (a leaked CREEK_ADAPTER_MINIFY must not flip either run), and an
+# invalid value fails fast. When E2E_MINIFY is unset, a directly-set
+# CREEK_ADAPTER_MINIFY is honored (matches the docs' `CREEK_ADAPTER_MINIFY=0
+# run.sh` invocation). The log reflects the resolved mode. The minify-OFF leg
+# keeps the escape hatch honest; the ON leg guards the interop that 0.2.13 was
+# (wrongly) blamed for. Same 200 assertion both ways.
 if [ -n "${E2E_MINIFY:-}" ]; then
   case "$E2E_MINIFY" in
     0) export CREEK_ADAPTER_MINIFY=0 ;;
@@ -49,12 +52,18 @@ if [ -n "${E2E_MINIFY:-}" ]; then
     *) fail "E2E_MINIFY must be 0 or 1 (got '$E2E_MINIFY')" ;;
   esac
 fi
-if [ "${CREEK_ADAPTER_MINIFY:-0}" = "1" ]; then
-  MINIFY_MODE="ON (CREEK_ADAPTER_MINIFY=1)"
-elif [ "${E2E_MINIFY:-}" = "0" ]; then
-  MINIFY_MODE="off (forced by E2E_MINIFY=0)"
+if [ "${CREEK_ADAPTER_MINIFY:-1}" = "0" ]; then
+  if [ "${E2E_MINIFY:-}" = "0" ]; then
+    MINIFY_MODE="off (forced by E2E_MINIFY=0)"
+  else
+    MINIFY_MODE="off (CREEK_ADAPTER_MINIFY=0)"
+  fi
+elif [ "${E2E_MINIFY:-}" = "1" ]; then
+  MINIFY_MODE="ON (forced by E2E_MINIFY=1)"
+elif [ -n "${CREEK_ADAPTER_MINIFY:-}" ]; then
+  MINIFY_MODE="ON (CREEK_ADAPTER_MINIFY=$CREEK_ADAPTER_MINIFY)"
 else
-  MINIFY_MODE="off (default)"
+  MINIFY_MODE="ON (default)"
 fi
 
 log "Building adapter and packing tarball (the EXACT bytes npm would publish)"
@@ -108,11 +117,39 @@ node -e "
 (cd .creek && npm install --no-audit --no-fund --ignore-scripts)
 
 # wrangler is a runtime dependency of the adapter, so it's resolved from the
-# adapter's own .creek dependency tree — use that binary rather than a floating
-# `npx wrangler` download so the gate exercises the same wrangler a real deploy
-# would, not whatever npx fetches.
-WRANGLER="$APP/.creek/node_modules/.bin/wrangler"
-test -x "$WRANGLER" || fail "wrangler not found in the adapter's .creek dependency tree at $WRANGLER"
+# adapter's own .creek dependency tree — the same wrangler a real deploy would
+# use, not whatever npx fetches. Resolve it via module resolution from the
+# adapter's package.json (mirroring src/bundler.ts resolveWranglerEntry), NOT a
+# hardcoded node_modules/.bin path: npm is free to nest wrangler under the
+# adapter instead of hoisting it (observed with npm 11's file:-tarball
+# install, where .creek/node_modules/.bin has no wrangler link), so the .bin
+# location is layout-dependent. Same lesson as adapter 0.2.2 in the creek CLI.
+WRANGLER_ENTRY="$(node -e "
+  const { createRequire } = require('node:module');
+  const path = require('node:path');
+  const fs = require('node:fs');
+  const appRequire = createRequire(path.join(process.argv[1], '.creek', 'package.json'));
+  // The adapter's exports map doesn't expose './package.json' — resolve the
+  // exported entry ('.') and walk up to the package root instead.
+  const adapterEntry = appRequire.resolve('@solcreek/adapter-creek');
+  let dir = path.dirname(adapterEntry);
+  // Root guard: path.dirname('/') === '/', so a broken install with no
+  // package.json on the walk-up path must fail fast, not spin forever.
+  while (!fs.existsSync(path.join(dir, 'package.json'))) {
+    const parent = path.dirname(dir);
+    if (parent === dir) {
+      console.error('no package.json found walking up from ' + adapterEntry);
+      process.exit(1);
+    }
+    dir = parent;
+  }
+  const adapterRequire = createRequire(path.join(dir, 'package.json'));
+  const wranglerPkgPath = adapterRequire.resolve('wrangler/package.json');
+  const binField = JSON.parse(fs.readFileSync(wranglerPkgPath, 'utf8')).bin;
+  const binRel = typeof binField === 'string' ? binField : binField.wrangler;
+  console.log(path.join(path.dirname(wranglerPkgPath), binRel));
+" "$APP")" || fail "could not resolve wrangler through the adapter's dependency tree"
+test -f "$WRANGLER_ENTRY" || fail "wrangler entry not found at $WRANGLER_ENTRY"
 
 ADAPTER_PATH="$(node -e "
   const { createRequire } = require('node:module');
@@ -173,7 +210,7 @@ TOML
 
 log "Seeding the Note table into the local D1 (model queries need it)"
 cd "$SERVER_DIR"
-"$WRANGLER" d1 execute e2e-prisma-d1 --local \
+node "$WRANGLER_ENTRY" d1 execute e2e-prisma-d1 --local \
   --command "CREATE TABLE IF NOT EXISTS Note (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL)" \
   >"$WORK/seed.log" 2>&1 || { cat "$WORK/seed.log" >&2; fail "could not seed local D1"; }
 
@@ -181,7 +218,7 @@ log "Starting workerd via wrangler dev on :$PORT"
 # --no-bundle: serve the adapter's EMITTED worker.js as-is (matching the
 # WfP upload path, which does not re-bundle), so the gate tests the real
 # artifact rather than a wrangler re-bundle that could mask emitted-bundle bugs.
-"$WRANGLER" dev --port "$PORT" --no-bundle >"$WORK/wrangler.log" 2>&1 &
+node "$WRANGLER_ENTRY" dev --port "$PORT" --no-bundle >"$WORK/wrangler.log" 2>&1 &
 WRANGLER_PID=$!
 
 log "Waiting for the worker to come up"
