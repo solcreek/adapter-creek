@@ -58,7 +58,8 @@ jobs:
       # The publish gate for the 0.2.13-class regression: unit tests pass but the
       # emitted worker can still break at runtime. Build the Prisma-on-D1 fixture
       # and assert its D1 route returns 200 in workerd BEFORE publishing — for
-      # both minify off (the default) and on (the opt-in worker.js minify).
+      # both minify on (the default since 0.2.18) and off (the
+      # CREEK_ADAPTER_MINIFY=0 escape hatch).
       - name: E2E — Prisma-on-D1 runtime gate (minify off)
         run: e2e/prisma-d1/run.sh
         env:
