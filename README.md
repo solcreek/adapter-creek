@@ -107,18 +107,25 @@ Output goes to `.creek/adapter-output/`:
   assets/ …
 ```
 
-### Opt-in worker minify
+### Worker minify (on by default)
 
-`CREEK_ADAPTER_MINIFY=1` minifies the emitted `worker.js` (typically ~35%
-smaller — useful when a dependency-heavy app approaches the bundle size limit).
+The emitted `worker.js` is minified with a standalone esbuild pass (typically
+~35% smaller), keeping dependency-heavy apps away from the Workers bundle-size
+and startup limits. Opt out with `CREEK_ADAPTER_MINIFY=0` (e.g. to debug the
+emitted worker with readable code).
 
-**Off by default.** 0.2.13 shipped it on and broke Prisma driver-adapter apps at
-runtime (`PrismaD1 is not a constructor`). A Prisma-on-D1 runtime e2e gate now
-runs in **both** minify modes on every publish (see `e2e/prisma-d1`), guarding
-the Prisma-D1 path against a minify-induced runtime break. (It does not
-reproduce that exact 0.2.13 failure — that was minifier-input-dependent — so the
-default stays off: a real app can still hit an edge this fixture doesn't.)
-Enable it when you've verified your own deploy end-to-end.
+History: 0.2.13 shipped minify on, was blamed for a Prisma runtime break
+(`PrismaD1 is not a constructor`), and 0.2.14 turned it off. The 0.2.17
+root-cause analysis overturned that blame — the break was Next externalizing
+`@prisma/adapter-d1` to an empty module, identical with minify off. A
+Prisma-on-D1 runtime e2e gate runs in **both** minify modes on every PR and
+every publish (see `e2e/prisma-d1`), so a real minify-induced interop break
+now blocks the release instead of shipping.
+
+The minify pass always runs **after** the adapter's post-bundle compatibility
+patches — that ordering is load-bearing (the patches match unminified output).
+It is also best-effort: if esbuild is unresolvable or the transform fails, the
+build ships the unminified worker instead of failing.
 
 ## How It Works
 

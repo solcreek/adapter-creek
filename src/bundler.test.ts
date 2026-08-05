@@ -201,9 +201,22 @@ describe("minifyWorker", () => {
     delete process.env.CREEK_ADAPTER_MINIFY;
   });
 
-  // Off by default: 0.2.13 shipped minify ON and broke Prisma-D1 apps at
-  // runtime, so nothing minifies unless a build explicitly opts in.
-  it("is off by default (no opt-in) and leaves the worker untouched", async () => {
+  // ON by default since the 0.2.13 blame was overturned (0.2.17 root cause:
+  // adapter-d1 externalization, "minify was a red herring"). Opt out with
+  // CREEK_ADAPTER_MINIFY=0.
+  it("is on by default and minifies the worker in place", async () => {
+    const workerPath = path.join(workDir, "worker.js");
+    const source = "export const x = 1;  // a comment that must not survive\n";
+    writeFileSync(workerPath, source);
+
+    const outcome = await minifyWorker(workerPath, selfRequire);
+
+    expect(outcome).toEqual({ minified: true });
+    expect(readFileSync(workerPath, "utf-8")).not.toContain("must not survive");
+  });
+
+  it("is disabled via CREEK_ADAPTER_MINIFY=0 and leaves the worker untouched", async () => {
+    process.env.CREEK_ADAPTER_MINIFY = "0";
     const workerPath = path.join(workDir, "worker.js");
     const source = "export const x = 1;  // keep me\n";
     writeFileSync(workerPath, source);
@@ -211,11 +224,11 @@ describe("minifyWorker", () => {
     const outcome = await minifyWorker(workerPath, selfRequire);
 
     expect(outcome.minified).toBe(false);
-    expect(outcome.reason).toMatch(/off by default/);
+    expect(outcome.reason).toMatch(/disabled via CREEK_ADAPTER_MINIFY=0/);
     expect(readFileSync(workerPath, "utf-8")).toBe(source);
   });
 
-  it("minifies in place when opted in via CREEK_ADAPTER_MINIFY=1", async () => {
+  it("still minifies when explicitly set to 1 (back-compat with the opt-in era)", async () => {
     process.env.CREEK_ADAPTER_MINIFY = "1";
     const workerPath = path.join(workDir, "worker.js");
     const verbose =

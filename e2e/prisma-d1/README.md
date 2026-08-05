@@ -9,8 +9,8 @@ was produced), this executes the worker, so it catches runtime-only breakage
 in the Prisma-on-D1 path.
 
 Run: `e2e/prisma-d1/run.sh` (needs network; wrangler is resolved from the
-adapter's own dependency tree via the `.creek` lazy-install, not `npx`). Opt
-into the minify pass with `CREEK_ADAPTER_MINIFY=1`.
+adapter's own dependency tree via the `.creek` lazy-install, not `npx`). Minify
+is on by default; opt out with `CREEK_ADAPTER_MINIFY=0`.
 
 **CI:** this gate runs in `checks.yml` (every PR + push to `main`) and again in
 `publish.yml` right before `npm publish`, so a runtime regression blocks the
@@ -22,18 +22,19 @@ wrangler re-bundle).
 
 The gate runs **both** ways (CI matrix + both steps in `publish.yml`):
 
-- **minify off** — the default since 0.2.14.
-- **minify on** — `E2E_MINIFY=1` sets `CREEK_ADAPTER_MINIFY=1`, exercising the
-  opt-in worker.js minify pass and asserting the same 200. This is the
-  "Prisma-D1 e2e test" that `minifyWorker` was waiting on: it proves the
-  minify pass doesn't reproduce the 0.2.13 interop break on this path, and
-  guards it going forward. On this fixture minify shrinks worker.js ~5.2MB →
-  3.3MB (−36%).
+- **minify on** — the default. `E2E_MINIFY=1` forces it explicitly for the CI
+  leg. On this fixture minify shrinks worker.js ~5.2MB → 3.3MB (−36%).
+- **minify off** — `E2E_MINIFY=0` forces `CREEK_ADAPTER_MINIFY=0`, keeping the
+  escape hatch honest (an unminified build must serve identically).
 
-Minify stays **opt-in** (default off): it is validated safe here, but 0.2.13
-showed a real app can break where a fixture doesn't, so we don't flip the
-default — the switch is for someone who verifies their own worker end-to-end
-(this gate now makes that safe to recommend).
+Why the default is on: 0.2.13 shipped minify on and was blamed for the
+"PrismaD1 is not a constructor" break; 0.2.14 turned it off. The 0.2.17
+root-cause analysis (commit 0dfa03e) overturned that blame — the break was
+`@prisma/adapter-d1` being externalized to an empty module, present since
+0.2.10 and identical with minify off ("minify was a red herring"). With the
+misattribution cleared and this gate running both legs on every PR and every
+publish, minify is on by default; `CREEK_ADAPTER_MINIFY=0` remains for
+debugging the emitted worker.
 
 ## B11 duplicate-wasm gate
 
