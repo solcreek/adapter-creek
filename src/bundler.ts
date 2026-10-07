@@ -14,6 +14,7 @@ import { execFileSync } from "node:child_process";
 import { builtinModules, createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { WORKER_COMPATIBILITY_DATE, WORKER_COMPATIBILITY_FLAGS } from "./compat.js";
+import { escapeNonLatin1 } from "./escape-source.js";
 
 /** Escape a string for safe interpolation into a RegExp source. */
 function escapeRegExp(s: string): string {
@@ -1610,6 +1611,43 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       console.log(`  [Creek Adapter] worker.js left unminified (${outcome.reason})`);
     } else if (outcome.reason) {
       console.warn(`  [Creek Adapter] worker.js left unminified (${outcome.reason})`);
+    }
+  }
+
+  // Escape characters above U+00FF so V8 holds the source one byte per
+  // character. Runs after minify, which escapes most of them already; with
+  // minify off it escapes them all. See escape-source.ts.
+  {
+    const code = await fs.readFile(workerPath, "utf-8").catch(() => null);
+    if (code !== null) {
+      const result = escapeNonLatin1(code);
+      const mb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+      if (result.kept > 0) {
+        // Still two-byte: a partial rewrite would only grow the file, so it is
+        // not written and every character found stays, escapable ones too.
+        const why = result.reason ?? `${result.kept} in template text`;
+        console.warn(
+          `  [Creek Adapter] worker.js keeps ${result.escaped + result.kept} character(s) above U+00FF (${why}); ` +
+            `V8 stores the whole source two bytes per character, about ${mb(code.length)} more isolate memory`,
+        );
+      } else if (result.escaped > 0) {
+        // Two bytes per character before, one byte per character after.
+        const saved = 2 * code.length - result.code.length;
+        if (saved > 0) {
+          await fs.writeFile(workerPath, result.code);
+          console.log(
+            `  [Creek Adapter] worker.js: escaped ${result.escaped} character(s) above U+00FF, ` +
+              `saving ${mb(saved)} of isolate memory`,
+          );
+        } else {
+          // Only for a source this dense in escapable characters: the escapes
+          // would cost more than the second byte per character they remove.
+          console.warn(
+            `  [Creek Adapter] worker.js keeps ${result.escaped} character(s) above U+00FF; ` +
+              `escaping them would take ${mb(-saved)} more isolate memory than keeping the source two bytes per character`,
+          );
+        }
+      }
     }
   }
 
