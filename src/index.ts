@@ -101,6 +101,28 @@ function mirrorCacheHandlerIntoProject(cacheHandlerPath: string): string {
   }
 }
 
+/**
+ * The adapter builds Workers from webpack output only. Under Turbopack the
+ * SQLite-to-D1 driver swap and the Prisma-on-D1 alias in `webpack()` below
+ * never apply, so a real `better-sqlite3` is bundled and every D1-backed route
+ * fails at runtime; Turbopack output is also not covered by the adapter's
+ * end-to-end tests.
+ *
+ * Next.js sets `process.env.TURBOPACK` while it parses the `next build` flags
+ * (to "1" for `--turbopack`, "auto" when no bundler flag is given, since
+ * Turbopack is the default), before it loads the config. Checking it here
+ * stops the build before anything is bundled. `creek deploy` always runs
+ * `next build --webpack`. Exported for tests.
+ */
+export function assertWebpackBuild(env: NodeJS.ProcessEnv = process.env): void {
+  if (!env.TURBOPACK) return;
+  throw new Error(
+    `[Creek Adapter] This build uses Turbopack (TURBOPACK=${env.TURBOPACK}). ` +
+      "The Creek adapter supports webpack builds only: run `next build --webpack`. " +
+      "`creek deploy` runs it for you.",
+  );
+}
+
 const adapter: NextAdapter = {
   name: "adapter-creek",
 
@@ -116,6 +138,7 @@ const adapter: NextAdapter = {
     // production build phase; applyBaseModifyConfig is a passthrough
     // for other phases, so guarding here matches its behaviour.
     if (ctx.phase !== "phase-production-build") return baseConfig;
+    assertWebpackBuild();
 
     // Keep the mirrored handler anchored to this adapter's dependency tree,
     // not the consumer project's shared @solcreek/adapter-next-core copy.

@@ -13,7 +13,39 @@ import * as path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import ts from "typescript";
 
-import adapter from "./index.js";
+import adapter, { assertWebpackBuild } from "./index.js";
+
+describe("webpack-only guard", () => {
+  let saved: string | undefined;
+  beforeEach(() => {
+    saved = process.env.TURBOPACK;
+  });
+  afterEach(() => {
+    if (saved === undefined) delete process.env.TURBOPACK;
+    else process.env.TURBOPACK = saved;
+  });
+
+  it("accepts a webpack build (Next leaves TURBOPACK unset for --webpack)", () => {
+    expect(() => assertWebpackBuild({})).not.toThrow();
+  });
+
+  it.each(["1", "auto"])("refuses a Turbopack build (TURBOPACK=%s)", (value) => {
+    // "1": `next build --turbopack`; "auto": plain `next build`, Turbopack by default.
+    expect(() => assertWebpackBuild({ TURBOPACK: value })).toThrow(/supports webpack builds only: run `next build --webpack`/);
+  });
+
+  it("stops a Turbopack production build in modifyConfig, before anything is bundled", () => {
+    process.env.TURBOPACK = "auto";
+    expect(() => adapter.modifyConfig?.({}, { phase: "phase-production-build" } as never)).toThrow(
+      /\[Creek Adapter\] This build uses Turbopack \(TURBOPACK=auto\)/,
+    );
+  });
+
+  it("leaves next dev alone, which runs Turbopack by default", () => {
+    process.env.TURBOPACK = "auto";
+    expect(() => adapter.modifyConfig?.({}, { phase: "phase-development-server" } as never)).not.toThrow();
+  });
+});
 
 describe("adapter modifyConfig", () => {
   let originalCwd: string;
