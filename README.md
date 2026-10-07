@@ -61,7 +61,10 @@ Full Next.js coverage on Cloudflare Workers — zero adapter-specific skips. The
 ## Requirements
 
 - Next.js ≥ 16.2
-- Turbopack (default) or Webpack via `--webpack`
+- A webpack build: `next build --webpack`. `creek deploy` runs it for you.
+  A Turbopack build (`next build` without `--webpack`, or `--turbopack`) stops
+  at config load with an error: the adapter swaps local SQLite drivers for D1
+  through webpack aliases, which Turbopack does not apply.
 
 ## Usage
 
@@ -130,8 +133,10 @@ build ships the unminified worker instead of failing.
 ## How It Works
 
 ```
-next build  (Turbopack by default, Webpack via --webpack)
+next build --webpack
   → modifyConfig
+      • refuses a Turbopack build (`process.env.TURBOPACK` is set)
+      • webpack aliases: SQLite drivers → D1 shims, `@prisma/adapter-d1` bundled
       • `outputFileTracingRoot` (monorepo aware)
       • `cacheMaxMemorySize: 0` (we ship a DO-backed IncrementalCache)
       • `maxPostponedStateSize: 20mb` (workerd-safe PPR fallback size)
@@ -148,11 +153,9 @@ next build  (Turbopack by default, Webpack via --webpack)
            - edge/node dispatch via `_ENTRIES` registry
            - same-origin `fetch()` coalescer for RSC chunk-count fidelity
            - `IncomingMessage` / `ServerResponse` bridge
-      6. Post-process Turbopack output
-           - hard-resolve `[externals]*.js` lazy-requires
-           - collect ssr/ lazy-require aliases → wrangler `alias` map
-           - (preserves module identity; no source rewrite of ssr/ chunks)
-      7. esbuild + workerd bundle via `wrangler --dry-run`
+      6. esbuild + workerd bundle via `wrangler --dry-run`
+      7. Minify, then escape characters above U+00FF (keeps the source one
+         byte per character in V8)
       8. Write `.creek/adapter-output/` + deploy manifest
 ```
 
