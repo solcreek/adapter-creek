@@ -49,6 +49,13 @@ describe("findTurbopackSqliteDrivers", () => {
     expect(await findTurbopackSqliteDrivers(distDir)).toEqual(["better-sqlite3"]);
   });
 
+  it("finds the external through either half of Turbopack's external call", async () => {
+    turbopackBuild('e.x("better-sqlite3-90e2652d1716b047",()=>null)');
+    expect(await findTurbopackSqliteDrivers(distDir)).toEqual(["better-sqlite3"]);
+    turbopackBuild('const m = require("better-sqlite3-90e2652d1716b047");');
+    expect(await findTurbopackSqliteDrivers(distDir)).toEqual(["better-sqlite3"]);
+  });
+
   it("finds a plain require of the package", async () => {
     turbopackBuild('module.exports = require("better-sqlite3");');
     expect(await findTurbopackSqliteDrivers(distDir)).toEqual(["better-sqlite3"]);
@@ -78,6 +85,7 @@ describe("findTurbopackSqliteDrivers", () => {
     turbopackBuild(
       [
         'const config = { driver: "better-sqlite3" };', // a value in application code
+        'const id = "better-sqlite3-deadbeef";', // a hash-shaped value, not an external
         '"[project]/node_modules/drizzle-orm/better-sqlite3/driver.js"', // another package's subpath
         "// install better-sqlite3 for local development",
       ].join("\n"),

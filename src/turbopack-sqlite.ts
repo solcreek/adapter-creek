@@ -13,9 +13,10 @@
  * build ran from, or bundler environment variables:
  * - a Turbopack build is one with a `[turbopack]_runtime.js` server chunk,
  *   which webpack and Rspack builds never emit;
- * - a driver is present when a server chunk names it as a Turbopack external
- *   (`e.x("better-sqlite3-<hash>", () => require("better-sqlite3-<hash>"))`)
- *   or bundles one of its modules (`[project]/node_modules/better-sqlite3/…`).
+ * - a driver is present when a server chunk loads it as a Turbopack external
+ *   (`e.x("better-sqlite3-<hash>", () => require("better-sqlite3-<hash>"))`),
+ *   requires it, or bundles one of its modules
+ *   (`[project]/node_modules/better-sqlite3/…`).
  */
 
 import * as fs from "node:fs/promises";
@@ -29,13 +30,12 @@ function escapeRegExp(s: string): string {
 
 const DRIVER_PATTERNS = DRIVERS.map((name) => {
   const n = escapeRegExp(name);
-  // Turbopack's hashed external id, a plain require of the package, or a path
-  // into the package's own directory. The bare quoted name alone is not
-  // enough: application code can mention it as a value.
-  return {
-    name,
-    pattern: new RegExp(`["']${n}-[0-9a-f]{8,}["']|require\\(["']${n}["']\\)|node_modules/${n}/`),
-  };
+  // Turbopack's external call `.x("<name>-<hash>"`, a require of the package
+  // (hashed or not), or a path into the package's own directory. A quoted
+  // name, hashed or not, is not enough on its own: application code can hold
+  // it as a value.
+  const id = `["']${n}(?:-[0-9a-f]{8,})?["']`;
+  return { name, pattern: new RegExp(`\\.x\\(${id}|require\\(${id}\\)|node_modules/${n}/`) };
 });
 
 async function* serverChunks(dir: string): AsyncGenerator<string> {
