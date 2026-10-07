@@ -19,8 +19,9 @@
  *   flags and as a surrogate pair of escapes otherwise (a non-unicode regex
  *   sees them as two code units either way). Odd backslash runs as above.
  * - identifiers and private names: `\uXXXX` / `\u{X}`.
- * - comments: escaped as text; whitespace between tokens becomes a space, or
- *   a newline for U+2028/U+2029 (both are line terminators, so ASI holds).
+ * - comments: escaped as text; whitespace between tokens becomes a space.
+ *   U+2028/U+2029 become a newline in both, so ASI holds (a block comment
+ *   containing a line terminator counts as one).
  * - template text is left alone and counted as `kept`: whether a template is
  *   tagged is not visible at the token level, and escaping a tagged one
  *   changes `strings.raw`.
@@ -111,7 +112,9 @@ export function escapeNonLatin1(code: string): EscapeResult {
   const between = (hit: Hit): void => {
     while (c < comments.length && comments[c][1] <= hit.pos) c++;
     const inComment = c < comments.length && comments[c][0] <= hit.pos;
-    const text = inComment ? escapeCodePoint(hit.cp) : isLineSeparator(hit.cp) ? "\n" : " ";
+    // A line separator stays a line break even inside a block comment: a
+    // multi-line comment is a line terminator for ASI.
+    const text = isLineSeparator(hit.cp) ? "\n" : inComment ? escapeCodePoint(hit.cp) : " ";
     edits.push({ start: hit.pos, end: hit.pos + hit.len, text });
   };
 

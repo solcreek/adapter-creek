@@ -128,6 +128,11 @@ describe("escapeNonLatin1", () => {
     `);
   });
 
+  it("keeps a line separator inside a block comment a line break", () => {
+    // `return /*<LS>*/ 1` returns undefined: the comment ends the statement.
+    expectSameResult("function f() { return /* 註\u2028解 */ 1 }\nreturn f();");
+  });
+
   it("escapes comments and replaces non-Latin-1 whitespace", () => {
     expectSameResult("const a = 1\u2028const b = 2\u3000;\n// 註解\n/* 區塊註解 */\nreturn [a, b];");
   });
