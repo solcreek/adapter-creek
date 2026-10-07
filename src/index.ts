@@ -142,7 +142,7 @@ export function d1SwapDependencies(dir: string = process.cwd()): string[] {
  */
 export function assertD1SwapApplies(env: NodeJS.ProcessEnv, swapDependencies: string[]): void {
   if (!env.TURBOPACK || swapDependencies.length === 0) return;
-  if (env.NEXT_RSPACK || env.NEXT_TEST_USE_RSPACK) return;
+  if (env.NEXT_RSPACK) return; // the variable finalizeBundlerFromConfig switches on
   throw new Error(
     `[Creek Adapter] This build uses Turbopack (TURBOPACK=${env.TURBOPACK}), and the project ` +
       `depends on ${swapDependencies.join(", ")}. The adapter swaps SQLite for D1 through webpack ` +
