@@ -1623,10 +1623,11 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       const result = escapeNonLatin1(code);
       const mb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)}MB`;
       if (result.kept > 0) {
-        // Still two-byte: a partial rewrite would only grow the file.
-        const why = result.reason ?? "template text";
+        // Still two-byte: a partial rewrite would only grow the file, so it is
+        // not written and every character found stays, escapable ones too.
+        const why = result.reason ?? `${result.kept} in template text`;
         console.warn(
-          `  [Creek Adapter] worker.js keeps ${result.kept} character(s) above U+00FF (${why}); ` +
+          `  [Creek Adapter] worker.js keeps ${result.escaped + result.kept} character(s) above U+00FF (${why}); ` +
             `V8 stores the whole source two bytes per character, about ${mb(code.length)} more isolate memory`,
         );
       } else if (result.escaped > 0) {
