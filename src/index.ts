@@ -134,10 +134,15 @@ export function d1SwapDependencies(dir: string = process.cwd()): string[] {
  * (to "1" for `--turbopack`, "auto" when no bundler flag is given, since
  * Turbopack is the default), before it loads the config, so this runs before
  * anything is bundled. `creek deploy` always runs `next build --webpack`.
- * Exported for tests.
+ *
+ * A plain `next build` sets TURBOPACK=auto even for an Rspack project: loading
+ * the config sets NEXT_RSPACK (next-rspack's `withRspack`), and Next then
+ * switches to Rspack without clearing TURBOPACK. Rspack runs the `webpack()`
+ * aliases, so such a build is not refused. Exported for tests.
  */
 export function assertD1SwapApplies(env: NodeJS.ProcessEnv, swapDependencies: string[]): void {
   if (!env.TURBOPACK || swapDependencies.length === 0) return;
+  if (env.NEXT_RSPACK || env.NEXT_TEST_USE_RSPACK) return;
   throw new Error(
     `[Creek Adapter] This build uses Turbopack (TURBOPACK=${env.TURBOPACK}), and the project ` +
       `depends on ${swapDependencies.join(", ")}. The adapter swaps SQLite for D1 through webpack ` +

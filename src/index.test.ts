@@ -51,6 +51,12 @@ describe("Turbopack guard for the SQLite-to-D1 swap", () => {
     expect(() => assertD1SwapApplies({}, ["better-sqlite3"])).not.toThrow();
   });
 
+  it.each(["NEXT_RSPACK", "NEXT_TEST_USE_RSPACK"])("accepts an Rspack build, which keeps TURBOPACK=auto (%s set)", (flag) => {
+    // Next sets TURBOPACK=auto before the config sets the Rspack flag, then
+    // switches to Rspack without clearing it; Rspack applies the aliases.
+    expect(() => assertD1SwapApplies({ TURBOPACK: "auto", [flag]: "true" }, ["better-sqlite3"])).not.toThrow();
+  });
+
   it("accepts a Turbopack build of a project that does not rely on the swap", () => {
     // The Next.js deploy suite builds its fixtures under Turbopack.
     expect(() => assertD1SwapApplies({ TURBOPACK: "1" }, [])).not.toThrow();
