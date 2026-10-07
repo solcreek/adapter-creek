@@ -14,6 +14,7 @@ import { execFileSync } from "node:child_process";
 import { builtinModules, createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { WORKER_COMPATIBILITY_DATE, WORKER_COMPATIBILITY_FLAGS } from "./compat.js";
+import { escapeNonLatin1 } from "./escape-source.js";
 
 /** Escape a string for safe interpolation into a RegExp source. */
 function escapeRegExp(s: string): string {
@@ -1610,6 +1611,30 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
       console.log(`  [Creek Adapter] worker.js left unminified (${outcome.reason})`);
     } else if (outcome.reason) {
       console.warn(`  [Creek Adapter] worker.js left unminified (${outcome.reason})`);
+    }
+  }
+
+  // Escape characters above U+00FF so V8 holds the source one byte per
+  // character. Runs after minify, which escapes most of them already; with
+  // minify off it escapes them all. See escape-source.ts.
+  {
+    const code = await fs.readFile(workerPath, "utf-8").catch(() => null);
+    if (code !== null) {
+      const result = escapeNonLatin1(code);
+      if (result.escaped > 0) await fs.writeFile(workerPath, result.code);
+      const sourceMB = `${(result.code.length / 1024 / 1024).toFixed(1)}MB`;
+      if (result.kept > 0) {
+        const why = result.reason ?? "template text";
+        console.warn(
+          `  [Creek Adapter] worker.js keeps ${result.kept} character(s) above U+00FF (${why}); ` +
+            `V8 stores the whole source two bytes per character, ${sourceMB} more isolate memory`,
+        );
+      } else if (result.escaped > 0) {
+        console.log(
+          `  [Creek Adapter] worker.js: escaped ${result.escaped} character(s) above U+00FF, ` +
+            `saving ${sourceMB} of isolate memory`,
+        );
+      }
     }
   }
 
