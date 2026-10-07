@@ -106,11 +106,13 @@ describe("findTurbopackSqliteDrivers", () => {
 });
 
 describe("turbopackSqliteError", () => {
-  it("names the drivers and the webpack build", () => {
+  it("names the drivers, the webpack build, and that direct use is unsupported", () => {
     expect(turbopackSqliteError(["better-sqlite3", "@prisma/adapter-better-sqlite3"]).message).toBe(
       "[Creek Adapter] This Turbopack build contains better-sqlite3 and @prisma/adapter-better-sqlite3. " +
-        "The adapter swaps SQLite for D1 through webpack aliases, which Turbopack does not apply, so every " +
-        "database route would fail on Workers. Build with `next build --webpack`; `creek deploy` runs it for you.",
+        "The adapter runs the Prisma and Drizzle better-sqlite3 adapters on D1 through webpack aliases, " +
+        "which Turbopack does not apply, so every database route would fail on Workers. Build with " +
+        "`next build --webpack`; `creek deploy` runs it for you. Code that calls better-sqlite3 directly " +
+        "is not supported on Workers.",
     );
   });
 });

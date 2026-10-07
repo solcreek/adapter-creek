@@ -63,11 +63,13 @@ Full Next.js coverage on Cloudflare Workers — zero adapter-specific skips. The
 - Next.js ≥ 16.2
 - Turbopack (default) or webpack via `--webpack`. `creek deploy` builds with
   `--webpack`.
-- The SQLite-to-D1 swap (`better-sqlite3`, `@prisma/adapter-better-sqlite3`,
-  `drizzle-orm/better-sqlite3`) works in webpack builds only: it is a set of
-  webpack aliases. A Turbopack build whose server output contains
-  `better-sqlite3` fails with an error naming `next build --webpack`, before
-  the adapter writes any output.
+- Local SQLite through Prisma (`@prisma/adapter-better-sqlite3`) or Drizzle
+  (`drizzle-orm/better-sqlite3`) runs on D1 on Workers: webpack aliases swap
+  those adapters for D1-backed shims. That works in webpack builds only. A
+  Turbopack build whose server output contains `better-sqlite3` fails with an
+  error naming `next build --webpack`, before the adapter writes any output.
+- Calling `better-sqlite3` directly is not supported on Workers, with either
+  bundler: the driver is replaced by a stub whose `prepare()` throws.
 
 ## Usage
 
@@ -140,7 +142,8 @@ build ships the unminified worker instead of failing.
 ```
 next build  (Turbopack by default, webpack via --webpack; creek deploy uses --webpack)
   → modifyConfig
-      • webpack aliases: SQLite drivers → D1 shims, `@prisma/adapter-d1` bundled
+      • webpack aliases: Prisma/Drizzle better-sqlite3 adapters → D1 shims,
+        `better-sqlite3` → stub, `@prisma/adapter-d1` bundled
       • `outputFileTracingRoot` (monorepo aware)
       • `cacheMaxMemorySize: 0` (we ship a DO-backed IncrementalCache)
       • `maxPostponedStateSize: 20mb` (workerd-safe PPR fallback size)

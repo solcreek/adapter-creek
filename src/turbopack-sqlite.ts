@@ -81,8 +81,10 @@ export async function findTurbopackSqliteDrivers(distDir: string): Promise<strin
 /** The build error for a Turbopack build that contains `drivers`. */
 export function turbopackSqliteError(drivers: string[]): Error {
   return new Error(
-    `[Creek Adapter] This Turbopack build contains ${drivers.join(" and ")}. The adapter swaps ` +
-      "SQLite for D1 through webpack aliases, which Turbopack does not apply, so every database " +
-      "route would fail on Workers. Build with `next build --webpack`; `creek deploy` runs it for you.",
+    `[Creek Adapter] This Turbopack build contains ${drivers.join(" and ")}. The adapter runs ` +
+      "the Prisma and Drizzle better-sqlite3 adapters on D1 through webpack aliases, which " +
+      "Turbopack does not apply, so every database route would fail on Workers. Build with " +
+      "`next build --webpack`; `creek deploy` runs it for you. Code that calls better-sqlite3 " +
+      "directly is not supported on Workers.",
   );
 }
