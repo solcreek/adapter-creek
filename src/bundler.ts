@@ -1644,7 +1644,7 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
           // would cost more than the second byte per character they remove.
           console.warn(
             `  [Creek Adapter] worker.js keeps ${result.escaped} character(s) above U+00FF; ` +
-              `escaping them would grow the source by ${mb(-saved)}, so it stays two bytes per character`,
+              `escaping them would take ${mb(-saved)} more isolate memory than keeping the source two bytes per character`,
           );
         }
       }
