@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { copyFileSync, existsSync, readFileSync } from "node:fs";
+import { copyFileSync, existsSync } from "node:fs";
 import type { NextAdapter } from "next";
 import { applyBaseModifyConfig } from "@solcreek/adapter-next-core";
 import { handleBuild } from "./build.js";
@@ -101,56 +101,6 @@ function mirrorCacheHandlerIntoProject(cacheHandlerPath: string): string {
   }
 }
 
-/**
- * Packages whose presence means the build relies on the SQLite-to-D1 swap: the
- * driver aliases in DB_DRIVER_ALIASES, the Prisma query-compiler stub, and
- * forcing `@prisma/adapter-d1` into the bundle (resolvePrismaD1Alias). A
- * Prisma SQLite project always depends on one of these adapters.
- */
-const D1_SWAP_PACKAGES = ["better-sqlite3", "@prisma/adapter-better-sqlite3", "@prisma/adapter-d1"];
-
-/** The D1-swap packages the project in `dir` lists as dependencies or devDependencies. */
-export function d1SwapDependencies(dir: string = process.cwd()): string[] {
-  try {
-    const pkg = JSON.parse(readFileSync(path.join(dir, "package.json"), "utf-8")) as {
-      dependencies?: Record<string, string>;
-      devDependencies?: Record<string, string>;
-    };
-    const deps = { ...pkg.devDependencies, ...pkg.dependencies };
-    return D1_SWAP_PACKAGES.filter((name) => Object.hasOwn(deps, name));
-  } catch {
-    return [];
-  }
-}
-
-/**
- * The SQLite-to-D1 swap is a set of webpack aliases (see `webpack()` below).
- * A Turbopack build never applies them: a project that relies on the swap
- * gets the real `better-sqlite3` (or an externalized, empty
- * `@prisma/adapter-d1`) bundled, and every database route fails at runtime.
- * Such a build is stopped here. Other Turbopack builds are left alone.
- *
- * Next.js sets `process.env.TURBOPACK` while it parses the `next build` flags
- * (to "1" for `--turbopack`, "auto" when no bundler flag is given, since
- * Turbopack is the default), before it loads the config, so this runs before
- * anything is bundled. `creek deploy` always runs `next build --webpack`.
- *
- * A plain `next build` sets TURBOPACK=auto even for an Rspack project: loading
- * the config sets NEXT_RSPACK (next-rspack's `withRspack`), and Next then
- * switches to Rspack without clearing TURBOPACK. Rspack runs the `webpack()`
- * aliases, so such a build is not refused. Exported for tests.
- */
-export function assertD1SwapApplies(env: NodeJS.ProcessEnv, swapDependencies: string[]): void {
-  if (!env.TURBOPACK || swapDependencies.length === 0) return;
-  if (env.NEXT_RSPACK) return; // the variable finalizeBundlerFromConfig switches on
-  throw new Error(
-    `[Creek Adapter] This build uses Turbopack (TURBOPACK=${env.TURBOPACK}), and the project ` +
-      `depends on ${swapDependencies.join(", ")}. The adapter swaps SQLite for D1 through webpack ` +
-      "aliases, which Turbopack does not apply, so every database route would fail. " +
-      "Build with `next build --webpack`; `creek deploy` runs it for you.",
-  );
-}
-
 const adapter: NextAdapter = {
   name: "adapter-creek",
 
@@ -166,7 +116,6 @@ const adapter: NextAdapter = {
     // production build phase; applyBaseModifyConfig is a passthrough
     // for other phases, so guarding here matches its behaviour.
     if (ctx.phase !== "phase-production-build") return baseConfig;
-    assertD1SwapApplies(process.env, d1SwapDependencies());
 
     // Keep the mirrored handler anchored to this adapter's dependency tree,
     // not the consumer project's shared @solcreek/adapter-next-core copy.

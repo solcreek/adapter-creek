@@ -17,6 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { NextAdapter } from "next";
 import { generateWorkerEntry } from "./worker-entry.js";
 import { bundleForWorkers } from "./bundler.js";
+import { findTurbopackSqliteDrivers, turbopackSqliteError } from "./turbopack-sqlite.js";
 import { writeManifest } from "./manifest.js";
 import { evaluateBundleSize, type ScriptFileSize } from "./bundle-size.js";
 
@@ -158,6 +159,12 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   const serverDir = path.join(outputDir, "server");
 
   await fs.rm(outputDir, { recursive: true, force: true });
+
+  // Before any output exists: a Turbopack build that bundled a native SQLite
+  // driver missed the D1 swap and would fail on every database route.
+  const sqliteDrivers = await findTurbopackSqliteDrivers(ctx.distDir);
+  if (sqliteDrivers.length > 0) throw turbopackSqliteError(sqliteDrivers);
+
   await fs.mkdir(assetsDir, { recursive: true });
   await fs.mkdir(serverDir, { recursive: true });
 

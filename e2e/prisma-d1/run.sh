@@ -159,11 +159,11 @@ ADAPTER_PATH="$(node -e "
 ")"
 
 # The SQLite-to-D1 swap is a set of webpack aliases: under Turbopack it never
-# applies and every D1 route fails at runtime. This fixture depends on
-# @prisma/adapter-better-sqlite3, so a plain `next build` (Turbopack by default)
-# must stop at config load with the adapter's message, before anything is
-# bundled or emitted.
-log "Asserting a Turbopack build is refused before anything is bundled"
+# applies and every D1 route fails at runtime. This fixture's route uses
+# @prisma/adapter-better-sqlite3, so a plain `next build` (Turbopack by
+# default) must fail with the adapter's message when it reads the build
+# output, before it writes any adapter output.
+log "Asserting a Turbopack build with better-sqlite3 is refused without output"
 set +e
 TURBO_OUT="$(NEXT_ADAPTER_PATH="$ADAPTER_PATH" npx next build 2>&1)"
 TURBO_STATUS=$?
