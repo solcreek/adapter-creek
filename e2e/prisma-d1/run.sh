@@ -158,6 +158,24 @@ ADAPTER_PATH="$(node -e "
     .resolve('@solcreek/adapter-creek'));
 ")"
 
+# The SQLite-to-D1 swap is a set of webpack aliases: under Turbopack it never
+# applies and every D1 route fails at runtime. This fixture's route uses
+# @prisma/adapter-better-sqlite3, so a plain `next build` (Turbopack by
+# default) must fail with the adapter's message when it reads the build
+# output, before it writes any adapter output.
+log "Asserting a Turbopack build with better-sqlite3 is refused without output"
+set +e
+TURBO_OUT="$(NEXT_ADAPTER_PATH="$ADAPTER_PATH" npx next build 2>&1)"
+TURBO_STATUS=$?
+set -e
+[ "$TURBO_STATUS" -ne 0 ] || fail "a Turbopack build succeeded; the adapter must refuse it"
+if ! printf '%s' "$TURBO_OUT" | grep -q 'Turbopack does not apply'; then
+  printf '%s\n' "$TURBO_OUT" | tail -30
+  fail "the Turbopack build failed without the adapter's message"
+fi
+[ ! -e "$APP/.creek/adapter-output" ] || fail "the refused Turbopack build emitted adapter output"
+printf '%s\n' "$TURBO_OUT" | grep -m1 'Turbopack does not apply'
+
 # The gate asserts the built worker serves the D1 route, so any future change
 # that breaks the Prisma-D1 path (minify off OR on) is caught before publish.
 log "Building fixture with the adapter — minify $MINIFY_MODE"

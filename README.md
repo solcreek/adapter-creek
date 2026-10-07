@@ -61,7 +61,15 @@ Full Next.js coverage on Cloudflare Workers — zero adapter-specific skips. The
 ## Requirements
 
 - Next.js ≥ 16.2
-- Turbopack (default) or Webpack via `--webpack`
+- Turbopack (default) or webpack via `--webpack`. `creek deploy` builds with
+  `--webpack`.
+- Local SQLite through Prisma (`@prisma/adapter-better-sqlite3`) or Drizzle
+  (`drizzle-orm/better-sqlite3`) runs on D1 on Workers: webpack aliases swap
+  those adapters for D1-backed shims. That works in webpack builds only. A
+  Turbopack build whose server output contains `better-sqlite3` fails with an
+  error naming `next build --webpack`, before the adapter writes any output.
+- Calling `better-sqlite3` directly is not supported on Workers, with either
+  bundler: the driver is replaced by a stub whose `prepare()` throws.
 
 ## Usage
 
@@ -74,8 +82,10 @@ npx creek deploy
 For manual use, set `NEXT_ADAPTER_PATH`:
 
 ```bash
-NEXT_ADAPTER_PATH=@solcreek/adapter-creek npx next build
+NEXT_ADAPTER_PATH=@solcreek/adapter-creek npx next build --webpack
 ```
+
+`--webpack` is what `creek deploy` runs, and the SQLite-to-D1 swap needs it.
 
 Or configure in `next.config.js`:
 
@@ -130,13 +140,16 @@ build ships the unminified worker instead of failing.
 ## How It Works
 
 ```
-next build  (Turbopack by default, Webpack via --webpack)
+next build  (Turbopack by default, webpack via --webpack; creek deploy uses --webpack)
   → modifyConfig
+      • webpack aliases: Prisma/Drizzle better-sqlite3 adapters → D1 shims,
+        `better-sqlite3` → stub, `@prisma/adapter-d1` bundled
       • `outputFileTracingRoot` (monorepo aware)
       • `cacheMaxMemorySize: 0` (we ship a DO-backed IncrementalCache)
       • `maxPostponedStateSize: 20mb` (workerd-safe PPR fallback size)
 
   → onBuildComplete
+      0. Refuse a Turbopack build whose server chunks contain `better-sqlite3`
       1. Collect static files from typed outputs
       2. Embed .next/ manifests (JSON + JS, base64-safe)
       3. Seed ISR/`'use cache'` entries (composable cache handler in-bundle)
@@ -153,7 +166,9 @@ next build  (Turbopack by default, Webpack via --webpack)
            - collect ssr/ lazy-require aliases → wrangler `alias` map
            - (preserves module identity; no source rewrite of ssr/ chunks)
       7. esbuild + workerd bundle via `wrangler --dry-run`
-      8. Write `.creek/adapter-output/` + deploy manifest
+      8. Minify, then escape characters above U+00FF (keeps the source one
+         byte per character in V8)
+      9. Write `.creek/adapter-output/` + deploy manifest
 ```
 
 Side systems plugged in for specific Next.js features:
