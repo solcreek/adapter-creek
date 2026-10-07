@@ -1,8 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { collectManifests, countNativeModuleRefs, dedupeWasmByContent } from "./build.js";
+import {
+  assertWorkerWithinLimit,
+  collectManifests,
+  countNativeModuleRefs,
+  dedupeWasmByContent,
+} from "./build.js";
 
 // Regression for the misleading "N native modules" hint: an oversized bundle
 // whose real cause was a stale `.next/dev` reported dozens of phantom natives
@@ -132,5 +137,101 @@ describe("dedupeWasmByContent", () => {
 
     expect(dropped).toBe(0);
     expect(wasmFiles.size).toBe(2);
+  });
+});
+
+// The Workers size limit is 64 MiB UNCOMPRESSED across every uploaded module
+// (it was 3 MB / 10 MB gzipped). Files are written sparse via truncate, so a
+// 70 MiB fixture costs no real disk or time.
+describe("assertWorkerWithinLimit", () => {
+  const MiB = 1024 * 1024;
+  let serverDir: string;
+  let warn: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    serverDir = mkdtempSync(path.join(tmpdir(), "creek-size-"));
+    warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    warn.mockRestore();
+    rmSync(serverDir, { recursive: true, force: true });
+  });
+
+  function file(name: string, bytes: number, prefix = ""): string {
+    const p = path.join(serverDir, name);
+    writeFileSync(p, prefix);
+    truncateSync(p, bytes);
+    return name;
+  }
+
+  it("passes silently for a normal bundle", async () => {
+    const files = [file("worker.js", 3 * MiB), file("compiler.wasm", 2 * MiB)];
+    await expect(assertWorkerWithinLimit(serverDir, files)).resolves.toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  // Regression: a 20 MiB worker gzips well past 10 MB when incompressible, and
+  // the old guard failed it. Cloudflare accepts it now (verified 2026-10-07).
+  it("does not fail a bundle the retired gzipped limit would have rejected", async () => {
+    const files = [file("worker.js", 20 * MiB)];
+    await expect(assertWorkerWithinLimit(serverDir, files)).resolves.toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
+  });
+
+  // Regression: highly compressible output (e.g. a stale `.next/dev` scan)
+  // used to slip under the gzipped check and only fail at upload.
+  it("throws on a bundle over 64 MiB uncompressed, however well it compresses", async () => {
+    const files = [file("worker.js", 70 * MiB)];
+    await expect(assertWorkerWithinLimit(serverDir, files)).rejects.toThrow(
+      /\[Creek Adapter\] Worker bundle is 70\.0 MiB uncompressed, over the Cloudflare Workers script limit \(64\.0 MiB\)/,
+    );
+  });
+
+  it("sums every server file, not just .js and .wasm", async () => {
+    const files = [
+      file("worker.js", 40 * MiB),
+      file("compiler.wasm", 20 * MiB),
+      file("data.bin", 5 * MiB),
+    ];
+    await expect(assertWorkerWithinLimit(serverDir, files)).rejects.toThrow(/65\.0 MiB uncompressed/);
+  });
+
+  it("warns without throwing when near the limit", async () => {
+    const files = [file("worker.js", 50 * MiB)];
+    await expect(assertWorkerWithinLimit(serverDir, files)).resolves.toBeUndefined();
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(String(warn.mock.calls[0]?.[0])).toMatch(/\[Creek Adapter\] .*78% of the 64\.0 MiB/);
+  });
+
+  it("reports inlined native-module references found in worker.js", async () => {
+    const files = [file("worker.js", 70 * MiB, `require("build/Release/better_sqlite3.node");`)];
+    await expect(assertWorkerWithinLimit(serverDir, files)).rejects.toThrow(
+      /1 inlined native-module reference/,
+    );
+  });
+
+  it("handles an empty worker.js", async () => {
+    await expect(assertWorkerWithinLimit(serverDir, [file("worker.js", 0)])).resolves.toBeUndefined();
+  });
+
+  it("still enforces the limit when worker.js cannot be scanned for native refs", async () => {
+    // A directory stats fine but cannot be read, so the native-ref scan bails to 0.
+    mkdirSync(path.join(serverDir, "worker.js"));
+    const files = ["worker.js", file("compiler.wasm", 70 * MiB)];
+    const err = await assertWorkerWithinLimit(serverDir, files).catch((e: Error) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect((err as Error).message).toMatch(/over the Cloudflare Workers script limit/);
+    expect((err as Error).message).not.toMatch(/native-module reference/);
+  });
+
+  it("skips files that are missing on disk", async () => {
+    const files = [file("worker.js", 1 * MiB), "gone.wasm"];
+    await expect(assertWorkerWithinLimit(serverDir, files)).resolves.toBeUndefined();
+  });
+
+  it("does nothing when there are no server files", async () => {
+    await expect(assertWorkerWithinLimit(serverDir, [])).resolves.toBeUndefined();
+    expect(warn).not.toHaveBeenCalled();
   });
 });

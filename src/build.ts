@@ -14,7 +14,6 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { gzipSync } from "node:zlib";
 import type { NextAdapter } from "next";
 import { generateWorkerEntry } from "./worker-entry.js";
 import { bundleForWorkers } from "./bundler.js";
@@ -616,8 +615,8 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   console.log(`  [Creek Adapter] Worker bundled: ${serverFiles.length} files (${formatSize(totalSize)})`);
 
   // Step 4b: Fail fast on an oversized worker. The Workers script limit is on
-  // the gzipped size of worker.js + its wasm modules; blowing past it only
-  // surfaces as a terse "Payload Too Large" at upload. Check here so the build
+  // the uncompressed size of every uploaded module; blowing past it only
+  // surfaces as an upload error after the whole build. Check here so the build
   // fails with the size, the limit, the biggest files, and a likely cause.
   await assertWorkerWithinLimit(serverDir, serverFiles);
 
@@ -1384,10 +1383,8 @@ async function getTotalSize(dir: string, files: string[]): Promise<number> {
   return total;
 }
 
-// Above this raw size, skip gzipping (clearly over the limit either way) — and
-// scan only a prefix for native-module references, so a pathological 200MB+
-// worker.js doesn't get fully read or compressed just to report the failure.
-const RAW_GZIP_SKIP = 50 * 1024 * 1024;
+// Scan only a prefix for native-module references, so a pathological 200MB+
+// worker.js doesn't get fully read just to report the failure.
 const NATIVE_SCAN_BYTES = 8 * 1024 * 1024;
 
 /**
@@ -1425,27 +1422,24 @@ async function countNativeRefs(filePath: string): Promise<number> {
 }
 
 /**
- * Fail the build when the worker script (worker.js + its wasm modules) exceeds
- * the Workers gzipped size limit, with an actionable message. Over the paid
- * ceiling → throw; over only the free limit → warn. See bundle-size.ts.
+ * Fail the build when the worker script exceeds the Workers uncompressed size
+ * limit, with an actionable message. Every server file is uploaded as a module
+ * and counts toward the limit, so all of them are summed. Over the limit →
+ * throw; near it → warn. See bundle-size.ts. Exported for testing.
  */
-async function assertWorkerWithinLimit(serverDir: string, serverFiles: string[]): Promise<void> {
-  const scriptFiles = serverFiles.filter((f) => f.endsWith(".js") || f.endsWith(".wasm"));
+export async function assertWorkerWithinLimit(serverDir: string, serverFiles: string[]): Promise<void> {
   const sizes: ScriptFileSize[] = [];
   let nativeRefs = 0;
 
-  for (const name of scriptFiles) {
+  for (const name of serverFiles) {
     const filePath = path.join(serverDir, name);
-    let raw: number;
+    let size: number;
     try {
-      raw = (await fs.stat(filePath)).size;
+      size = (await fs.stat(filePath)).size;
     } catch {
       continue;
     }
-    // Pathologically large files are over the limit regardless — use the raw
-    // size as a (generous) lower bound for gzip rather than compressing it.
-    const gzipSize = raw > RAW_GZIP_SKIP ? raw : gzipSync(await fs.readFile(filePath)).length;
-    sizes.push({ name, gzipSize });
+    sizes.push({ name, size });
     if (name === "worker.js") nativeRefs = await countNativeRefs(filePath);
   }
 
@@ -1455,7 +1449,7 @@ async function assertWorkerWithinLimit(serverDir: string, serverFiles: string[])
   if (verdict.level === "over-limit") {
     throw new Error(`[Creek Adapter] ${verdict.message}`);
   }
-  if (verdict.level === "free-warning" && verdict.message) {
+  if (verdict.level === "near-limit" && verdict.message) {
     console.warn(`  [Creek Adapter] ${verdict.message}`);
   }
 }
