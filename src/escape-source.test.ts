@@ -39,7 +39,8 @@ describe.each(LOCALES)("escapeNonLatin1 ($locale)", ({ text, am, pm }) => {
     expectSameResult(`
       const r = /^(${am}|${pm})$/;
       const all = /^[${text}]+$/u;
-      return [r.test(${lit(am)}), r.test(${lit(pm)}), r.test(${lit(text)}), all.test(${lit(text)}), all.test("x")];
+      return [r.test(${lit(am)}), r.test(${lit(pm)}), r.test(${lit(text)}), all.test(${lit(text)}), all.test("x"),
+        r.source, String(r), all.source, all.flags];
     `);
   });
 
@@ -70,10 +71,35 @@ describe("escapeNonLatin1", () => {
 
   it("escapes regex literals and keeps what they match", () => {
     const out = expectSameResult(`
-      const r = /午前|下午/;
-      return ["午前", "下午", "上午"].map((s) => r.test(s));
+      const r = /午前|下午/g;
+      return [["午前", "下午", "上午"].map((s) => r.test(s)), r.source, String(r), r.flags, r.lastIndex];
     `);
-    expect(out).toContain("/\\u5348\\u524D|\\u4E0B\\u5348/");
+    expect(out).toContain('/(?:)/.constructor("\\u5348\\u524D|\\u4E0B\\u5348","g")');
+  });
+
+  it("keeps .source and toString() of a rewritten regex", () => {
+    // Escaping inside the literal would turn /中/.source into "\\u4E2D".
+    expectSameResult(`
+      return [/中/.source, String(/中\\/文/gi), /[中/]/.source, /\\中/.source, /😀/u.source];
+    `);
+  });
+
+  it("rewrites a regex in every expression position minified code puts one", () => {
+    expectSameResult(`
+      const RegExp = null; // a local binding must not shadow the constructor
+      function f(s) { return/^中/.test(s) }
+      const xs = [/中/g, typeof/中/, !/中/.test("文"), "中文".replace(/中/g, "x"), /中/ instanceof Object];
+      return [f("中文"), f("文"), xs.map(String), xs[0].lastIndex];
+    `);
+  });
+
+  it("gives each evaluation of a regex its own object, as a literal does", () => {
+    expectSameResult(`
+      const make = () => /中/g;
+      const a = make(), b = make();
+      a.test("中");
+      return [a === b, a.lastIndex, b.lastIndex];
+    `);
   });
 
   it("escapes ranges and classes", () => {
@@ -91,18 +117,15 @@ describe("escapeNonLatin1", () => {
         /^[😀]$/u.test("😀"),
         /^[😀]$/.test("😀"),
         /^.$/u.test("😀"),
-      ];
+      ].concat([/^😀$/, /^😀$/u, /[😀]/u].map(String));
     `);
-    expect(out).toContain("/^\\u{1F600}$/u");
-    expect(out).toContain("/^\\uD83D\\uDE00$/.");
+    expect(out).toContain('"^\\u{1F600}$","u"');
   });
 
-  it("drops one backslash of an odd run before the character", () => {
-    const out = expectSameResult(
-      'return [/\\中/.test("中"), /\\\\中/.test("\\\\中"), /\\\\\\中/.test("\\\\中")];',
+  it("keeps backslash runs before the character in a regex", () => {
+    expectSameResult(
+      'return [/\\中/.test("中"), /\\\\中/.test("\\\\中"), /\\\\\\中/.test("\\\\中"), /\\中/.source, /\\\\中/.source];',
     );
-    expect(out).toContain("/\\u4E2D/.");
-    expect(out).toContain("/\\\\\\u4E2D/");
   });
 
   it("escapes named capture groups", () => {
@@ -143,7 +166,7 @@ describe("escapeNonLatin1", () => {
     expect(result.reason).toBeUndefined();
     expect(result.escaped).toBe(1);
     expect(result.kept).toBe(4);
-    expect(result.code).toContain("/\\u4E2D/");
+    expect(result.code).toContain('/(?:)/.constructor("\\u4E2D","")');
     expect(result.code).toContain("String.raw`標\\籤`");
     expect(result.code).toContain("`中文${");
   });

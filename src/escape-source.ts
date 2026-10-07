@@ -15,9 +15,13 @@
  *   character makes it a non-escape character (`"\中"` is `"中"`), so one
  *   backslash is dropped; `\` + U+2028/U+2029 is a line continuation and is
  *   removed whole.
- * - regex literals: `\uXXXX`; astral characters as `\u{X}` under the u/v
- *   flags and as a surrogate pair of escapes otherwise (a non-unicode regex
- *   sees them as two code units either way). Odd backslash runs as above.
+ * - regex literals: `/中/g` becomes `/(?:)/.constructor("\u4E2D","g")`.
+ *   Escaping inside the literal would match the same strings but change
+ *   `.source` and `toString()` (`"\\u4E2D"` instead of `"中"`); a pattern
+ *   passed as a string reaches RegExp as the identical text, so both stay
+ *   the same. The replacement still starts with a regex literal, so the
+ *   tokenizer context around it is unchanged, and the constructor comes from
+ *   that literal, so a local binding named `RegExp` cannot shadow it.
  * - identifiers and private names: `\uXXXX` / `\u{X}`.
  * - comments: escaped as text; whitespace between tokens becomes a space.
  *   U+2028/U+2029 become a newline in both, so ASI holds (a block comment
@@ -30,7 +34,8 @@
  * boundaries — and with them the tokenizer's regex-vs-division context for
  * the rest of the file — are unchanged. Each rewritten token is tokenized
  * again on its own and must come back as one token of the same type and
- * value (regex: same flags, pattern re-validated by acorn). Any difference,
+ * value; a rewritten regex must come back as the constructor call carrying
+ * the original pattern and flags. Any difference,
  * or a tokenizer error, returns the input unchanged. One full tokenizer pass
  * over the file, not three: worker.js is tens of megabytes.
  */
@@ -79,11 +84,20 @@ function escapeCodePoint(cp: number): string {
   return cp > 0xffff ? `\\u{${cp.toString(16).toUpperCase()}}` : hex4(cp);
 }
 
-/** `\uXXXX` for the BMP, a surrogate pair of escapes above it. */
-function escapeCodeUnits(cp: number): string {
-  if (cp <= 0xffff) return hex4(cp);
-  const offset = cp - 0x10000;
-  return hex4(0xd800 + (offset >> 10)) + hex4(0xdc00 + (offset & 0x3ff));
+/** A double-quoted string literal for `s`, with nothing above U+00FF. */
+function stringLiteral(s: string): string {
+  return JSON.stringify(s).replace(NON_LATIN1, (ch) => escapeCodePoint(ch.codePointAt(0)!));
+}
+
+interface RegexValue {
+  pattern: string;
+  flags: string;
+}
+
+const REGEX_CONSTRUCTOR = "/(?:)/.constructor";
+
+function regexConstructorCall({ pattern, flags }: RegexValue): string {
+  return `${REGEX_CONSTRUCTOR}(${stringLiteral(pattern)},${stringLiteral(flags)})`;
 }
 
 function oddBackslashesBefore(code: string, pos: number, floor: number): boolean {
@@ -119,7 +133,8 @@ export function escapeNonLatin1(code: string): EscapeResult {
   };
 
   const inToken = (tok: Token, hit: Hit): void => {
-    if (touched[touched.length - 1] !== tok) touched.push(tok);
+    const first = touched[touched.length - 1] !== tok;
+    if (first) touched.push(tok);
     const end = hit.pos + hit.len;
     const odd = () => oddBackslashesBefore(code, hit.pos, tok.start);
     switch (tok.type.label) {
@@ -130,13 +145,10 @@ export function escapeNonLatin1(code: string): EscapeResult {
           edits.push({ start: hit.pos, end, text: escapeCodePoint(hit.cp) });
         }
         return;
-      case "regexp": {
-        const { flags } = tok.value as { flags: string };
-        const unicode = flags.includes("u") || flags.includes("v");
-        const text = unicode ? escapeCodePoint(hit.cp) : escapeCodeUnits(hit.cp);
-        edits.push(odd() ? { start: hit.pos - 1, end, text } : { start: hit.pos, end, text });
+      case "regexp":
+        // One edit replaces the whole literal, however many hits it holds.
+        if (first) edits.push({ start: tok.start, end: tok.end, text: regexConstructorCall(tok.value as RegexValue) });
         return;
-      }
       case "name":
       case "privateId":
         edits.push({ start: hit.pos, end, text: escapeCodePoint(hit.cp) });
@@ -197,24 +209,34 @@ function applyEdits(code: string, edits: Edit[], start: number, end: number): st
 
 /**
  * Tokenize `text` alone: it must be exactly one token with `tok`'s type and
- * decoded value (for a regex, its flags; acorn validates the pattern while
- * reading it). Returns a description of the difference, or null.
+ * decoded value, or for a regex, the constructor call carrying its pattern
+ * and flags. Returns a description of the difference, or null.
  */
 function retokenizesAs(tok: Token, text: string): string | null {
-  let first: Token, next: Token;
+  const what = `rewritten ${tok.type.label} at offset ${tok.start}`;
+  let got: Token[];
   try {
     const t = tokenizer(text, ACORN_OPTIONS);
-    first = t.getToken();
-    next = t.getToken();
+    got = [];
+    for (let k: Token = t.getToken(); k.type.label !== "eof"; k = t.getToken()) got.push(k);
   } catch (err) {
-    return `rewritten ${tok.type.label} at offset ${tok.start} does not tokenize: ${(err as Error).message}`;
+    return `${what} does not tokenize: ${(err as Error).message}`;
   }
-  if (first.type !== tok.type || first.end !== text.length || next.type.label !== "eof") {
-    return `rewritten ${tok.type.label} at offset ${tok.start} is no longer one ${tok.type.label} token`;
+
+  if (tok.type.label === "regexp") {
+    const { pattern, flags } = tok.value as RegexValue;
+    const shape = got.map((k) => k.type.label).join(" ");
+    const ok =
+      shape === "regexp . name ( string , string )" &&
+      text.startsWith(REGEX_CONSTRUCTOR + "(") &&
+      got[2].value === "constructor" &&
+      got[4].value === pattern &&
+      got[6].value === flags;
+    return ok ? null : `${what} is not a constructor call with the same pattern and flags`;
   }
-  const same =
-    tok.type.label === "regexp"
-      ? (first.value as { flags: string }).flags === (tok.value as { flags: string }).flags
-      : first.value === tok.value;
-  return same ? null : `rewritten ${tok.type.label} at offset ${tok.start} changed value`;
+
+  if (got.length !== 1 || got[0].type !== tok.type || got[0].end !== text.length) {
+    return `${what} is no longer one ${tok.type.label} token`;
+  }
+  return got[0].value === tok.value ? null : `${what} changed value`;
 }
