@@ -64,9 +64,10 @@ Full Next.js coverage on Cloudflare Workers — zero adapter-specific skips. The
 - Turbopack (default) or webpack via `--webpack`. `creek deploy` builds with
   `--webpack`.
 - The SQLite-to-D1 swap (`better-sqlite3`, `@prisma/adapter-better-sqlite3`,
-  `@prisma/adapter-d1`) works in webpack builds only: it is a set of webpack
-  aliases. A Turbopack build of a project that depends on one of those packages
-  stops at config load with an error naming `next build --webpack`.
+  `drizzle-orm/better-sqlite3`) works in webpack builds only: it is a set of
+  webpack aliases. A Turbopack build whose server output contains
+  `better-sqlite3` fails with an error naming `next build --webpack`, before
+  the adapter writes any output.
 
 ## Usage
 
@@ -140,12 +141,12 @@ build ships the unminified worker instead of failing.
 next build  (Turbopack by default, webpack via --webpack; creek deploy uses --webpack)
   → modifyConfig
       • webpack aliases: SQLite drivers → D1 shims, `@prisma/adapter-d1` bundled
-      • stops a Turbopack build of a project that needs that swap
       • `outputFileTracingRoot` (monorepo aware)
       • `cacheMaxMemorySize: 0` (we ship a DO-backed IncrementalCache)
       • `maxPostponedStateSize: 20mb` (workerd-safe PPR fallback size)
 
   → onBuildComplete
+      0. Refuse a Turbopack build whose server chunks contain `better-sqlite3`
       1. Collect static files from typed outputs
       2. Embed .next/ manifests (JSON + JS, base64-safe)
       3. Seed ISR/`'use cache'` entries (composable cache handler in-bundle)
