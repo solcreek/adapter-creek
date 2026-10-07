@@ -158,22 +158,23 @@ ADAPTER_PATH="$(node -e "
     .resolve('@solcreek/adapter-creek'));
 ")"
 
-# The adapter supports webpack builds only: under Turbopack its D1 driver swap
-# never applies and every D1 route fails at runtime. A plain `next build`
-# (Turbopack by default) must stop at config load with the adapter's message,
-# before anything is bundled or emitted.
+# The SQLite-to-D1 swap is a set of webpack aliases: under Turbopack it never
+# applies and every D1 route fails at runtime. This fixture depends on
+# @prisma/adapter-better-sqlite3, so a plain `next build` (Turbopack by default)
+# must stop at config load with the adapter's message, before anything is
+# bundled or emitted.
 log "Asserting a Turbopack build is refused before anything is bundled"
 set +e
 TURBO_OUT="$(NEXT_ADAPTER_PATH="$ADAPTER_PATH" npx next build 2>&1)"
 TURBO_STATUS=$?
 set -e
 [ "$TURBO_STATUS" -ne 0 ] || fail "a Turbopack build succeeded; the adapter must refuse it"
-if ! printf '%s' "$TURBO_OUT" | grep -q 'supports webpack builds only'; then
+if ! printf '%s' "$TURBO_OUT" | grep -q 'Turbopack does not apply'; then
   printf '%s\n' "$TURBO_OUT" | tail -30
   fail "the Turbopack build failed without the adapter's message"
 fi
 [ ! -e "$APP/.creek/adapter-output" ] || fail "the refused Turbopack build emitted adapter output"
-printf '%s\n' "$TURBO_OUT" | grep -m1 'supports webpack builds only'
+printf '%s\n' "$TURBO_OUT" | grep -m1 'Turbopack does not apply'
 
 # The gate asserts the built worker serves the D1 route, so any future change
 # that breaks the Prisma-D1 path (minify off OR on) is caught before publish.
