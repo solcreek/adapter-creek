@@ -1621,19 +1621,24 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     const code = await fs.readFile(workerPath, "utf-8").catch(() => null);
     if (code !== null) {
       const result = escapeNonLatin1(code);
-      if (result.escaped > 0) await fs.writeFile(workerPath, result.code);
-      const sourceMB = `${(result.code.length / 1024 / 1024).toFixed(1)}MB`;
+      const mb = (bytes: number) => `${(bytes / 1024 / 1024).toFixed(1)}MB`;
       if (result.kept > 0) {
+        // Still two-byte: a partial rewrite would only grow the file.
         const why = result.reason ?? "template text";
         console.warn(
           `  [Creek Adapter] worker.js keeps ${result.kept} character(s) above U+00FF (${why}); ` +
-            `V8 stores the whole source two bytes per character, ${sourceMB} more isolate memory`,
+            `V8 stores the whole source two bytes per character, about ${mb(code.length)} more isolate memory`,
         );
       } else if (result.escaped > 0) {
-        console.log(
-          `  [Creek Adapter] worker.js: escaped ${result.escaped} character(s) above U+00FF, ` +
-            `saving ${sourceMB} of isolate memory`,
-        );
+        // Two bytes per character before, one byte per character after.
+        const saved = 2 * code.length - result.code.length;
+        if (saved > 0) {
+          await fs.writeFile(workerPath, result.code);
+          console.log(
+            `  [Creek Adapter] worker.js: escaped ${result.escaped} character(s) above U+00FF, ` +
+              `saving ${mb(saved)} of isolate memory`,
+          );
+        }
       }
     }
   }
