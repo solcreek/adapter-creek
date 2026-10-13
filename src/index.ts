@@ -8,7 +8,7 @@ import { handleBuild } from "./build.js";
 
 // Build-time DB driver swaps: in the Workers build only, redirect a local
 // SQLite driver import to a Creek shim that backs the same ORM with the
-// request's D1 binding (env.DB, resolved lazily). Local dev is untouched —
+// request's D1 binding (env.DATABASE, else env.DB; resolved lazily). Local dev is untouched —
 // the adapter only runs under the Creek build. Aliases are harmless when the
 // module isn't imported, so they apply unconditionally.
 const SHIMS_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "src", "shims");
@@ -26,7 +26,7 @@ const DB_DRIVER_ALIASES: Record<string, string> = {
   // build.ts registers the precompiled module under the sentinel length.
   "@prisma/client/runtime/query_compiler_fast_bg.sqlite.wasm-base64.mjs$": path.join(SHIMS_DIR, "prisma-wasm-base64-stub.mjs"),
   // The native better-sqlite3 client the user passes to drizzle() — stubbed,
-  // since the swap ignores it and uses env.DB. Keeps the native .node out of
+  // since the swap ignores it and uses the D1 binding. Keeps the native .node out of
   // the Workers bundle.
   "better-sqlite3$": path.join(SHIMS_DIR, "better-sqlite3-stub.js"),
 };

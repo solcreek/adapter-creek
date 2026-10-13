@@ -111,11 +111,23 @@ describe("drizzle-better-sqlite3 shim", () => {
     expect((db.__d1Client.prepare as () => string)()).toBe("stmt");
   });
 
-  it("throws a helpful error when env.DB is unavailable (deployed, no binding)", async () => {
+  it("prefers env.DATABASE, the binding `database = true` creates, over env.DB", async () => {
+    const { drizzle } = await import("./drizzle-better-sqlite3.js");
+    const database = { prepare: () => "DATABASE" };
+    const legacy = { prepare: () => "DB" };
+    (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({ DATABASE: database });
+    const db = drizzle({} as never, {}) as { __d1Client: Record<string, unknown> };
+    expect((db.__d1Client.prepare as () => string)()).toBe("DATABASE");
+
+    (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({ DATABASE: database, DB: legacy });
+    expect((db.__d1Client.prepare as () => string)()).toBe("DATABASE");
+  });
+
+  it("throws a helpful error when no D1 binding is available (deployed, no binding)", async () => {
     const { drizzle } = await import("./drizzle-better-sqlite3.js");
     (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({});
     const db = drizzle({} as never, {}) as { __d1Client: Record<string, unknown> };
-    expect(() => db.__d1Client.prepare).toThrow(/D1 binding `env\.DB` is unavailable/);
+    expect(() => db.__d1Client.prepare).toThrow(/D1 binding `env\.DATABASE` \(or `env\.DB`\) is unavailable/);
   });
 
   it("explains the build-time (SSG) case when there is no request env accessor", async () => {
@@ -165,11 +177,20 @@ describe("prisma-adapter-better-sqlite3 shim", () => {
     expect(shadow.kind).toBe("d1-shadow");
   });
 
-  it("throws a helpful error when env.DB is unavailable at connect() (deployed, no binding)", async () => {
+  it("connects against env.DATABASE when only DATABASE is bound", async () => {
+    const { PrismaBetterSqlite3 } = await import("./prisma-adapter-better-sqlite3.js");
+    const adapter = new PrismaBetterSqlite3({ url: "file:./dev.db" });
+    const fakeD1 = { tag: "database" };
+    (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({ DATABASE: fakeD1 });
+    const conn = adapter.connect() as { kind: string; db: unknown };
+    expect(conn.db).toBe(fakeD1);
+  });
+
+  it("throws a helpful error when no D1 binding is available at connect() (deployed, no binding)", async () => {
     const { PrismaBetterSqlite3 } = await import("./prisma-adapter-better-sqlite3.js");
     const adapter = new PrismaBetterSqlite3({ url: "file:./dev.db" });
     (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({});
-    expect(() => adapter.connect()).toThrow(/D1 binding `env\.DB` is unavailable/);
+    expect(() => adapter.connect()).toThrow(/D1 binding `env\.DATABASE` \(or `env\.DB`\) is unavailable/);
   });
 
   it("explains the build-time (SSG) case when there is no request env accessor", async () => {

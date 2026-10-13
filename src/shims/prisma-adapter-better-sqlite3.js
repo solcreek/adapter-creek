@@ -9,7 +9,7 @@
 // better-sqlite3 factory's shape but back it with `@prisma/adapter-d1` over the
 // request's D1 binding.
 //
-// The user constructs the adapter at module scope, before env.DB exists.
+// The user constructs the adapter at module scope, before the D1 binding exists.
 // Prisma reads `provider` synchronously at PrismaClient construction and only
 // calls `connect()` at the first query (request time), so D1 is resolved
 // lazily inside connect() — never at construction.
@@ -24,7 +24,7 @@ import { PrismaD1 } from "@prisma/adapter-d1";
 // error is actionable:
 //   - no `__creekEnv` accessor  → running outside a request, i.e. at BUILD time
 //     (Next runs DB code during static generation; D1 only exists at runtime).
-//   - accessor present, no DB   → deployed, but no database resource is bound.
+//   - accessor present, no D1   → deployed, but no database resource is bound.
 function resolveD1() {
   const accessor = globalThis.__creekEnv;
   if (typeof accessor !== "function") {
@@ -35,10 +35,13 @@ function resolveD1() {
         "request handler) so it runs on D1 at runtime.",
     );
   }
-  const db = (accessor() || {}).DB;
+  // `database = true` binds DATABASE; DB is the legacy alias and the name a
+  // project's own Workers config may use.
+  const env = accessor() || {};
+  const db = env.DATABASE ?? env.DB;
   if (!db) {
     throw new Error(
-      "[creek] D1 binding `env.DB` is unavailable. Add `database = true` under [resources] in creek.toml.",
+      "[creek] D1 binding `env.DATABASE` (or `env.DB`) is unavailable. Add `database = true` under [resources] in creek.toml.",
     );
   }
   return db;
