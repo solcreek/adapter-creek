@@ -4,10 +4,12 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
   assertWorkerWithinLimit,
+  collectEdgeWasmBindings,
   collectManifests,
   collectWebpackEdgeAssets,
   countNativeModuleRefs,
   dedupeWasmByContent,
+  webpackEdgeBootstrapSource,
 } from "./build.js";
 
 // Regression for the misleading "N native modules" hint: an oversized bundle
@@ -285,5 +287,75 @@ describe("collectWebpackEdgeAssets", () => {
     };
     expect(collectWebpackEdgeAssets(dist, turbopackManifest)).toEqual({ webpackEdgeChunkPaths: [] });
     expect(collectWebpackEdgeAssets(dist, null)).toEqual({ webpackEdgeChunkPaths: [] });
+  });
+});
+
+describe("collectEdgeWasmBindings", () => {
+  const dist = "/proj/.next";
+  const sha = "58ccff8b2b94b5dac6ef8957082ecd8f6d34186d";
+
+  it("maps each wasm binding of middleware and edge functions to its file", () => {
+    const bindings = collectEdgeWasmBindings(dist, {
+      middleware: { "/": { wasm: [{ name: `wasm_${sha}`, filePath: `server/edge-chunks/wasm_${sha}.wasm` }] } },
+      functions: {
+        "/api/add": {
+          wasm: [
+            { name: `wasm_${sha}`, filePath: `server/edge-chunks/wasm_${sha}.wasm` },
+            { name: "wasm_0123abcd", filePath: "server/edge-chunks/wasm_0123abcd.wasm" },
+          ],
+        },
+      },
+    });
+    expect([...bindings]).toEqual([
+      [`wasm_${sha}`, path.join(dist, `server/edge-chunks/wasm_${sha}.wasm`)],
+      ["wasm_0123abcd", path.join(dist, "server/edge-chunks/wasm_0123abcd.wasm")],
+    ]);
+  });
+
+  it("reads Turbopack's chunk paths the same way", () => {
+    const bindings = collectEdgeWasmBindings(dist, {
+      middleware: { "/": { wasm: [{ name: "wasm_54296c12d4cc3109", filePath: "server/edge/chunks/src_add_0656eb_.wasm" }] } },
+    });
+    expect(bindings.get("wasm_54296c12d4cc3109")).toBe(path.join(dist, "server/edge/chunks/src_add_0656eb_.wasm"));
+  });
+
+  it("skips entries that are not a wasm global name and a .wasm file", () => {
+    const bindings = collectEdgeWasmBindings(dist, {
+      functions: {
+        "/x": {
+          wasm: [
+            { name: "not-a-global", filePath: "server/edge-chunks/a.wasm" },
+            { name: "wasm_ok", filePath: "server/edge-chunks/a.js" },
+            { name: "wasm_bad;name", filePath: "server/edge-chunks/b.wasm" },
+            { filePath: "server/edge-chunks/c.wasm" },
+          ],
+        },
+      },
+    });
+    expect(bindings.size).toBe(0);
+  });
+
+  it("yields nothing without a manifest or wasm", () => {
+    expect(collectEdgeWasmBindings(dist, null).size).toBe(0);
+    expect(collectEdgeWasmBindings(dist, { functions: { "/x": { files: ["server/x.js"] } } }).size).toBe(0);
+  });
+});
+
+describe("webpackEdgeBootstrapSource", () => {
+  it("declares _ENTRIES", () => {
+    expect(webpackEdgeBootstrapSource("/out/server", new Map())).toBe("globalThis._ENTRIES = globalThis._ENTRIES || {};\n");
+  });
+
+  it("sets each wasm global from the file the bundler copies into serverDir", () => {
+    const src = webpackEdgeBootstrapSource(
+      "/out/server",
+      new Map([
+        ["58ccff8b", "wasm_58ccff8b.wasm"],
+        ["54296c12", "wasm_58ccff8b.wasm"],
+      ]),
+    );
+    expect(src).toContain(`import __wasm_0 from ${JSON.stringify(path.join("/out/server", "wasm_58ccff8b.wasm"))};`);
+    expect(src).toContain('globalThis["wasm_58ccff8b"] = __wasm_0;');
+    expect(src).toContain('globalThis["wasm_54296c12"] = __wasm_1;');
   });
 });

@@ -17,7 +17,8 @@
 #
 # Also covers two webpack-only render bugs: a server action posted to an edge
 # page ran the node build's module id, and a page under a route group rendered
-# without its client chunk.
+# without its client chunk. And edge wasm imports, which webpack binds to
+# `wasm_<hash>` globals the middleware manifest names.
 #
 # Usage: e2e/edge-webpack/run.sh   (from the repo root; needs network + wrangler)
 #        E2E_BUNDLER=turbopack e2e/edge-webpack/run.sh   (same checks, Turbopack)
@@ -163,6 +164,7 @@ run_variant() {
   check "app route, edge, dynamic"        '{"slug":"abc"}' "$BASE/edge-dyn/abc"
   check "app route, edge, POST json"      '{"echoed":{"a":1}}' -X POST -H 'content-type: application/json' --data '{"a":1}' "$BASE/edge-dyn/abc"
   check "app page, edge"                  'edge app page, runtime <!-- -->edge' "$BASE/edge-page"
+  check "pages API, edge, wasm import"    '{"input":10,"value":11}' "$BASE/api/edge-wasm?input=10"
   check "pages SSR, edge"                 'edge pages ssr q=<!-- -->zz' "$BASE/edge-ssr?q=zz"
   check "pages SSR, edge, dynamic"        'slug=<!-- -->hello<!-- --> q=<!-- -->1' "$BASE/edge-ssr-dyn/hello?q=1"
   if [ "$mw" != "null" ]; then
@@ -170,6 +172,7 @@ run_variant() {
     # params reach the edge entry only through the rewrite.
     check "rewrite -> pages SSR, edge"    'slug=<!-- -->world<!-- --> q=<!-- -->2' "$BASE/rw/world?q=2"
     check "rewrite -> pages API, edge"    '{"id":"77"}' "$BASE/rwapi/77"
+    check "middleware, wasm import"       '{"route":"mw-wasm","value":2}' "$BASE/mw-wasm"
   fi
   # An action imported by a node page and an edge page has a module id in
   # each runtime's build; the edge POST must run the edge one.
