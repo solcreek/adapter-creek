@@ -14,12 +14,9 @@ importers:
       '@node-rs/xxhash':
         specifier: ^1.7.6
         version: 1.7.6
-      '@solcreek/adapter-core':
-        specifier: ^0.2.0
-        version: 0.2.0(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))
       '@solcreek/adapter-next-core':
-        specifier: ^0.1.1
-        version: 0.1.1(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))
+        specifier: ^0.1.2
+        version: 0.1.2(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))
       acorn:
         specifier: ^8.19.0
         version: 8.19.0
@@ -713,13 +710,8 @@ packages:
     resolution: {integrity: sha512-P1Cz1dWaFfR4IR+U13mqqiGsLFf1KbayybWwdd2vfctdV6hDpUkgCY0nKOLLTMSoRd/jJNjtbqzf13K8DCCXQw==}
     engines: {node: '>=18'}
 
-  '@solcreek/adapter-core@0.2.0':
-    resolution: {integrity: sha512-dWkiZRAPj+Ji/aCI6cTKY4LJcMRRGkacQ0Bn0B/yNbeVB+mAfg+LUYrvuzArgPAMPugDPBilGsIoLrxbqV3B+A==}
-    peerDependencies:
-      next: '>=16.2.3'
-
-  '@solcreek/adapter-next-core@0.1.1':
-    resolution: {integrity: sha512-yVtNZ74EPbxe2bvz5/vhoBI3ljx4DX54K0Ry3YTfWS45xChserTpOVQ0r33iB5cn68dolCGFF5K0bpE3Jhc3Kg==}
+  '@solcreek/adapter-next-core@0.1.2':
+    resolution: {integrity: sha512-HLQHF08azd24rrurBnLs127Rlka2XQNUWuWOIp/RQpQraBHDa066QxAuxQ244Jpsr732JXFO+FtO4TDImNT7Mg==}
     peerDependencies:
       next: '>=15'
     peerDependenciesMeta:
@@ -1626,13 +1618,7 @@ snapshots:
 
   '@sindresorhus/is@7.2.0': {}
 
-  '@solcreek/adapter-core@0.2.0(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))':
-    dependencies:
-      next: 16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
-
-  '@solcreek/adapter-next-core@0.1.1(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))':
-    dependencies:
-      '@solcreek/adapter-core': 0.2.0(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))
+  '@solcreek/adapter-next-core@0.1.2(next@16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5))':
     optionalDependencies:
       next: 16.2.3(react-dom@19.2.5(react@19.2.5))(react@19.2.5)
 
