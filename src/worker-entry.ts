@@ -2099,7 +2099,43 @@ function __creekEdgeAdapterParams(request, pathname, params, ctx) {
   };
 }
 
+// The edge entry a request is running, as { page, route } like Next's work
+// store. An edge bundle carries its own copy of Next's workAsyncStorage, so
+// __nextWorkAsyncStorage (the node copy) is empty during an edge render; the
+// manifest proxies read this instead to find the current page.
+const __creekEdgeEntryStorage = new AsyncLocalStorage();
+
+function __creekEdgeEntryInfo(entryKey) {
+  const page = String(entryKey).replace(/^middleware_/, "");
+  return {
+    entryKey,
+    page,
+    route: page.startsWith("app/") ? __creekNormalizeAppPath(page.slice(3)) : undefined,
+  };
+}
+
+// { page, route } of the app render in progress: the node work store, else
+// the edge entry this request was dispatched to.
+function __creekCurrentRender() {
+  const workStore = typeof __nextWorkAsyncStorage?.getStore === "function"
+    ? __nextWorkAsyncStorage.getStore()
+    : undefined;
+  if (workStore) return workStore;
+  return __creekEdgeEntryStorage.getStore();
+}
+
 async function __withEdgeRouteEnv(entryKey, fn) {
+  // A same-origin request a render makes runs in-process (__creekSameOriginFetch)
+  // and inherits the caller's scope, so enter this entry's scope whenever it
+  // is not already the current one, and hide a node render's work store,
+  // which __creekCurrentRender would otherwise prefer.
+  if (entryKey && __creekEdgeEntryStorage.getStore()?.entryKey !== entryKey) {
+    const enter = () =>
+      __creekEdgeEntryStorage.run(__creekEdgeEntryInfo(entryKey), () => __withEdgeRouteEnv(entryKey, fn));
+    return await (typeof __nextWorkAsyncStorage?.getStore === "function" && __nextWorkAsyncStorage.getStore()
+      ? __nextWorkAsyncStorage.run(undefined, enter)
+      : enter());
+  }
   const envOverrides = entryKey ? EDGE_ROUTE_ENVS[entryKey] : null;
   if (!envOverrides || typeof process === "undefined") {
     return await fn();
@@ -3925,6 +3961,22 @@ function __creekHasPostponedPrerenderForPathname(...pathnames) {
   return false;
 }
 
+// Next's normalizeAppPath (shared/lib/router/utils/app-paths): an app entry
+// name to the route workStore.route reports.
+function __creekNormalizeAppPath(page) {
+  const segments = page.split("/");
+  let pathname = "";
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    if (!segment) continue;
+    if (segment[0] === "(" && segment.endsWith(")")) continue;
+    if (segment[0] === "@") continue;
+    if ((segment === "page" || segment === "route") && i === segments.length - 1) continue;
+    pathname += "/" + segment;
+  }
+  return pathname || "/";
+}
+
 // Initialize manifests singleton — called lazily on first SSR request.
 function __initManifests() {
   const MANIFESTS_SINGLETON = Symbol.for('next.server.manifests');
@@ -3966,10 +4018,13 @@ function __initManifests() {
     const clientReferenceManifestsPerRoute = new Map();
     const rscManifest = globalThis.__RSC_MANIFEST || {};
     for (const [page, manifest] of Object.entries(rscManifest)) {
-      // __RSC_MANIFEST keys are like "/page", "/pricing/page", "/docs/[[...slug]]/page"
-      // workStore.route uses "/", "/pricing", "/docs/[[...slug]]"
-      const normalized = page.replace(/\\/page$/, "").replace(/^$/, "/");
-      clientReferenceManifestsPerRoute.set(normalized, manifest);
+      // __RSC_MANIFEST keys are entry names: "/page", "/docs/[[...slug]]/page",
+      // "/shop/(group)/[id]/page". workStore.route is Next's normalizeAppPath()
+      // of that name ("/", "/docs/[[...slug]]", "/shop/[id]"), which drops
+      // route groups and parallel slots. Keying by anything else misses for
+      // grouped routes, and the scan below then returns another page's entry,
+      // whose client chunk list for this page's module is empty.
+      clientReferenceManifestsPerRoute.set(__creekNormalizeAppPath(page), manifest);
       // Also keep the original key for direct lookups
       clientReferenceManifestsPerRoute.set(page, manifest);
     }
@@ -3993,9 +4048,7 @@ function __initManifests() {
                 return entry;
               };
 
-              const workStore = typeof __nextWorkAsyncStorage?.getStore === "function"
-                ? __nextWorkAsyncStorage.getStore()
-                : undefined;
+              const workStore = __creekCurrentRender();
               if (workStore?.route) {
                 const routeEntry = readEntry(clientReferenceManifestsPerRoute.get(workStore.route));
                 if (
@@ -4065,9 +4118,7 @@ function __initManifests() {
           // We were returning the FIRST manifest inserted, which hid
           // route-specific CSS/JS entries and caused e.g. /_not-found
           // (global-not-found convention) to render without its CSS links.
-          const workStore = typeof __nextWorkAsyncStorage?.getStore === "function"
-            ? __nextWorkAsyncStorage.getStore()
-            : undefined;
+          const workStore = __creekCurrentRender();
           if (workStore?.route) {
             const routeManifest = clientReferenceManifestsPerRoute.get(workStore.route);
             if (routeManifest && routeManifest[prop] !== undefined) {
@@ -4120,9 +4171,7 @@ function __initManifests() {
           // next-after-app-deploy edge variants where
           // \`revalidatePath(pathPrefix + '/server-action')\` revalidated
           // \`/nodejs/server-action\` on an \`/edge/...\` POST.
-          const workStore = typeof __nextWorkAsyncStorage?.getStore === "function"
-            ? __nextWorkAsyncStorage.getStore()
-            : undefined;
+          const workStore = __creekCurrentRender();
           const mergedWorkers = Object.assign(
             Object.create(null),
             nodeWorkers || {},

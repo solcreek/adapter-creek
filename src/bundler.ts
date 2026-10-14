@@ -8,6 +8,7 @@
  * the custom chunk format that plain esbuild cannot follow.
  */
 
+import { readdirSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { execFileSync } from "node:child_process";
@@ -501,6 +502,45 @@ async function patchNodeExternalRequireConditions(distDir: string): Promise<void
       await fs.writeFile(filePath, patched);
     }
   }
+}
+
+/**
+ * Next's server require hook (next/dist/server/require-hook) sends every
+ * `*.shared-runtime` request to the pages runtime's own instance,
+ * `next/dist/server/route-modules/pages/vendored/contexts/<name>`. A webpack
+ * pages bundle leaves the user's `next/dist/shared/lib/<name>.shared-runtime`
+ * imports as external requires, so without the same mapping the worker loads
+ * a second copy: a `RouterContext.Provider` a page renders is then not the
+ * context `useRouter()` reads ("NextRouter was not mounted"). Returns an
+ * alias per vendored context, or none when Next cannot be resolved.
+ * Exported for tests.
+ */
+export function collectSharedRuntimeAliases(distDir: string): Record<string, string> {
+  const projectRequire = createRequire(path.join(path.dirname(distDir), "package.json"));
+  let contextsDir: string;
+  try {
+    contextsDir = path.join(
+      path.dirname(projectRequire.resolve("next/package.json")),
+      "dist", "server", "route-modules", "pages", "vendored", "contexts",
+    );
+  } catch {
+    return {};
+  }
+  let files: string[];
+  try {
+    files = readdirSync(contextsDir);
+  } catch {
+    return {};
+  }
+  const aliases: Record<string, string> = {};
+  for (const file of files) {
+    if (!file.endsWith(".js")) continue;
+    const name = file.slice(0, -".js".length);
+    const target = path.join(contextsDir, file);
+    aliases[`next/dist/shared/lib/${name}.shared-runtime`] = target;
+    aliases[`next/dist/shared/lib/${name}.shared-runtime.js`] = target;
+  }
+  return aliases;
 }
 
 /**
@@ -1115,6 +1155,7 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
   await patchNodeExternalRequireConditions(opts.distDir);
   await patchAppPageManifestSingletons(opts.distDir);
   const ssrLazyRequireAliases = await collectSsrLazyRequireAliases(opts.distDir);
+  const sharedRuntimeAliases = collectSharedRuntimeAliases(opts.distDir);
 
   // Write the generated worker entry
   const entryPath = path.join(opts.outputDir, "__entry.mjs");
@@ -1158,6 +1199,7 @@ export async function bundleForWorkers(opts: BundleOptions): Promise<string[]> {
     // always win over a happenstance SSR lazy-require of the same name.
     alias: {
       ...ssrLazyRequireAliases,
+      ...sharedRuntimeAliases,
       "@opentelemetry/api": path.join(adapterDir, "src", "shims", "opentelemetry.js"),
       // fs shim — intercept both bare and node: prefixed imports.
       // Turbopack runtime uses require("fs") which wrangler must redirect

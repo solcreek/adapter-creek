@@ -4,10 +4,13 @@ import { tmpdir } from "node:os";
 import * as path from "node:path";
 import {
   assertWorkerWithinLimit,
+  collectEdgeWasmBindings,
   collectManifests,
   collectWebpackEdgeAssets,
   countNativeModuleRefs,
   dedupeWasmByContent,
+  restrictWebpackChunkRequire,
+  webpackEdgeBootstrapSource,
 } from "./build.js";
 
 // Regression for the misleading "N native modules" hint: an oversized bundle
@@ -285,5 +288,119 @@ describe("collectWebpackEdgeAssets", () => {
     };
     expect(collectWebpackEdgeAssets(dist, turbopackManifest)).toEqual({ webpackEdgeChunkPaths: [] });
     expect(collectWebpackEdgeAssets(dist, null)).toEqual({ webpackEdgeChunkPaths: [] });
+  });
+});
+
+describe("collectEdgeWasmBindings", () => {
+  const dist = "/proj/.next";
+  const sha = "58ccff8b2b94b5dac6ef8957082ecd8f6d34186d";
+
+  it("maps each wasm binding of middleware and edge functions to its file", () => {
+    const bindings = collectEdgeWasmBindings(dist, {
+      middleware: { "/": { wasm: [{ name: `wasm_${sha}`, filePath: `server/edge-chunks/wasm_${sha}.wasm` }] } },
+      functions: {
+        "/api/add": {
+          wasm: [
+            { name: `wasm_${sha}`, filePath: `server/edge-chunks/wasm_${sha}.wasm` },
+            { name: "wasm_0123abcd", filePath: "server/edge-chunks/wasm_0123abcd.wasm" },
+          ],
+        },
+      },
+    });
+    expect([...bindings]).toEqual([
+      [`wasm_${sha}`, path.join(dist, `server/edge-chunks/wasm_${sha}.wasm`)],
+      ["wasm_0123abcd", path.join(dist, "server/edge-chunks/wasm_0123abcd.wasm")],
+    ]);
+  });
+
+  it("reads Turbopack's chunk paths the same way", () => {
+    const bindings = collectEdgeWasmBindings(dist, {
+      middleware: { "/": { wasm: [{ name: "wasm_54296c12d4cc3109", filePath: "server/edge/chunks/src_add_0656eb_.wasm" }] } },
+    });
+    expect(bindings.get("wasm_54296c12d4cc3109")).toBe(path.join(dist, "server/edge/chunks/src_add_0656eb_.wasm"));
+  });
+
+  it("skips entries that are not a wasm global name and a .wasm file", () => {
+    const bindings = collectEdgeWasmBindings(dist, {
+      functions: {
+        "/x": {
+          wasm: [
+            { name: "not-a-global", filePath: "server/edge-chunks/a.wasm" },
+            { name: "wasm_ok", filePath: "server/edge-chunks/a.js" },
+            { name: "wasm_bad;name", filePath: "server/edge-chunks/b.wasm" },
+            { filePath: "server/edge-chunks/c.wasm" },
+          ],
+        },
+      },
+    });
+    expect(bindings.size).toBe(0);
+  });
+
+  it("yields nothing without a manifest or wasm", () => {
+    expect(collectEdgeWasmBindings(dist, null).size).toBe(0);
+    expect(collectEdgeWasmBindings(dist, { functions: { "/x": { files: ["server/x.js"] } } }).size).toBe(0);
+  });
+});
+
+describe("webpackEdgeBootstrapSource", () => {
+  it("declares _ENTRIES", () => {
+    expect(webpackEdgeBootstrapSource("/out/server", new Map())).toBe("globalThis._ENTRIES = globalThis._ENTRIES || {};\n");
+  });
+
+  it("sets each wasm global from the file the bundler copies into serverDir", () => {
+    const src = webpackEdgeBootstrapSource(
+      "/out/server",
+      new Map([
+        ["58ccff8b", "wasm_58ccff8b.wasm"],
+        ["54296c12", "wasm_58ccff8b.wasm"],
+      ]),
+    );
+    expect(src).toContain(`import __wasm_0 from ${JSON.stringify(path.join("/out/server", "wasm_58ccff8b.wasm"))};`);
+    expect(src).toContain('globalThis["wasm_58ccff8b"] = __wasm_0;');
+    expect(src).toContain('globalThis["wasm_54296c12"] = __wasm_1;');
+  });
+});
+
+describe("restrictWebpackChunkRequire", () => {
+  // As next build --webpack writes server/webpack-runtime.js (minified).
+  const runtime = `d.f.require=(a,b)=>{c[a]||(311!=a?d(require("./chunks/"+g.u(a))):c[a]=1)},module.exports=g,g.C=d`;
+
+  it("narrows the chunk require to .js files and loads the same file", () => {
+    const out = restrictWebpackChunkRequire(runtime)!;
+    expect(out).toContain(`require("./chunks/"+g.u(a).replace(/\\.js$/,"")+".js")`);
+    const chunkFile = (u: (id: number) => string, src: string) => {
+      const expr = src.match(/require\(("\.\/chunks\/"\+g\.u\(a\)[^;]*?)\)\)/)![1];
+      return new Function("g", "a", `return ${expr};`)({ u }, 456) as string;
+    };
+    const u = (id: number) => "" + id + ".js";
+    expect(chunkFile(u, out)).toBe("./chunks/456.js");
+  });
+
+  it("handles other minified names, as in webpack-api-runtime.js", () => {
+    expect(restrictWebpackChunkRequire(`b(require("./chunks/"+e.u(c)))`)).toBe(
+      `b(require("./chunks/"+e.u(c).replace(/\\.js$/,"")+".js"))`,
+    );
+  });
+
+  it("narrows the ./ form a Web Worker's own runtime uses among the server chunks", () => {
+    expect(restrictWebpackChunkRequire(`(require("./"+d.u(b)))`)).toBe(
+      `(require("./"+d.u(b).replace(/\\.js$/,"")+".js"))`,
+    );
+  });
+
+  it("narrows unminified calls, as webpack writes them without server minification", () => {
+    expect(restrictWebpackChunkRequire(`d(require("./chunks/" + __webpack_require__.u(chunkId)))`)).toBe(
+      `d(require("./chunks/"+__webpack_require__.u(chunkId).replace(/\\.js$/,"")+".js"))`,
+    );
+    expect(restrictWebpackChunkRequire(`installChunk(require( "./" + __webpack_require__.u( chunkId ) ))`)).toBe(
+      `installChunk(require("./"+__webpack_require__.u(chunkId).replace(/\\.js$/,"")+".js"))`,
+    );
+  });
+
+  it("is idempotent and leaves other sources alone", () => {
+    const once = restrictWebpackChunkRequire(runtime)!;
+    expect(restrictWebpackChunkRequire(once)).toBeNull();
+    expect(restrictWebpackChunkRequire(`require("./chunks/" + name)`)).toBeNull();
+    expect(restrictWebpackChunkRequire("module.exports = {};")).toBeNull();
   });
 });

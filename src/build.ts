@@ -17,7 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { NextAdapter } from "next";
 import { generateWorkerEntry } from "./worker-entry.js";
 import { bundleForWorkers } from "./bundler.js";
-import { findTurbopackSqliteDrivers, turbopackSqliteError } from "./turbopack-sqlite.js";
+import { findTurbopackSqliteDrivers, isTurbopackBuild, turbopackSqliteError } from "./turbopack-sqlite.js";
 import { writeManifest } from "./manifest.js";
 import { evaluateBundleSize, type ScriptFileSize } from "./bundle-size.js";
 
@@ -233,6 +233,16 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
       const assets = (output as { assets?: Record<string, string> }).assets;
       if (!assets) continue;
       for (const [outPath, srcPath] of Object.entries(assets)) {
+        // `@vercel/og`'s node build also carries yoga, as a base64 data URL
+        // it instantiates from bytes; the trace never lists it. The
+        // `yoga.wasm` beside index.node.js has the same bytes, so registering
+        // it lets the instantiate patch swap in the precompiled module.
+        if (/[\\/]@vercel[\\/]og[\\/]index\.node\.js$/.test(srcPath)) {
+          const yoga = path.join(path.dirname(srcPath), "yoga.wasm");
+          if (!wasmFiles.has("yoga.wasm") && (await fs.access(yoga).then(() => true, () => false))) {
+            wasmFiles.set("yoga.wasm", yoga);
+          }
+        }
         if (!outPath.endsWith(".wasm")) continue;
         // Use basename as the wasm \`name\` so collisions across sources
         // don't produce colliding destination files. The
@@ -241,6 +251,15 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
         if (!wasmFiles.has(name)) wasmFiles.set(name, srcPath);
       }
     }
+  }
+
+  // Edge functions' wasm imports, as the middleware manifest lists them. A
+  // webpack build names each by its own hash (`wasm_<sha1>`), which the
+  // xxh3-named globals below do not cover; they are aliased after hashing.
+  const middlewareManifest = await readMiddlewareManifest(ctx.distDir);
+  const edgeWasmBindings = collectEdgeWasmBindings(ctx.distDir, middlewareManifest);
+  for (const [binding, absPath] of edgeWasmBindings) {
+    if (!wasmFiles.has(binding)) wasmFiles.set(binding, absPath);
   }
 
   // Stage Prisma 7's query-compiler WASM (sqlite) so a Prisma app runs on D1
@@ -280,6 +299,15 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
         console.log(`    wasm: name=${name} dest=${destName} xxh3=${hex} bytes=${bytes.byteLength}`);
         wasmHashToFilename.set(hex, destName);
         wasmLengthToFilename.set(bytes.byteLength, destName);
+      } catch {}
+    }
+    // Point each manifest binding at the shipped file with the same bytes
+    // (dedup may have dropped the binding's own copy).
+    for (const [binding, absPath] of edgeWasmBindings) {
+      try {
+        const hex = xxh3.xxh128(await fs.readFile(absPath)).toString(16).padStart(32, "0");
+        const destName = wasmHashToFilename.get(hex);
+        if (destName) wasmHashToFilename.set(binding.slice("wasm_".length), destName);
       } catch {}
     }
     if (wasmHashToFilename.size > 0) {
@@ -391,6 +419,12 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   }
 
 
+  // Webpack's server runtimes load chunks with `require("./chunks/"+g.u(a))`.
+  // The bundler turns that into a glob over every file in server/chunks,
+  // which with `experimental.serverSourceMaps` includes `.js.map` files it
+  // has no loader for, and the build fails.
+  await restrictWebpackChunkRequires(ctx.distDir);
+
   // Step 3c: Find edge middleware registration chunk.
   // Turbopack generates TWO edge-wrapper files:
   // 1. turbopack-..._edge-wrapper (modulePath — Turbopack runtime, imported by worker)
@@ -413,7 +447,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // edge routes and no middleware had neither.
   const { webpackEdgeRuntimePath, webpackEdgeChunkPaths } = collectWebpackEdgeAssets(
     ctx.distDir,
-    await readMiddlewareManifest(ctx.distDir),
+    middlewareManifest,
   );
   if (webpackEdgeRuntimePath) {
     console.log(
@@ -428,10 +462,16 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // `globalThis._ENTRIES` already exists. This bootstrap file ensures it
   // does; importing it before the runtime and entries runs it first
   // (imports evaluate in declaration order).
+  //
+  // It also sets the `wasm_<hash>` globals edge wasm imports read. Webpack
+  // evaluates the middleware entry as soon as its chunk is imported, before
+  // any statement of the worker entry runs, so the globals must come from a
+  // module imported ahead of the runtime. The bundler copies each wasm file
+  // into serverDir before bundling.
   let webpackEdgeBootstrapPath: string | undefined;
   if (webpackEdgeRuntimePath) {
     const bootstrapPath = path.join(ctx.distDir, "server", "creek-edge-bootstrap.js");
-    await fs.writeFile(bootstrapPath, "globalThis._ENTRIES = globalThis._ENTRIES || {};\n");
+    await fs.writeFile(bootstrapPath, webpackEdgeBootstrapSource(serverDir, wasmHashToFilename));
     webpackEdgeBootstrapPath = bootstrapPath;
   }
   if (ctx.outputs.middleware?.edgeRuntime) {
@@ -541,13 +581,20 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // registration is side-effect free (just pushes onto globalThis.TURBOPACK),
   // so preloading is safe — any Node-only factory body only runs if
   // someone actually requires that specific module.
-  try {
-    const nodeChunksDir = path.join(ctx.distDir, "server", "chunks");
-    const chunkPaths = await collectJsFilesRecursive(nodeChunksDir);
-    for (const chunkPath of chunkPaths) {
-      await addEdgeChunkImportPath(edgeOtherChunkPaths, chunkPath);
-    }
-  } catch {}
+  //
+  // Turbopack builds only. A webpack build's server chunks load through its
+  // own runtime's require, and not every one is a module registry: a Web
+  // Worker (`new Worker(new URL(...))`) is emitted there as a self-running
+  // bundle, which threw `self.postMessage is not a function` at worker start.
+  if (await isTurbopackBuild(ctx.distDir)) {
+    try {
+      const nodeChunksDir = path.join(ctx.distDir, "server", "chunks");
+      const chunkPaths = await collectJsFilesRecursive(nodeChunksDir);
+      for (const chunkPath of chunkPaths) {
+        await addEdgeChunkImportPath(edgeOtherChunkPaths, chunkPath);
+      }
+    } catch {}
+  }
 
   // Step 3e: Collect non-code user files (data.json, etc.) that route
   // handlers may read at runtime via fs.readFileSync. Next.js's adapter API
@@ -1465,9 +1512,14 @@ export async function assertWorkerWithinLimit(serverDir: string, serverFiles: st
   }
 }
 
+interface MiddlewareManifestFunction {
+  files?: string[];
+  wasm?: Array<{ name?: string; filePath?: string }>;
+}
+
 interface MiddlewareManifest {
-  middleware?: Record<string, { files?: string[] }>;
-  functions?: Record<string, { files?: string[] }>;
+  middleware?: Record<string, MiddlewareManifestFunction>;
+  functions?: Record<string, MiddlewareManifestFunction>;
 }
 
 /** `.next/server/middleware-manifest.json`, or null when absent or unreadable. */
@@ -1504,6 +1556,92 @@ export function collectWebpackEdgeAssets(
     }
   }
   return { webpackEdgeRuntimePath, webpackEdgeChunkPaths };
+}
+
+// Minified (`"./chunks/"+g.u(a)`) or not (`"./chunks/" + __webpack_require__.u(chunkId)`,
+// with `experimental.serverMinification: false`).
+const WEBPACK_CHUNK_REQUIRE = /require\(\s*"(\.\/(?:chunks\/)?)"\s*\+\s*([A-Za-z_$][\w$]*)\.u\(\s*([A-Za-z_$][\w$]*)\s*\)\s*\)/g;
+
+/**
+ * Rewrite a webpack server runtime's chunk require so the bundler's glob
+ * matches only `.js` files: `require("./chunks/"+g.u(a))` becomes
+ * `require("./chunks/"+g.u(a).replace(/\.js$/,"")+".js")`. The server
+ * runtimes use `./chunks/`; a Web Worker bundled among the server chunks
+ * carries its own runtime, which uses `./`. A server chunk's filename always
+ * ends in `.js`, so the loaded file is the same. Returns the rewritten source,
+ * or null when there is nothing to rewrite. Exported for tests.
+ */
+export function restrictWebpackChunkRequire(source: string): string | null {
+  const rewritten = source.replace(
+    WEBPACK_CHUNK_REQUIRE,
+    (_, dir: string, runtime: string, id: string) =>
+      `require(${JSON.stringify(dir)}+${runtime}.u(${id}).replace(/\\.js$/,"")+".js")`,
+  );
+  return rewritten === source ? null : rewritten;
+}
+
+/**
+ * Apply restrictWebpackChunkRequire in place to the webpack server runtimes
+ * and to the server chunks, where a Web Worker's own runtime can sit.
+ */
+async function restrictWebpackChunkRequires(distDir: string): Promise<void> {
+  const serverDir = path.join(distDir, "server");
+  const files = ["webpack-runtime.js", "webpack-api-runtime.js"].map((name) => path.join(serverDir, name));
+  try {
+    for (const entry of await fs.readdir(path.join(serverDir, "chunks"))) {
+      if (entry.endsWith(".js")) files.push(path.join(serverDir, "chunks", entry));
+    }
+  } catch {}
+  for (const file of files) {
+    let source: string;
+    try {
+      source = await fs.readFile(file, "utf-8");
+    } catch {
+      continue;
+    }
+    if (!source.includes(".u(")) continue;
+    const rewritten = restrictWebpackChunkRequire(source);
+    if (rewritten !== null) await fs.writeFile(file, rewritten);
+  }
+}
+
+/**
+ * The module imported before the webpack edge runtime: declares `_ENTRIES`
+ * and sets each `wasm_<hash>` global to its compiled wasm module, imported
+ * from serverDir. Exported for tests.
+ */
+export function webpackEdgeBootstrapSource(serverDir: string, wasmHashToFilename: Map<string, string>): string {
+  const lines = ["globalThis._ENTRIES = globalThis._ENTRIES || {};"];
+  let i = 0;
+  for (const [hash, filename] of wasmHashToFilename) {
+    lines.push(`import __wasm_${i} from ${JSON.stringify(path.join(serverDir, filename))};`);
+    lines.push(`globalThis[${JSON.stringify("wasm_" + hash)}] = __wasm_${i};`);
+    i++;
+  }
+  return lines.join("\n") + "\n";
+}
+
+/**
+ * The wasm bindings of edge functions (middleware, edge pages and routes): the
+ * global each one reads its wasm import from, as the middleware manifest names
+ * it (`wasm_<hash>`), mapped to the file's absolute path. Webpack builds name
+ * them by a hash of their own; the edge code reads the global as a bare
+ * identifier, so it must exist under exactly this name. Exported for tests.
+ */
+export function collectEdgeWasmBindings(
+  distDir: string,
+  manifest: MiddlewareManifest | null,
+): Map<string, string> {
+  const bindings = new Map<string, string>();
+  const entries = [...Object.values(manifest?.middleware ?? {}), ...Object.values(manifest?.functions ?? {})];
+  for (const entry of entries) {
+    for (const { name, filePath } of entry?.wasm ?? []) {
+      if (typeof name !== "string" || !/^wasm_[0-9A-Za-z_]+$/.test(name)) continue;
+      if (typeof filePath !== "string" || !filePath.endsWith(".wasm")) continue;
+      if (!bindings.has(name)) bindings.set(name, path.join(distDir, filePath));
+    }
+  }
+  return bindings;
 }
 
 /**

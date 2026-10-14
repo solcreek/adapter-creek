@@ -1,6 +1,10 @@
 import { NextResponse } from "next/server";
-export function middleware(req) {
+import { increment } from "./lib/add";
+export async function middleware(req) {
   const { pathname } = req.nextUrl;
+  if (pathname === "/mw-wasm") {
+    return Response.json({ route: "mw-wasm", value: await increment(1) });
+  }
   if (pathname.startsWith("/rw/")) {
     const url = req.nextUrl.clone();
     url.pathname = "/edge-ssr-dyn/" + pathname.slice(4);
@@ -17,4 +21,4 @@ export function middleware(req) {
   res.headers.set("x-mw-ran", "1");
   return res;
 }
-export const config = { matcher: ["/api/:path*", "/edge-route", "/node-route", "/edge-dyn/:path*", "/rw/:path*", "/rwapi/:path*"] };
+export const config = { matcher: ["/api/:path*", "/edge-route", "/node-route", "/edge-dyn/:path*", "/rw/:path*", "/rwapi/:path*", "/mw-wasm"] };

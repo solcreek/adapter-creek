@@ -195,10 +195,22 @@ try {
 }
 
 // --- Signal handling ---
+// Give requests already in flight a moment before disposing: a test can end
+// with fetches it started but did not await (e2e/app-dir/css-chunking), and a
+// deployment would answer them rather than drop the connection.
+const SHUTDOWN_GRACE_MS = 500;
+let shuttingDown = false;
 const shutdown = async (sig) => {
+  if (shuttingDown) return;
+  shuttingDown = true;
   console.error(`[worker-dev-server-miniflare] received ${sig}, disposing...`);
+  await new Promise((resolve) => setTimeout(resolve, SHUTDOWN_GRACE_MS));
   try { await mf.dispose(); } catch {}
   process.exit(0);
 };
+// Miniflare's exit hook kills workerd and exits on these signals at once;
+// replace it (its "exit" listener stays, as a backstop).
+process.removeAllListeners("SIGTERM");
+process.removeAllListeners("SIGINT");
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));

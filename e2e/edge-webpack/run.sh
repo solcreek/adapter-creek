@@ -15,6 +15,14 @@
 # twice: with middleware, then without it (the edge runtime used to come only
 # from the middleware's files, so edge routes alone had none).
 #
+# Also covers two webpack-only render bugs: a server action posted to an edge
+# page ran the node build's module id, and a page under a route group rendered
+# without its client chunk. And edge wasm imports, which webpack binds to
+# `wasm_<hash>` globals the middleware manifest names.
+#
+# The build itself covers two more: server source maps beside the server
+# chunks, and a Web Worker, which webpack also emits among them.
+#
 # Usage: e2e/edge-webpack/run.sh   (from the repo root; needs network + wrangler)
 #        E2E_BUNDLER=turbopack e2e/edge-webpack/run.sh   (same checks, Turbopack)
 set -euo pipefail
@@ -100,6 +108,45 @@ check() {
   fi
 }
 
+# post_form <label> <page path> <expected substring of the response HTML>
+# Submits the page's first <form> as a browser without JavaScript does: a
+# server action's progressive-enhancement POST.
+post_form() {
+  local label="$1" path="$2" expect="$3" out
+  out="$(node -e '
+      const [url, expect] = process.argv.slice(1);
+      (async () => {
+        const page = await fetch(url).then((r) => r.text());
+        const form = (page.match(/<form[^>]*>([\s\S]*?)<\/form>/) || [])[1];
+        if (!form) return console.log("no <form> on " + url);
+        const unescape = (s) => s.replace(/&quot;/g, "\"").replace(/&#x27;/g, "\x27").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
+        const body = new FormData();
+        for (const m of form.matchAll(/<input[^>]*?name="([^"]+)"(?:[^>]*?value="([^"]*)")?[^>]*>/g)) body.append(unescape(m[1]), unescape(m[2] ?? ""));
+        const res = await fetch(url, { method: "POST", body, redirect: "manual" });
+        const text = await res.text();
+        console.log(res.status === 200 && text.includes(expect) ? "ok" : "HTTP " + res.status + ": " + text.slice(0, 300));
+      })().catch((e) => console.log(String(e)));
+    ' "$BASE$path" "$expect")"
+  if [ "$out" = "ok" ]; then
+    printf '  ok    %s\n' "$label"
+  else
+    printf '  FAIL  %s -> %s\n' "$label" "$out"
+    FAILED=$((FAILED + 1))
+  fi
+}
+
+# check_type <label> <expected content-type> <url>: HTTP 200 with that type.
+check_type() {
+  local label="$1" expect="$2" url="$3" out
+  out="$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' "$url" || true)"
+  if [ "$out" = "200 $expect" ]; then
+    printf '  ok    %s\n' "$label"
+  else
+    printf '  FAIL  %s -> %s\n' "$label" "$out"
+    FAILED=$((FAILED + 1))
+  fi
+}
+
 # run_variant <name> <x-from-mw value expected from middleware, as JSON>
 run_variant() {
   local name="$1" mw="$2"
@@ -132,6 +179,7 @@ run_variant() {
   check "app route, edge, dynamic"        '{"slug":"abc"}' "$BASE/edge-dyn/abc"
   check "app route, edge, POST json"      '{"echoed":{"a":1}}' -X POST -H 'content-type: application/json' --data '{"a":1}' "$BASE/edge-dyn/abc"
   check "app page, edge"                  'edge app page, runtime <!-- -->edge' "$BASE/edge-page"
+  check "pages API, edge, wasm import"    '{"input":10,"value":11}' "$BASE/api/edge-wasm?input=10"
   check "pages SSR, edge"                 'edge pages ssr q=<!-- -->zz' "$BASE/edge-ssr?q=zz"
   check "pages SSR, edge, dynamic"        'slug=<!-- -->hello<!-- --> q=<!-- -->1' "$BASE/edge-ssr-dyn/hello?q=1"
   if [ "$mw" != "null" ]; then
@@ -139,7 +187,21 @@ run_variant() {
     # params reach the edge entry only through the rewrite.
     check "rewrite -> pages SSR, edge"    'slug=<!-- -->world<!-- --> q=<!-- -->2' "$BASE/rw/world?q=2"
     check "rewrite -> pages API, edge"    '{"id":"77"}' "$BASE/rwapi/77"
+    check "middleware, wasm import"       '{"route":"mw-wasm","value":2}' "$BASE/mw-wasm"
   fi
+  # An action imported by a node page and an edge page has a module id in
+  # each runtime's build; the edge POST must run the edge one.
+  post_form "server action, edge page"    /action-edge 'echo:creek:edge'
+  post_form "server action, node page"    /action-node 'echo:creek:node'
+  # Under a route group the page's manifest is keyed "/(shop)/grouped/[id]";
+  # the render must still find it, or the page's client chunk is left out.
+  # The chunk path is webpack's naming.
+  if [ "$BUILD_FLAG" = "--webpack" ]; then
+    check "RSC payload, route group"      'static/chunks/app/(shop)/grouped/%5Bid%5D/page-' -H 'RSC: 1' "$BASE/grouped/1"
+  fi
+  check "pages SSR, shared-runtime context" 'pathname <!-- -->/from-provider' "$BASE/shared-runtime"
+  check_type "app route, node, next/og"   'image/png' "$BASE/og-node"
+  check "page with a Web Worker"          'web worker page: <!-- -->waiting' "$BASE/web-worker"
   check "pages API, node (control)"       "{\"route\":\"pages-node\",\"header\":$mw}" "$BASE/api/node"
   check "app route, node (control)"       "{\"route\":\"app-node\",\"header\":$mw}" "$BASE/node-route"
 

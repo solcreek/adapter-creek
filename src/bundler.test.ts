@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { createRequire } from "node:module";
 import * as path from "node:path";
 import {
+  collectSharedRuntimeAliases,
   dedupeEmittedWasm,
   minifyWorker,
   patchAppPageRevalidationPostponedState,
@@ -406,5 +407,37 @@ describe("dedupeEmittedWasm", () => {
     expect(dropped).toBe(0);
     expect(readFileSync(path.join(dir, `${HASH}-only.wasm`), "utf-8")).toBe("X");
     expect(readFileSync(path.join(dir, `deadbeef1234567-other.wasm`), "utf-8")).toBe("Y");
+  });
+});
+
+describe("collectSharedRuntimeAliases", () => {
+  let project: string;
+  beforeEach(() => {
+    project = mkdtempSync(path.join(tmpdir(), "creek-shared-runtime-"));
+    const next = path.join(project, "node_modules", "next");
+    const contexts = path.join(next, "dist", "server", "route-modules", "pages", "vendored", "contexts");
+    mkdirSync(contexts, { recursive: true });
+    writeFileSync(path.join(next, "package.json"), JSON.stringify({ name: "next", version: "16.0.0" }));
+    writeFileSync(path.join(project, "package.json"), "{}");
+    for (const f of ["router-context.js", "head-manager-context.js", "router-context.js.map"]) {
+      writeFileSync(path.join(contexts, f), "");
+    }
+  });
+  afterEach(() => rmSync(project, { recursive: true, force: true }));
+
+  it("maps each shared-runtime context to the pages runtime's vendored copy, as Next's require hook does", () => {
+    const aliases = collectSharedRuntimeAliases(path.join(project, ".next"));
+    const contexts = path.join(realpathSync(project), "node_modules", "next", "dist", "server", "route-modules", "pages", "vendored", "contexts");
+    expect(aliases).toEqual({
+      "next/dist/shared/lib/head-manager-context.shared-runtime": path.join(contexts, "head-manager-context.js"),
+      "next/dist/shared/lib/head-manager-context.shared-runtime.js": path.join(contexts, "head-manager-context.js"),
+      "next/dist/shared/lib/router-context.shared-runtime": path.join(contexts, "router-context.js"),
+      "next/dist/shared/lib/router-context.shared-runtime.js": path.join(contexts, "router-context.js"),
+    });
+  });
+
+  it("returns none when Next cannot be resolved", () => {
+    rmSync(path.join(project, "node_modules"), { recursive: true });
+    expect(collectSharedRuntimeAliases(path.join(project, ".next"))).toEqual({});
   });
 });
