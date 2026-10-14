@@ -397,12 +397,8 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // 2. node_modules_..._edge-wrapper (contains _ENTRIES registration + module loader)
   // File 2 is NOT referenced by modulePath, so we need to import it explicitly.
   //
-  // Webpack builds take a different path: the middleware output's `assets`
-  // include `server/edge-runtime-webpack.js`, a tiny IIFE that installs a
-  // `webpackChunk_N_E.push` hook. Without importing it BEFORE `middleware.js`,
-  // the chunk push becomes a plain Array.push and the entry chunk never
-  // evaluates — `_ENTRIES["middleware_middleware"]` stays undefined and all
-  // middleware rewrites silently no-op (reproduces as search-params 404s).
+  // Webpack builds take a different path: see collectWebpackEdgeAssets below,
+  // which covers middleware and edge pages/routes alike.
   let edgeRegistrationChunkPath: string | undefined;
   let edgeRuntimeModuleIds: number[] = [];
   let edgeOtherChunkPaths: string[] = [];

@@ -75,19 +75,19 @@ export interface WorkerEntryOptions {
   /** Paths to edge otherChunks that need explicit import */
   edgeOtherChunkPaths?: string[];
   /**
-   * Path to `.next/server/edge-runtime-webpack.js` when the user built with
-   * `next build --webpack`. This tiny IIFE installs the chunk-push hook on
-   * `self.webpackChunk_N_E`; it must evaluate BEFORE `middleware.js` so the
-   * push that registers chunk 149 triggers entry evaluation and populates
-   * `_ENTRIES["middleware_middleware"]`. Turbopack builds don't emit this
-   * file — its absence is the signal to fall through to the Turbopack path.
+   * Path to `.next/server/edge-runtime-webpack.js` when the build used webpack
+   * and has an edge function (middleware or an edge page/route). This tiny
+   * IIFE installs the chunk-push hook on `self.webpackChunk_N_E`; it must
+   * evaluate before the shared edge chunks and every webpack edge entry, so
+   * each entry's push evaluates it and populates `_ENTRIES["middleware_…"]`.
+   * Turbopack builds don't emit this file.
    */
   webpackEdgeRuntimePath?: string;
   /**
    * Path to a tiny generated bootstrap file that predeclares
-   * `globalThis._ENTRIES`. Imported BEFORE the webpack runtime so that
-   * middleware.js's strict-mode bare `_ENTRIES = {}` has a global to resolve
-   * against (otherwise: ReferenceError at module evaluation).
+   * `globalThis._ENTRIES`. Imported BEFORE the webpack runtime so that each
+   * webpack edge entry's strict-mode bare `_ENTRIES = …` assignment has a
+   * global to resolve against (otherwise: ReferenceError at module evaluation).
    */
   webpackEdgeBootstrapPath?: string;
   /**
