@@ -13,12 +13,13 @@ if [ -f ".adapter-server.pid" ]; then
   if kill -0 "${PID}" 2>/dev/null; then
     echo "[adapter-creek] Stopping server (PID ${PID})..." >&2
     
-    # Kill entire process group (including wrangler and workerd children)
-    # The node process spawned worker-dev-server-sub.mjs as a new process group
-    # Use negative PID to kill the entire group
-    kill -- -"${PID}" 2>/dev/null || true
+    # Signal the leader alone first: the miniflare server finishes requests
+    # in flight, then disposes workerd itself. Signalling the whole group
+    # would kill workerd mid-request. The group is force-killed below if the
+    # leader does not exit.
+    kill "${PID}" 2>/dev/null || true
     
-    # Wait for process group to exit
+    # Wait for the leader to exit
     for i in $(seq 1 10); do
       if ! kill -0 "${PID}" 2>/dev/null; then
         break
@@ -26,9 +27,11 @@ if [ -f ".adapter-server.pid" ]; then
       sleep 0.5
     done
     
-    # Force kill if still alive
+    # Force kill if still alive; otherwise stop anything left in its group.
     if kill -0 "${PID}" 2>/dev/null; then
       kill -9 -- -"${PID}" 2>/dev/null || true
+    else
+      kill -- -"${PID}" 2>/dev/null || true
     fi
   fi
   rm -f .adapter-server.pid
