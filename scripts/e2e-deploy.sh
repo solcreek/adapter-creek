@@ -76,6 +76,13 @@ else
 # install into a ~5s link operation once the store is warm.
 # Dropping --force so pnpm can actually use the cached store. --force
 # would re-download every package.
+  #
+  # Pin the store in the fixture's .npmrc too, not only on this command: any
+  # later pnpm call in the fixture must link from the same store. `next build`
+  # runs `pnpm add typescript` itself when a TypeScript fixture lacks it, and
+  # with the default store pnpm refuses (ERR_PNPM_UNEXPECTED_STORE), failing
+  # the build before the adapter runs.
+  printf 'store-dir=%s\n' "${PNPM_STORE_DIR}" >> .npmrc
   pnpm install --store-dir "${PNPM_STORE_DIR}" --no-frozen-lockfile --prefer-offline --ignore-scripts >&2 2>&1
 fi
 if grep -R "@swc/helpers/_/_object_spread" pages app src 2>/dev/null >/dev/null; then
