@@ -187,6 +187,7 @@ run_variant() {
   if [ "$BUILD_FLAG" = "--webpack" ]; then
     check "RSC payload, route group"      'static/chunks/app/(shop)/grouped/%5Bid%5D/page-' -H 'RSC: 1' "$BASE/grouped/1"
   fi
+  check "pages SSR, shared-runtime context" 'pathname <!-- -->/from-provider' "$BASE/shared-runtime"
   check "page with a Web Worker"          'web worker page: <!-- -->waiting' "$BASE/web-worker"
   check "pages API, node (control)"       "{\"route\":\"pages-node\",\"header\":$mw}" "$BASE/api/node"
   check "app route, node (control)"       "{\"route\":\"app-node\",\"header\":$mw}" "$BASE/node-route"
