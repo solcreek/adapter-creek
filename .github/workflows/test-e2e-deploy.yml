@@ -11,6 +11,13 @@ on:
         description: 'Next.js repo ref (branch/tag/SHA)'
         default: '493fba50f36ff8dd98cb5dd46306a701da080329'
         type: string
+      bundler:
+        # creek deploy always builds with webpack (`next build --webpack`);
+        # turbopack is the Next.js 16 default and this suite's history.
+        description: 'Bundler for every fixture build'
+        default: 'turbopack'
+        type: choice
+        options: [turbopack, webpack]
   # Uncomment for nightly runs:
   # schedule:
   #   - cron: '0 2 * * *'
@@ -78,7 +85,7 @@ jobs:
           key: build-${{ github.sha }}-${{ github.run_id }}
 
   test:
-    name: Tests (${{ matrix.group }})
+    name: Tests (${{ inputs.bundler || 'turbopack' }}, ${{ matrix.group }})
     needs: build
     runs-on: ubuntu-latest-8-core
     timeout-minutes: 120
@@ -144,7 +151,11 @@ jobs:
           NEXT_EXTERNAL_TESTS_FILTERS: test/deploy-tests-manifest.json,${{ github.workspace }}/adapter/test/deploy-tests-manifest.adapter-creek.json
           ADAPTER_DIR: ${{ github.workspace }}/adapter
           ADAPTER_TARBALL: ${{ steps.tarball.outputs.path }}
-          IS_TURBOPACK_TEST: 1
+          # Next.js picks the bundler from these (lib/bundler.js); setting
+          # both exits with "Multiple bundler flags set", so exactly one is
+          # non-empty.
+          IS_TURBOPACK_TEST: ${{ inputs.bundler == 'webpack' && '' || '1' }}
+          IS_WEBPACK_TEST: ${{ inputs.bundler == 'webpack' && '1' || '' }}
           NEXT_TEST_JOB: 1
           NEXT_TELEMETRY_DISABLED: 1
           NEXT_TEST_DEPLOY_SCRIPT_PATH: ${{ github.workspace }}/adapter/scripts/e2e-deploy.sh
