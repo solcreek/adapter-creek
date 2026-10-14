@@ -1558,7 +1558,9 @@ export function collectWebpackEdgeAssets(
   return { webpackEdgeRuntimePath, webpackEdgeChunkPaths };
 }
 
-const WEBPACK_CHUNK_REQUIRE = /require\("(\.\/(?:chunks\/)?)"\+([A-Za-z_$][\w$]*)\.u\(([A-Za-z_$][\w$]*)\)\)/g;
+// Minified (`"./chunks/"+g.u(a)`) or not (`"./chunks/" + __webpack_require__.u(chunkId)`,
+// with `experimental.serverMinification: false`).
+const WEBPACK_CHUNK_REQUIRE = /require\(\s*"(\.\/(?:chunks\/)?)"\s*\+\s*([A-Za-z_$][\w$]*)\.u\(\s*([A-Za-z_$][\w$]*)\s*\)\s*\)/g;
 
 /**
  * Rewrite a webpack server runtime's chunk require so the bundler's glob

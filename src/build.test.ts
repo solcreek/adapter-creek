@@ -388,6 +388,15 @@ describe("restrictWebpackChunkRequire", () => {
     );
   });
 
+  it("narrows unminified calls, as webpack writes them without server minification", () => {
+    expect(restrictWebpackChunkRequire(`d(require("./chunks/" + __webpack_require__.u(chunkId)))`)).toBe(
+      `d(require("./chunks/"+__webpack_require__.u(chunkId).replace(/\\.js$/,"")+".js"))`,
+    );
+    expect(restrictWebpackChunkRequire(`installChunk(require( "./" + __webpack_require__.u( chunkId ) ))`)).toBe(
+      `installChunk(require("./"+__webpack_require__.u(chunkId).replace(/\\.js$/,"")+".js"))`,
+    );
+  });
+
   it("is idempotent and leaves other sources alone", () => {
     const once = restrictWebpackChunkRequire(runtime)!;
     expect(restrictWebpackChunkRequire(once)).toBeNull();
