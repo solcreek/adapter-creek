@@ -135,6 +135,18 @@ post_form() {
   fi
 }
 
+# check_type <label> <expected content-type> <url>: HTTP 200 with that type.
+check_type() {
+  local label="$1" expect="$2" url="$3" out
+  out="$(curl -sS -o /dev/null -w '%{http_code} %{content_type}' "$url" || true)"
+  if [ "$out" = "200 $expect" ]; then
+    printf '  ok    %s\n' "$label"
+  else
+    printf '  FAIL  %s -> %s\n' "$label" "$out"
+    FAILED=$((FAILED + 1))
+  fi
+}
+
 # run_variant <name> <x-from-mw value expected from middleware, as JSON>
 run_variant() {
   local name="$1" mw="$2"
@@ -188,6 +200,7 @@ run_variant() {
     check "RSC payload, route group"      'static/chunks/app/(shop)/grouped/%5Bid%5D/page-' -H 'RSC: 1' "$BASE/grouped/1"
   fi
   check "pages SSR, shared-runtime context" 'pathname <!-- -->/from-provider' "$BASE/shared-runtime"
+  check_type "app route, node, next/og"   'image/png' "$BASE/og-node"
   check "page with a Web Worker"          'web worker page: <!-- -->waiting' "$BASE/web-worker"
   check "pages API, node (control)"       "{\"route\":\"pages-node\",\"header\":$mw}" "$BASE/api/node"
   check "app route, node (control)"       "{\"route\":\"app-node\",\"header\":$mw}" "$BASE/node-route"

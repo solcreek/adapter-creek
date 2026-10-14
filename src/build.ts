@@ -233,6 +233,16 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
       const assets = (output as { assets?: Record<string, string> }).assets;
       if (!assets) continue;
       for (const [outPath, srcPath] of Object.entries(assets)) {
+        // `@vercel/og`'s node build also carries yoga, as a base64 data URL
+        // it instantiates from bytes; the trace never lists it. The
+        // `yoga.wasm` beside index.node.js has the same bytes, so registering
+        // it lets the instantiate patch swap in the precompiled module.
+        if (/[\\/]@vercel[\\/]og[\\/]index\.node\.js$/.test(srcPath)) {
+          const yoga = path.join(path.dirname(srcPath), "yoga.wasm");
+          if (!wasmFiles.has("yoga.wasm") && (await fs.access(yoga).then(() => true, () => false))) {
+            wasmFiles.set("yoga.wasm", yoga);
+          }
+        }
         if (!outPath.endsWith(".wasm")) continue;
         // Use basename as the wasm \`name\` so collisions across sources
         // don't produce colliding destination files. The
