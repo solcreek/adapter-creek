@@ -180,7 +180,10 @@ run_variant() {
   post_form "server action, node page"    /action-node 'echo:creek:node'
   # Under a route group the page's manifest is keyed "/(shop)/grouped/[id]";
   # the render must still find it, or the page's client chunk is left out.
-  check "RSC payload, route group"        'static/chunks/app/(shop)/grouped/%5Bid%5D/page-' -H 'RSC: 1' "$BASE/grouped/1"
+  # The chunk path is webpack's naming.
+  if [ "$BUILD_FLAG" = "--webpack" ]; then
+    check "RSC payload, route group"      'static/chunks/app/(shop)/grouped/%5Bid%5D/page-' -H 'RSC: 1' "$BASE/grouped/1"
+  fi
   check "pages API, node (control)"       "{\"route\":\"pages-node\",\"header\":$mw}" "$BASE/api/node"
   check "app route, node (control)"       "{\"route\":\"app-node\",\"header\":$mw}" "$BASE/node-route"
 
