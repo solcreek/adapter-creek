@@ -17,7 +17,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import type { NextAdapter } from "next";
 import { generateWorkerEntry } from "./worker-entry.js";
 import { bundleForWorkers } from "./bundler.js";
-import { findTurbopackSqliteDrivers, turbopackSqliteError } from "./turbopack-sqlite.js";
+import { findTurbopackSqliteDrivers, isTurbopackBuild, turbopackSqliteError } from "./turbopack-sqlite.js";
 import { writeManifest } from "./manifest.js";
 import { evaluateBundleSize, type ScriptFileSize } from "./bundle-size.js";
 
@@ -571,13 +571,20 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // registration is side-effect free (just pushes onto globalThis.TURBOPACK),
   // so preloading is safe — any Node-only factory body only runs if
   // someone actually requires that specific module.
-  try {
-    const nodeChunksDir = path.join(ctx.distDir, "server", "chunks");
-    const chunkPaths = await collectJsFilesRecursive(nodeChunksDir);
-    for (const chunkPath of chunkPaths) {
-      await addEdgeChunkImportPath(edgeOtherChunkPaths, chunkPath);
-    }
-  } catch {}
+  //
+  // Turbopack builds only. A webpack build's server chunks load through its
+  // own runtime's require, and not every one is a module registry: a Web
+  // Worker (`new Worker(new URL(...))`) is emitted there as a self-running
+  // bundle, which threw `self.postMessage is not a function` at worker start.
+  if (await isTurbopackBuild(ctx.distDir)) {
+    try {
+      const nodeChunksDir = path.join(ctx.distDir, "server", "chunks");
+      const chunkPaths = await collectJsFilesRecursive(nodeChunksDir);
+      for (const chunkPath of chunkPaths) {
+        await addEdgeChunkImportPath(edgeOtherChunkPaths, chunkPath);
+      }
+    } catch {}
+  }
 
   // Step 3e: Collect non-code user files (data.json, etc.) that route
   // handlers may read at runtime via fs.readFileSync. Next.js's adapter API
