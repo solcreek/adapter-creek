@@ -5,6 +5,7 @@
 #   ./scripts/local-test.sh                           # Run all e2e tests (2 concurrent)
 #   ./scripts/local-test.sh test/e2e/app-dir/app      # Run a single test
 #   ./scripts/local-test.sh -g 1/4                    # Run test group 1 of 4
+#   BUNDLER=webpack ./scripts/local-test.sh            # Build fixtures with webpack (as creek deploy does)
 #
 # Prerequisites:
 #   1. Next.js repo cloned at ./nextjs — per Next.js's official adapter-testing
@@ -97,7 +98,14 @@ cd "${NEXTJS_DIR}"
 # Core test configuration
 export NEXT_TEST_MODE=deploy
 export ADAPTER_DIR="${ADAPTER_DIR}"
-export IS_TURBOPACK_TEST=1
+# BUNDLER=webpack builds every fixture with webpack, as creek deploy does;
+# the default is turbopack, the Next.js 16 default. Set exactly one flag:
+# Next.js exits on "Multiple bundler flags set".
+case "${BUNDLER:-turbopack}" in
+  turbopack) export IS_TURBOPACK_TEST=1; unset IS_WEBPACK_TEST ;;
+  webpack) export IS_WEBPACK_TEST=1; unset IS_TURBOPACK_TEST ;;
+  *) echo "[local-test] BUNDLER must be turbopack or webpack (got '${BUNDLER}')" >&2; exit 1 ;;
+esac
 export NEXT_TEST_JOB=1
 export NEXT_TELEMETRY_DISABLED=1
 export NEXT_EXTERNAL_TESTS_FILTERS=test/deploy-tests-manifest.json
