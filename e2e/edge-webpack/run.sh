@@ -15,6 +15,9 @@
 # twice: with middleware, then without it (the edge runtime used to come only
 # from the middleware's files, so edge routes alone had none).
 #
+# Also covers a webpack-only render bug: a page under a route group rendered
+# without its client chunk.
+#
 # Usage: e2e/edge-webpack/run.sh   (from the repo root; needs network + wrangler)
 #        E2E_BUNDLER=turbopack e2e/edge-webpack/run.sh   (same checks, Turbopack)
 set -euo pipefail
@@ -140,6 +143,9 @@ run_variant() {
     check "rewrite -> pages SSR, edge"    'slug=<!-- -->world<!-- --> q=<!-- -->2' "$BASE/rw/world?q=2"
     check "rewrite -> pages API, edge"    '{"id":"77"}' "$BASE/rwapi/77"
   fi
+  # Under a route group the page's manifest is keyed "/(shop)/grouped/[id]";
+  # the render must still find it, or the page's client chunk is left out.
+  check "RSC payload, route group"        'static/chunks/app/(shop)/grouped/%5Bid%5D/page-' -H 'RSC: 1' "$BASE/grouped/1"
   check "pages API, node (control)"       "{\"route\":\"pages-node\",\"header\":$mw}" "$BASE/api/node"
   check "app route, node (control)"       "{\"route\":\"app-node\",\"header\":$mw}" "$BASE/node-route"
 

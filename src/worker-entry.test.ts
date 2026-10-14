@@ -63,3 +63,47 @@ describe("generateWorkerEntry: webpack edge functions", () => {
     expect(helper).toContain("waitUntil: ctx?.waitUntil");
   });
 });
+
+/** Source of a top-level function declaration in the generated entry. */
+function fnSource(src: string, name: string): string {
+  const start = src.search(new RegExp(`\\n(async )?function ${name}\\(`)) + 1;
+  expect(start).toBeGreaterThan(0);
+  const end = src.indexOf("\n}\n", start);
+  return src.slice(start, end + 2);
+}
+
+describe("generateWorkerEntry: client reference manifests per route", () => {
+  const src = entry({});
+  const normalize = new Function(`${fnSource(src, "__creekNormalizeAppPath")}; return __creekNormalizeAppPath;`)() as (
+    page: string,
+  ) => string;
+
+  it("keys a manifest by the route Next's work store reports, as normalizeAppPath does", async () => {
+    const { normalizeAppPath } = await import("next/dist/shared/lib/router/utils/app-paths.js");
+    for (const page of [
+      "/page",
+      "/pricing/page",
+      "/docs/[[...slug]]/page",
+      "/nested-folder/(foo)/product-category/[...slugs]/page",
+      "/(marketing)/(nested)/about/page",
+      "/@modal/(.)photo/[id]/page",
+      "/dashboard/@team/settings/page",
+      "/api/(v1)/items/route",
+      "/(group)/page",
+      "/_not-found/page",
+      "/blog/page-two/page",
+    ]) {
+      expect(normalize(page)).toBe(normalizeAppPath(page));
+    }
+  });
+
+  it("drops route groups and parallel slots", () => {
+    expect(normalize("/nested-folder/(foo)/product-category/[...slugs]/page")).toBe("/nested-folder/product-category/[...slugs]");
+    expect(normalize("/(group)/page")).toBe("/");
+    expect(normalize("/dashboard/@team/settings/page")).toBe("/dashboard/settings");
+  });
+
+  it("registers each manifest under its normalized route", () => {
+    expect(src).toContain("clientReferenceManifestsPerRoute.set(__creekNormalizeAppPath(page), manifest);");
+  });
+});

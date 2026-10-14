@@ -3925,6 +3925,22 @@ function __creekHasPostponedPrerenderForPathname(...pathnames) {
   return false;
 }
 
+// Next's normalizeAppPath (shared/lib/router/utils/app-paths): an app entry
+// name to the route workStore.route reports.
+function __creekNormalizeAppPath(page) {
+  const segments = page.split("/");
+  let pathname = "";
+  for (let i = 0; i < segments.length; i++) {
+    const segment = segments[i];
+    if (!segment) continue;
+    if (segment[0] === "(" && segment.endsWith(")")) continue;
+    if (segment[0] === "@") continue;
+    if ((segment === "page" || segment === "route") && i === segments.length - 1) continue;
+    pathname += "/" + segment;
+  }
+  return pathname || "/";
+}
+
 // Initialize manifests singleton — called lazily on first SSR request.
 function __initManifests() {
   const MANIFESTS_SINGLETON = Symbol.for('next.server.manifests');
@@ -3966,10 +3982,13 @@ function __initManifests() {
     const clientReferenceManifestsPerRoute = new Map();
     const rscManifest = globalThis.__RSC_MANIFEST || {};
     for (const [page, manifest] of Object.entries(rscManifest)) {
-      // __RSC_MANIFEST keys are like "/page", "/pricing/page", "/docs/[[...slug]]/page"
-      // workStore.route uses "/", "/pricing", "/docs/[[...slug]]"
-      const normalized = page.replace(/\\/page$/, "").replace(/^$/, "/");
-      clientReferenceManifestsPerRoute.set(normalized, manifest);
+      // __RSC_MANIFEST keys are entry names: "/page", "/docs/[[...slug]]/page",
+      // "/shop/(group)/[id]/page". workStore.route is Next's normalizeAppPath()
+      // of that name ("/", "/docs/[[...slug]]", "/shop/[id]"), which drops
+      // route groups and parallel slots. Keying by anything else misses for
+      // grouped routes, and the scan below then returns another page's entry,
+      // whose client chunk list for this page's module is empty.
+      clientReferenceManifestsPerRoute.set(__creekNormalizeAppPath(page), manifest);
       // Also keep the original key for direct lookups
       clientReferenceManifestsPerRoute.set(page, manifest);
     }
