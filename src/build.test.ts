@@ -382,6 +382,12 @@ describe("restrictWebpackChunkRequire", () => {
     );
   });
 
+  it("narrows the ./ form a Web Worker's own runtime uses among the server chunks", () => {
+    expect(restrictWebpackChunkRequire(`(require("./"+d.u(b)))`)).toBe(
+      `(require("./"+d.u(b).replace(/\\.js$/,"")+".js"))`,
+    );
+  });
+
   it("is idempotent and leaves other sources alone", () => {
     const once = restrictWebpackChunkRequire(runtime)!;
     expect(restrictWebpackChunkRequire(once)).toBeNull();

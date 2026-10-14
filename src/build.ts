@@ -1558,33 +1558,46 @@ export function collectWebpackEdgeAssets(
   return { webpackEdgeRuntimePath, webpackEdgeChunkPaths };
 }
 
-const WEBPACK_CHUNK_REQUIRE = /require\("\.\/chunks\/"\+([A-Za-z_$][\w$]*)\.u\(([A-Za-z_$][\w$]*)\)\)/g;
+const WEBPACK_CHUNK_REQUIRE = /require\("(\.\/(?:chunks\/)?)"\+([A-Za-z_$][\w$]*)\.u\(([A-Za-z_$][\w$]*)\)\)/g;
 
 /**
  * Rewrite a webpack server runtime's chunk require so the bundler's glob
  * matches only `.js` files: `require("./chunks/"+g.u(a))` becomes
- * `require("./chunks/"+g.u(a).replace(/\.js$/,"")+".js")`. A server chunk's
- * filename always ends in `.js`, so the loaded file is the same. Returns the
- * rewritten source, or null when there is nothing to rewrite. Exported for tests.
+ * `require("./chunks/"+g.u(a).replace(/\.js$/,"")+".js")`. The server
+ * runtimes use `./chunks/`; a Web Worker bundled among the server chunks
+ * carries its own runtime, which uses `./`. A server chunk's filename always
+ * ends in `.js`, so the loaded file is the same. Returns the rewritten source,
+ * or null when there is nothing to rewrite. Exported for tests.
  */
 export function restrictWebpackChunkRequire(source: string): string | null {
   const rewritten = source.replace(
     WEBPACK_CHUNK_REQUIRE,
-    (_, runtime: string, id: string) => `require("./chunks/"+${runtime}.u(${id}).replace(/\\.js$/,"")+".js")`,
+    (_, dir: string, runtime: string, id: string) =>
+      `require(${JSON.stringify(dir)}+${runtime}.u(${id}).replace(/\\.js$/,"")+".js")`,
   );
   return rewritten === source ? null : rewritten;
 }
 
-/** Apply restrictWebpackChunkRequire to the webpack server runtimes in place. */
+/**
+ * Apply restrictWebpackChunkRequire in place to the webpack server runtimes
+ * and to the server chunks, where a Web Worker's own runtime can sit.
+ */
 async function restrictWebpackChunkRequires(distDir: string): Promise<void> {
-  for (const name of ["webpack-runtime.js", "webpack-api-runtime.js"]) {
-    const file = path.join(distDir, "server", name);
+  const serverDir = path.join(distDir, "server");
+  const files = ["webpack-runtime.js", "webpack-api-runtime.js"].map((name) => path.join(serverDir, name));
+  try {
+    for (const entry of await fs.readdir(path.join(serverDir, "chunks"))) {
+      if (entry.endsWith(".js")) files.push(path.join(serverDir, "chunks", entry));
+    }
+  } catch {}
+  for (const file of files) {
     let source: string;
     try {
       source = await fs.readFile(file, "utf-8");
     } catch {
       continue;
     }
+    if (!source.includes(".u(")) continue;
     const rewritten = restrictWebpackChunkRequire(source);
     if (rewritten !== null) await fs.writeFile(file, rewritten);
   }
