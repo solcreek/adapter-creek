@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { describe, expect, it } from "vitest";
 import { generateWorkerEntry, type WorkerEntryOptions } from "./worker-entry.js";
 
@@ -105,5 +106,79 @@ describe("generateWorkerEntry: client reference manifests per route", () => {
 
   it("registers each manifest under its normalized route", () => {
     expect(src).toContain("clientReferenceManifestsPerRoute.set(__creekNormalizeAppPath(page), manifest);");
+  });
+});
+
+describe("generateWorkerEntry: the render in progress for edge entries", () => {
+  const src = entry({});
+  type Render = { page?: string; route?: string } | undefined;
+
+  /** The generated helpers, with a node work store the test controls. */
+  function load(nodeStore: { getStore(): unknown }) {
+    const decl = src.slice(src.indexOf("const __creekEdgeEntryStorage"), src.indexOf(";", src.indexOf("const __creekEdgeEntryStorage")) + 1);
+    const body = [
+      fnSource(src, "__creekNormalizeAppPath"),
+      decl,
+      fnSource(src, "__creekEdgeEntryInfo"),
+      fnSource(src, "__creekCurrentRender"),
+      fnSource(src, "__withEdgeRouteEnv"),
+      "return { __creekCurrentRender, __withEdgeRouteEnv };",
+    ].join("\n");
+    return new Function("AsyncLocalStorage", "__nextWorkAsyncStorage", "EDGE_ROUTE_ENVS", "__CREEK_NEXT_RUNTIME_KEY", "process", body)(
+      AsyncLocalStorage,
+      nodeStore,
+      { "middleware_app/env/page": { FOO: "1" } },
+      "NEXT_RUNTIME",
+      { env: {} },
+    ) as {
+      __creekCurrentRender(): Render;
+      __withEdgeRouteEnv<T>(entryKey: string, fn: () => Promise<T>): Promise<T>;
+    };
+  }
+
+  it("reports the edge entry's page and route across awaits", async () => {
+    const h = load({ getStore: () => undefined });
+    const seen = await h.__withEdgeRouteEnv("middleware_app/header/(g)/edge/form/page", async () => {
+      await new Promise((r) => setTimeout(r, 1));
+      return h.__creekCurrentRender();
+    });
+    expect(seen).toEqual({ page: "app/header/(g)/edge/form/page", route: "/header/edge/form" });
+    expect(h.__creekCurrentRender()).toBeUndefined();
+  });
+
+  it("keeps it for entries with env overrides", async () => {
+    const h = load({ getStore: () => undefined });
+    expect(await h.__withEdgeRouteEnv("middleware_app/env/page", async () => h.__creekCurrentRender())).toEqual({
+      page: "app/env/page",
+      route: "/env",
+    });
+  });
+
+  it("keeps concurrent edge requests apart", async () => {
+    const h = load({ getStore: () => undefined });
+    const run = (key: string, ms: number) =>
+      h.__withEdgeRouteEnv(key, async () => {
+        await new Promise((r) => setTimeout(r, ms));
+        return h.__creekCurrentRender()?.page;
+      });
+    expect(await Promise.all([run("middleware_app/a/page", 5), run("middleware_app/b/page", 1)])).toEqual(["app/a/page", "app/b/page"]);
+  });
+
+  it("gives no route for a non-app entry", async () => {
+    const h = load({ getStore: () => undefined });
+    expect(await h.__withEdgeRouteEnv("middleware_pages/api/edge", async () => h.__creekCurrentRender())).toEqual({
+      page: "pages/api/edge",
+      route: undefined,
+    });
+  });
+
+  it("prefers the node work store when one is active", async () => {
+    const nodeStore = { page: "/node/page", route: "/node" };
+    const h = load({ getStore: () => nodeStore });
+    expect(h.__creekCurrentRender()).toBe(nodeStore);
+  });
+
+  it("is what every manifest lookup reads", () => {
+    expect(src.match(/const workStore = __creekCurrentRender\(\);/g)?.length).toBe(3);
   });
 });

@@ -2099,7 +2099,36 @@ function __creekEdgeAdapterParams(request, pathname, params, ctx) {
   };
 }
 
+// The edge entry a request is running, as { page, route } like Next's work
+// store. An edge bundle carries its own copy of Next's workAsyncStorage, so
+// __nextWorkAsyncStorage (the node copy) is empty during an edge render; the
+// manifest proxies read this instead to find the current page.
+const __creekEdgeEntryStorage = new AsyncLocalStorage();
+
+function __creekEdgeEntryInfo(entryKey) {
+  const page = String(entryKey).replace(/^middleware_/, "");
+  return {
+    page,
+    route: page.startsWith("app/") ? __creekNormalizeAppPath(page.slice(3)) : undefined,
+  };
+}
+
+// { page, route } of the app render in progress: the node work store, else
+// the edge entry this request was dispatched to.
+function __creekCurrentRender() {
+  const workStore = typeof __nextWorkAsyncStorage?.getStore === "function"
+    ? __nextWorkAsyncStorage.getStore()
+    : undefined;
+  if (workStore) return workStore;
+  return __creekEdgeEntryStorage.getStore();
+}
+
 async function __withEdgeRouteEnv(entryKey, fn) {
+  if (entryKey && !__creekEdgeEntryStorage.getStore()) {
+    return await __creekEdgeEntryStorage.run(__creekEdgeEntryInfo(entryKey), () =>
+      __withEdgeRouteEnv(entryKey, fn),
+    );
+  }
   const envOverrides = entryKey ? EDGE_ROUTE_ENVS[entryKey] : null;
   if (!envOverrides || typeof process === "undefined") {
     return await fn();
@@ -4012,9 +4041,7 @@ function __initManifests() {
                 return entry;
               };
 
-              const workStore = typeof __nextWorkAsyncStorage?.getStore === "function"
-                ? __nextWorkAsyncStorage.getStore()
-                : undefined;
+              const workStore = __creekCurrentRender();
               if (workStore?.route) {
                 const routeEntry = readEntry(clientReferenceManifestsPerRoute.get(workStore.route));
                 if (
@@ -4084,9 +4111,7 @@ function __initManifests() {
           // We were returning the FIRST manifest inserted, which hid
           // route-specific CSS/JS entries and caused e.g. /_not-found
           // (global-not-found convention) to render without its CSS links.
-          const workStore = typeof __nextWorkAsyncStorage?.getStore === "function"
-            ? __nextWorkAsyncStorage.getStore()
-            : undefined;
+          const workStore = __creekCurrentRender();
           if (workStore?.route) {
             const routeManifest = clientReferenceManifestsPerRoute.get(workStore.route);
             if (routeManifest && routeManifest[prop] !== undefined) {
@@ -4139,9 +4164,7 @@ function __initManifests() {
           // next-after-app-deploy edge variants where
           // \`revalidatePath(pathPrefix + '/server-action')\` revalidated
           // \`/nodejs/server-action\` on an \`/edge/...\` POST.
-          const workStore = typeof __nextWorkAsyncStorage?.getStore === "function"
-            ? __nextWorkAsyncStorage.getStore()
-            : undefined;
+          const workStore = __creekCurrentRender();
           const mergedWorkers = Object.assign(
             Object.create(null),
             nodeWorkers || {},
