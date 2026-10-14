@@ -11,7 +11,9 @@
 #   bundled, so the entry never evaluated into `_ENTRIES`;
 # - a webpack edge page/API entry exports only `default`, Next's edge
 #   `adapter()`, which takes request data rather than a Request.
-# A build-only check cannot catch either; only running the worker can.
+# A build-only check cannot catch either; only running the worker can. Runs
+# twice: with middleware, then without it (the edge runtime used to come only
+# from the middleware's files, so edge routes alone had none).
 #
 # Usage: e2e/edge-webpack/run.sh   (from the repo root; needs network + wrangler)
 #        E2E_BUNDLER=turbopack e2e/edge-webpack/run.sh   (same checks, Turbopack)
@@ -78,26 +80,6 @@ WRANGLER_ENTRY="$(node -e "
 " "$ADAPTER_PATH")"
 test -f "$WRANGLER_ENTRY" || fail "wrangler entry not found at $WRANGLER_ENTRY"
 
-log "Building the fixture: next build ${BUILD_FLAG:-(Turbopack)}"
-# shellcheck disable=SC2086
-NEXT_ADAPTER_PATH="$ADAPTER_PATH" npx next build $BUILD_FLAG
-
-SERVER_DIR="$APP/.creek/adapter-output/server"
-test -f "$SERVER_DIR/worker.js" || fail "adapter did not emit worker.js"
-
-log "Starting workerd via wrangler dev on :$PORT"
-cd "$SERVER_DIR"
-# --no-bundle: serve the EMITTED worker.js as the upload does, not a re-bundle.
-node "$WRANGLER_ENTRY" dev --port "$PORT" --no-bundle >"$WORK/wrangler.log" 2>&1 &
-WRANGLER_PID=$!
-BASE="http://127.0.0.1:$PORT"
-for _ in $(seq 1 60); do
-  CODE="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/node" 2>/dev/null || true)"
-  [ -n "$CODE" ] && [ "$CODE" != "000" ] && break
-  kill -0 "$WRANGLER_PID" 2>/dev/null || { cat "$WORK/wrangler.log" >&2; fail "wrangler dev exited before serving"; }
-  sleep 2
-done
-
 FAILED=0
 # check <label> <expected: JSON subset, or a substring of the HTML> <curl args…>
 check() {
@@ -118,21 +100,54 @@ check() {
   fi
 }
 
-log "Checking routes (bundler: ${E2E_BUNDLER:-webpack})"
-check "pages API, edge"                 '{"route":"pages-edge","header":"yes","url":"/api/edge"}' "$BASE/api/edge"
-check "pages API, edge, query"          '{"method":"GET","q":"hi","header":"yes"}' "$BASE/api/edge-echo?q=hi"
-check "pages API, edge, POST body"      '{"method":"POST","body":"hello-body"}' -X POST -H 'content-type: text/plain' --data 'hello-body' "$BASE/api/edge-echo"
-check "pages API, edge, dynamic"        '{"id":"42"}' "$BASE/api/edge-dyn/42"
-check "app route, edge"                 '{"route":"app-edge","header":"yes"}' "$BASE/edge-route"
-check "app route, edge, dynamic"        '{"slug":"abc"}' "$BASE/edge-dyn/abc"
-check "app route, edge, POST json"      '{"echoed":{"a":1}}' -X POST -H 'content-type: application/json' --data '{"a":1}' "$BASE/edge-dyn/abc"
-check "app page, edge"                  'edge app page, runtime <!-- -->edge' "$BASE/edge-page"
-check "pages SSR, edge"                 'edge pages ssr q=<!-- -->zz' "$BASE/edge-ssr?q=zz"
-check "pages API, node (control)"       '{"route":"pages-node","header":"yes"}' "$BASE/api/node"
-check "app route, node (control)"       '{"route":"app-node","header":"yes"}' "$BASE/node-route"
+# run_variant <name> <x-from-mw value expected from middleware, as JSON>
+run_variant() {
+  local name="$1" mw="$2"
+  cd "$APP"
+  rm -rf .next .creek/adapter-output
+  log "[$name] Building the fixture: next build ${BUILD_FLAG:-(Turbopack)}"
+  # shellcheck disable=SC2086
+  NEXT_ADAPTER_PATH="$ADAPTER_PATH" npx next build $BUILD_FLAG
+  local server_dir="$APP/.creek/adapter-output/server"
+  test -f "$server_dir/worker.js" || fail "[$name] adapter did not emit worker.js"
 
-if [ "$FAILED" -gt 0 ]; then
-  echo; tail -40 "$WORK/wrangler.log" >&2
-  fail "$FAILED route check(s) failed"
-fi
-log "PASS — every edge route served 200 in workerd"
+  log "[$name] Starting workerd via wrangler dev on :$PORT"
+  # --no-bundle: serve the EMITTED worker.js as the upload does, not a re-bundle.
+  (cd "$server_dir" && exec node "$WRANGLER_ENTRY" dev --port "$PORT" --no-bundle) >"$WORK/wrangler.log" 2>&1 &
+  WRANGLER_PID=$!
+  local code
+  for _ in $(seq 1 60); do
+    code="$(curl -sS -o /dev/null -w '%{http_code}' "$BASE/api/node" 2>/dev/null || true)"
+    [ -n "$code" ] && [ "$code" != "000" ] && break
+    kill -0 "$WRANGLER_PID" 2>/dev/null || { cat "$WORK/wrangler.log" >&2; fail "[$name] wrangler dev exited before serving"; }
+    sleep 2
+  done
+
+  log "[$name] Checking routes (bundler: ${E2E_BUNDLER:-webpack})"
+  check "pages API, edge"                 "{\"route\":\"pages-edge\",\"header\":$mw,\"url\":\"/api/edge\"}" "$BASE/api/edge"
+  check "pages API, edge, query"          "{\"method\":\"GET\",\"q\":\"hi\",\"header\":$mw}" "$BASE/api/edge-echo?q=hi"
+  check "pages API, edge, POST body"      '{"method":"POST","body":"hello-body"}' -X POST -H 'content-type: text/plain' --data 'hello-body' "$BASE/api/edge-echo"
+  check "pages API, edge, dynamic"        '{"id":"42"}' "$BASE/api/edge-dyn/42"
+  check "app route, edge"                 "{\"route\":\"app-edge\",\"header\":$mw}" "$BASE/edge-route"
+  check "app route, edge, dynamic"        '{"slug":"abc"}' "$BASE/edge-dyn/abc"
+  check "app route, edge, POST json"      '{"echoed":{"a":1}}' -X POST -H 'content-type: application/json' --data '{"a":1}' "$BASE/edge-dyn/abc"
+  check "app page, edge"                  'edge app page, runtime <!-- -->edge' "$BASE/edge-page"
+  check "pages SSR, edge"                 'edge pages ssr q=<!-- -->zz' "$BASE/edge-ssr?q=zz"
+  check "pages API, node (control)"       "{\"route\":\"pages-node\",\"header\":$mw}" "$BASE/api/node"
+  check "app route, node (control)"       "{\"route\":\"app-node\",\"header\":$mw}" "$BASE/node-route"
+
+  kill "$WRANGLER_PID" 2>/dev/null || true
+  wait "$WRANGLER_PID" 2>/dev/null || true
+  WRANGLER_PID=""
+  if [ "$FAILED" -gt 0 ]; then
+    echo; tail -40 "$WORK/wrangler.log" >&2
+    fail "[$name] $FAILED route check(s) failed"
+  fi
+}
+
+BASE="http://127.0.0.1:$PORT"
+run_variant "with middleware" '"yes"'
+rm "$APP/middleware.js"
+run_variant "without middleware" 'null'
+
+log "PASS — every edge route served 200 in workerd, with and without middleware"
