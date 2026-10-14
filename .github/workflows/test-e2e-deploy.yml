@@ -154,7 +154,9 @@ jobs:
           # Next.js picks the bundler from these (lib/bundler.js); setting
           # both exits with "Multiple bundler flags set", so exactly one is
           # non-empty.
-          IS_TURBOPACK_TEST: ${{ inputs.bundler == 'webpack' && '' || '1' }}
+          # `a && '' || b` is always b in Actions expressions ('' is falsy), so
+          # the empty value goes last in both.
+          IS_TURBOPACK_TEST: ${{ inputs.bundler != 'webpack' && '1' || '' }}
           IS_WEBPACK_TEST: ${{ inputs.bundler == 'webpack' && '1' || '' }}
           NEXT_TEST_JOB: 1
           NEXT_TELEMETRY_DISABLED: 1
