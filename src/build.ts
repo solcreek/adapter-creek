@@ -409,6 +409,12 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   }
 
 
+  // Webpack's server runtimes load chunks with `require("./chunks/"+g.u(a))`.
+  // The bundler turns that into a glob over every file in server/chunks,
+  // which with `experimental.serverSourceMaps` includes `.js.map` files it
+  // has no loader for, and the build fails.
+  await restrictWebpackChunkRequires(ctx.distDir);
+
   // Step 3c: Find edge middleware registration chunk.
   // Turbopack generates TWO edge-wrapper files:
   // 1. turbopack-..._edge-wrapper (modulePath — Turbopack runtime, imported by worker)
@@ -1533,6 +1539,38 @@ export function collectWebpackEdgeAssets(
     }
   }
   return { webpackEdgeRuntimePath, webpackEdgeChunkPaths };
+}
+
+const WEBPACK_CHUNK_REQUIRE = /require\("\.\/chunks\/"\+([A-Za-z_$][\w$]*)\.u\(([A-Za-z_$][\w$]*)\)\)/g;
+
+/**
+ * Rewrite a webpack server runtime's chunk require so the bundler's glob
+ * matches only `.js` files: `require("./chunks/"+g.u(a))` becomes
+ * `require("./chunks/"+g.u(a).replace(/\.js$/,"")+".js")`. A server chunk's
+ * filename always ends in `.js`, so the loaded file is the same. Returns the
+ * rewritten source, or null when there is nothing to rewrite. Exported for tests.
+ */
+export function restrictWebpackChunkRequire(source: string): string | null {
+  const rewritten = source.replace(
+    WEBPACK_CHUNK_REQUIRE,
+    (_, runtime: string, id: string) => `require("./chunks/"+${runtime}.u(${id}).replace(/\\.js$/,"")+".js")`,
+  );
+  return rewritten === source ? null : rewritten;
+}
+
+/** Apply restrictWebpackChunkRequire to the webpack server runtimes in place. */
+async function restrictWebpackChunkRequires(distDir: string): Promise<void> {
+  for (const name of ["webpack-runtime.js", "webpack-api-runtime.js"]) {
+    const file = path.join(distDir, "server", name);
+    let source: string;
+    try {
+      source = await fs.readFile(file, "utf-8");
+    } catch {
+      continue;
+    }
+    const rewritten = restrictWebpackChunkRequire(source);
+    if (rewritten !== null) await fs.writeFile(file, rewritten);
+  }
 }
 
 /**

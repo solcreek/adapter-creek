@@ -9,6 +9,7 @@ import {
   collectWebpackEdgeAssets,
   countNativeModuleRefs,
   dedupeWasmByContent,
+  restrictWebpackChunkRequire,
   webpackEdgeBootstrapSource,
 } from "./build.js";
 
@@ -357,5 +358,34 @@ describe("webpackEdgeBootstrapSource", () => {
     expect(src).toContain(`import __wasm_0 from ${JSON.stringify(path.join("/out/server", "wasm_58ccff8b.wasm"))};`);
     expect(src).toContain('globalThis["wasm_58ccff8b"] = __wasm_0;');
     expect(src).toContain('globalThis["wasm_54296c12"] = __wasm_1;');
+  });
+});
+
+describe("restrictWebpackChunkRequire", () => {
+  // As next build --webpack writes server/webpack-runtime.js (minified).
+  const runtime = `d.f.require=(a,b)=>{c[a]||(311!=a?d(require("./chunks/"+g.u(a))):c[a]=1)},module.exports=g,g.C=d`;
+
+  it("narrows the chunk require to .js files and loads the same file", () => {
+    const out = restrictWebpackChunkRequire(runtime)!;
+    expect(out).toContain(`require("./chunks/"+g.u(a).replace(/\\.js$/,"")+".js")`);
+    const chunkFile = (u: (id: number) => string, src: string) => {
+      const expr = src.match(/require\(("\.\/chunks\/"\+g\.u\(a\)[^;]*?)\)\)/)![1];
+      return new Function("g", "a", `return ${expr};`)({ u }, 456) as string;
+    };
+    const u = (id: number) => "" + id + ".js";
+    expect(chunkFile(u, out)).toBe("./chunks/456.js");
+  });
+
+  it("handles other minified names, as in webpack-api-runtime.js", () => {
+    expect(restrictWebpackChunkRequire(`b(require("./chunks/"+e.u(c)))`)).toBe(
+      `b(require("./chunks/"+e.u(c).replace(/\\.js$/,"")+".js"))`,
+    );
+  });
+
+  it("is idempotent and leaves other sources alone", () => {
+    const once = restrictWebpackChunkRequire(runtime)!;
+    expect(restrictWebpackChunkRequire(once)).toBeNull();
+    expect(restrictWebpackChunkRequire(`require("./chunks/" + name)`)).toBeNull();
+    expect(restrictWebpackChunkRequire("module.exports = {};")).toBeNull();
   });
 });
