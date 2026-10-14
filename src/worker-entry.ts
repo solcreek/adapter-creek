@@ -2080,7 +2080,10 @@ const EDGE_ROUTE_ENVS = __getEdgeRouteEnvs();
 // page/API entry (\`(opts) => adapter({ ...opts, page, handler })\`), which takes
 // request data rather than a Request and returns { response, waitUntil }.
 // Turbopack entries and webpack app routes also export \`handler(request, ctx)\`.
-function __creekEdgeAdapterParams(request, pathname, params) {
+// \`requestMeta\` and \`waitUntil\` are forwarded as Next's own edge wrapper does:
+// adapter() installs request metadata only when it is present, and without
+// \`waitUntil\` background work (after(), revalidation) has no lifetime.
+function __creekEdgeAdapterParams(request, pathname, params, ctx) {
   return {
     request: {
       url: request.url,
@@ -2090,6 +2093,8 @@ function __creekEdgeAdapterParams(request, pathname, params) {
       signal: request.signal,
       nextConfig: { basePath: BASE_PATH, i18n: I18N || undefined, trailingSlash: !!CONFIG?.trailingSlash },
       page: { name: pathname, params },
+      requestMeta: ctx?.requestMeta,
+      waitUntil: ctx?.waitUntil,
     },
   };
 }
@@ -8661,7 +8666,7 @@ async function __handleRequestInner(request, env, ctx) {
                   handler.entryKey,
                   () =>
                     adapterStyle
-                      ? fn(__creekEdgeAdapterParams(edgeRequest, handler.pathname, edgeRouteParams))
+                      ? fn(__creekEdgeAdapterParams(edgeRequest, handler.pathname, edgeRouteParams, edgeHandlerContext))
                       : fn(edgeRequest, edgeHandlerContext),
                 );
                 if (edgeResult instanceof Response) {

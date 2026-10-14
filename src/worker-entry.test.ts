@@ -52,7 +52,14 @@ describe("generateWorkerEntry: webpack edge functions", () => {
 
   it("calls an entry without a handler export through Next's edge adapter params", () => {
     const src = entry(webpackEdge);
-    expect(src).toContain("function __creekEdgeAdapterParams(request, pathname, params)");
-    expect(src).toMatch(/adapterStyle\s*\?\s*fn\(__creekEdgeAdapterParams\(edgeRequest, handler\.pathname, edgeRouteParams\)\)/);
+    expect(src).toContain("function __creekEdgeAdapterParams(request, pathname, params, ctx)");
+    expect(src).toMatch(/adapterStyle\s*\?\s*fn\(__creekEdgeAdapterParams\(edgeRequest, handler\.pathname, edgeRouteParams, edgeHandlerContext\)\)/);
+  });
+
+  it("forwards requestMeta and waitUntil to Next's edge adapter, as Next's edge wrapper does", () => {
+    const src = entry(webpackEdge);
+    const helper = src.slice(src.indexOf("function __creekEdgeAdapterParams"), src.indexOf("async function __withEdgeRouteEnv"));
+    expect(helper).toContain("requestMeta: ctx?.requestMeta");
+    expect(helper).toContain("waitUntil: ctx?.waitUntil");
   });
 });

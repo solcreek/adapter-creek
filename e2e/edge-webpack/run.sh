@@ -133,6 +133,13 @@ run_variant() {
   check "app route, edge, POST json"      '{"echoed":{"a":1}}' -X POST -H 'content-type: application/json' --data '{"a":1}' "$BASE/edge-dyn/abc"
   check "app page, edge"                  'edge app page, runtime <!-- -->edge' "$BASE/edge-page"
   check "pages SSR, edge"                 'edge pages ssr q=<!-- -->zz' "$BASE/edge-ssr?q=zz"
+  check "pages SSR, edge, dynamic"        'slug=<!-- -->hello<!-- --> q=<!-- -->1' "$BASE/edge-ssr-dyn/hello?q=1"
+  if [ "$mw" != "null" ]; then
+    # Middleware rewrites: the URL keeps the original path, so the route
+    # params reach the edge entry only through the rewrite.
+    check "rewrite -> pages SSR, edge"    'slug=<!-- -->world<!-- --> q=<!-- -->2' "$BASE/rw/world?q=2"
+    check "rewrite -> pages API, edge"    '{"id":"77"}' "$BASE/rwapi/77"
+  fi
   check "pages API, node (control)"       "{\"route\":\"pages-node\",\"header\":$mw}" "$BASE/api/node"
   check "app route, node (control)"       "{\"route\":\"app-node\",\"header\":$mw}" "$BASE/node-route"
 
