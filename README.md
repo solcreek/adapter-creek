@@ -42,7 +42,7 @@ Creek is a **platform** — this adapter is the bridge between Next.js and that 
 
 ## Status
 
-Full Next.js coverage on Cloudflare Workers — zero adapter-specific skips. The `test/deploy-tests-manifest.adapter-creek.json` file is empty; every test that runs against other adapters also runs (and passes) here.
+The Next.js deploy suite runs here with no adapter-specific skips: `test/deploy-tests-manifest.adapter-creek.json` is empty, so every test that runs against other adapters runs here too. Results depend on the bundler, and `creek deploy` builds with webpack (see the last row below and #15).
 
 | Feature | Status |
 |---------|:------:|
@@ -56,7 +56,7 @@ Full Next.js coverage on Cloudflare Workers — zero adapter-specific skips. The
 | `@vercel/og` (node + edge) | ✅ WASM-path |
 | `sqlite3` native-addon packages | ✅ transparent sql.js shim |
 | Multi-runtime isolation (opt-in) | ✅ `CREEK_MULTI_WORKER=1` |
-| Next.js e2e deploy suite | ✅ 100% of in-scope tests (full matrix green) |
+| Next.js e2e deploy suite (2026-10-14, adapter 0.2.21, Next.js 16.3.0-canary.25) | Turbopack: 1,012 / 1,013 test files ([run](https://github.com/solcreek/adapter-creek/actions/runs/38501325977)). webpack: 955 / 1,013 ([run](https://github.com/solcreek/adapter-creek/actions/runs/38505148158)) |
 
 ## Requirements
 
