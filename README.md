@@ -56,7 +56,7 @@ The Next.js deploy suite runs here with no adapter-specific skips: `test/deploy-
 | `@vercel/og` (node + edge) | ✅ WASM-path |
 | `sqlite3` native-addon packages | ✅ transparent sql.js shim |
 | Multi-runtime isolation (opt-in) | ✅ `CREEK_MULTI_WORKER=1` |
-| Next.js e2e deploy suite (2026-10-14, adapter 0.2.21, Next.js 16.3.0-canary.25) | Turbopack: 1,012 / 1,013 test files ([run](https://github.com/solcreek/adapter-creek/actions/runs/38501325977)). webpack: 955 / 1,013 ([run](https://github.com/solcreek/adapter-creek/actions/runs/38505148158)) |
+| Next.js e2e deploy suite (2026-10-14, adapter 0.2.22, Next.js 16.3.0-canary.25) | Turbopack: 1,012 / 1,013 test files ([run](https://github.com/solcreek/adapter-creek/actions/runs/38514629810)). webpack: 989 / 1,013 ([run](https://github.com/solcreek/adapter-creek/actions/runs/38514623166)) |
 
 ## Requirements
 
