@@ -75,6 +75,13 @@ jobs:
           # be released, so reusing 8799 could flake with "address already in use".
           E2E_PORT: '8800'
 
+      # Edge-runtime routes built with webpack (what `creek deploy` runs) must
+      # serve 200 in workerd, with and without middleware.
+      - name: E2E — Edge routes under webpack
+        run: e2e/edge-webpack/run.sh
+        env:
+          E2E_PORT: '8801'
+
       # Use `npm publish` rather than `pnpm publish` — npm has the most
       # mature OIDC trusted-publishing implementation, and pnpm just
       # delegates to npm internally for the registry hit anyway.

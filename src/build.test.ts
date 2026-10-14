@@ -5,6 +5,7 @@ import * as path from "node:path";
 import {
   assertWorkerWithinLimit,
   collectManifests,
+  collectWebpackEdgeAssets,
   countNativeModuleRefs,
   dedupeWasmByContent,
 } from "./build.js";
@@ -233,5 +234,56 @@ describe("assertWorkerWithinLimit", () => {
   it("does nothing when there are no server files", async () => {
     await expect(assertWorkerWithinLimit(serverDir, [])).resolves.toBeUndefined();
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("collectWebpackEdgeAssets", () => {
+  const dist = "/proj/.next";
+  // As Next 16 writes server/middleware-manifest.json for a webpack build.
+  const webpackManifest = {
+    middleware: {
+      "/": { files: ["server/edge-runtime-webpack.js", "server/middleware.js"] },
+    },
+    functions: {
+      "/api/edge": {
+        files: ["server/edge-runtime-webpack.js", "server/edge-chunks/754.js", "server/pages/api/edge.js"],
+      },
+      "/edge-route/route": {
+        files: [
+          "server/server-reference-manifest.js",
+          "server/middleware-build-manifest.js",
+          "server/edge-runtime-webpack.js",
+          "server/edge-chunks/754.js",
+          "server/edge-chunks/890.js",
+          "server/app/edge-route/route.js",
+        ],
+      },
+    },
+  };
+
+  it("collects the runtime and every shared edge chunk, once each", () => {
+    expect(collectWebpackEdgeAssets(dist, webpackManifest)).toEqual({
+      webpackEdgeRuntimePath: path.join(dist, "server/edge-runtime-webpack.js"),
+      webpackEdgeChunkPaths: [path.join(dist, "server/edge-chunks/754.js"), path.join(dist, "server/edge-chunks/890.js")],
+    });
+  });
+
+  it("collects them for edge routes when there is no middleware", () => {
+    const { middleware: _, ...functionsOnly } = webpackManifest;
+    const result = collectWebpackEdgeAssets(dist, functionsOnly);
+    expect(result.webpackEdgeRuntimePath).toBe(path.join(dist, "server/edge-runtime-webpack.js"));
+    expect(result.webpackEdgeChunkPaths).toHaveLength(2);
+  });
+
+  it("collects nothing for a Turbopack manifest or none at all", () => {
+    const turbopackManifest = {
+      functions: {
+        "/api/edge": {
+          files: ["server/edge/chunks/[root-of-the-server]__0abc._.js", "server/edge/chunks/turbopack-pages_api_edge_edge-wrapper.js"],
+        },
+      },
+    };
+    expect(collectWebpackEdgeAssets(dist, turbopackManifest)).toEqual({ webpackEdgeChunkPaths: [] });
+    expect(collectWebpackEdgeAssets(dist, null)).toEqual({ webpackEdgeChunkPaths: [] });
   });
 });

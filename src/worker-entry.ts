@@ -75,21 +75,28 @@ export interface WorkerEntryOptions {
   /** Paths to edge otherChunks that need explicit import */
   edgeOtherChunkPaths?: string[];
   /**
-   * Path to `.next/server/edge-runtime-webpack.js` when the user built with
-   * `next build --webpack`. This tiny IIFE installs the chunk-push hook on
-   * `self.webpackChunk_N_E`; it must evaluate BEFORE `middleware.js` so the
-   * push that registers chunk 149 triggers entry evaluation and populates
-   * `_ENTRIES["middleware_middleware"]`. Turbopack builds don't emit this
-   * file — its absence is the signal to fall through to the Turbopack path.
+   * Path to `.next/server/edge-runtime-webpack.js` when the build used webpack
+   * and has an edge function (middleware or an edge page/route). This tiny
+   * IIFE installs the chunk-push hook on `self.webpackChunk_N_E`; it must
+   * evaluate before the shared edge chunks and every webpack edge entry, so
+   * each entry's push evaluates it and populates `_ENTRIES["middleware_…"]`.
+   * Turbopack builds don't emit this file.
    */
   webpackEdgeRuntimePath?: string;
   /**
    * Path to a tiny generated bootstrap file that predeclares
-   * `globalThis._ENTRIES`. Imported BEFORE the webpack runtime so that
-   * middleware.js's strict-mode bare `_ENTRIES = {}` has a global to resolve
-   * against (otherwise: ReferenceError at module evaluation).
+   * `globalThis._ENTRIES`. Imported BEFORE the webpack runtime so that each
+   * webpack edge entry's strict-mode bare `_ENTRIES = …` assignment has a
+   * global to resolve against (otherwise: ReferenceError at module evaluation).
    */
   webpackEdgeBootstrapPath?: string;
+  /**
+   * Shared webpack edge chunks (`server/edge-chunks/*.js`) that webpack edge
+   * entries — middleware and edge pages/routes — depend on. Imported after the
+   * webpack edge runtime and before the entries, so each entry's dependencies
+   * are registered when it is pushed and it evaluates into `_ENTRIES`.
+   */
+  webpackEdgeChunkPaths?: string[];
   /**
    * [xxh3_128_hex, wasm_filename_with_ext] pairs. Turbopack edge bundles
    * access the compiled WebAssembly.Module via \`globalThis.wasm_<hex>\`.
@@ -613,26 +620,31 @@ ${externalModuleImports}
 // return it without hitting workerd's dynamic-require restriction.
 ${userInstrumentationImport}
 
+${opts.webpackEdgeBootstrapPath ? `
+// Predeclare \`globalThis._ENTRIES\` before any webpack edge entry evaluates —
+// each ends with a bare \`_ENTRIES = …\` assignment that throws in strict-mode
+// ESM unless a global binding already exists.
+import * as __creek_edge_bootstrap from ${JSON.stringify(opts.webpackEdgeBootstrapPath)};
+void __creek_edge_bootstrap;
+` : ""}
+${opts.webpackEdgeRuntimePath ? `
+// Webpack edge runtime — installs the \`webpackChunk_N_E.push\` hook. Loaded
+// before the shared edge chunks and every webpack edge entry (middleware and
+// edge pages/routes), so each push registers or evaluates instead of being a
+// plain Array.push.
+import * as __webpack_edge_runtime from ${JSON.stringify(opts.webpackEdgeRuntimePath)};
+void __webpack_edge_runtime;
+` : ""}
+${(opts.webpackEdgeChunkPaths ?? [])
+  .map((p, i) => `import * as __webpack_edge_chunk_${i} from ${JSON.stringify(p)};\nvoid __webpack_edge_chunk_${i};`)
+  .join("\n")}
+
 // Edge runtime chunks must be imported so their module factories are present
 // before runtimeModuleIds are evaluated for middleware or edge pages/routes.
 ${edgeOtherChunkImports}
 ${handlerStaticImports}
 
 ${opts.outputs.middleware?.edgeRuntime ? `
-${opts.webpackEdgeBootstrapPath ? `
-// Predeclare \`globalThis._ENTRIES\` before webpack middleware evaluates —
-// middleware.js ends with a bare \`_ENTRIES = {}\` assignment that throws in
-// strict-mode ESM unless a global binding already exists.
-import * as __creek_edge_bootstrap from ${JSON.stringify(opts.webpackEdgeBootstrapPath)};
-void __creek_edge_bootstrap;
-` : ""}
-${opts.webpackEdgeRuntimePath ? `
-// Webpack edge runtime — installs \`webpackChunk_N_E.push\` hook. MUST load
-// before middleware.js, otherwise middleware's chunk push becomes a plain
-// Array.push, entry 149 never evaluates, and \`_ENTRIES\` stays empty.
-import * as __webpack_edge_runtime from ${JSON.stringify(opts.webpackEdgeRuntimePath)};
-void __webpack_edge_runtime;
-` : ""}
 // Import edge middleware runtime.
 import * as __middleware_edge from ${JSON.stringify(opts.outputs.middleware.edgeRuntime.modulePath)};
 void __middleware_edge;
@@ -2063,6 +2075,29 @@ function __getEdgeRouteEnvs() {
 }
 
 const EDGE_ROUTE_ENVS = __getEdgeRouteEnvs();
+
+// Params for Next's edge \`adapter()\` — the \`default\` export of a webpack edge
+// page/API entry (\`(opts) => adapter({ ...opts, page, handler })\`), which takes
+// request data rather than a Request and returns { response, waitUntil }.
+// Turbopack entries and webpack app routes also export \`handler(request, ctx)\`.
+// \`requestMeta\` and \`waitUntil\` are forwarded as Next's own edge wrapper does:
+// adapter() installs request metadata only when it is present, and without
+// \`waitUntil\` background work (after(), revalidation) has no lifetime.
+function __creekEdgeAdapterParams(request, pathname, params, ctx) {
+  return {
+    request: {
+      url: request.url,
+      method: request.method,
+      headers: Object.fromEntries(request.headers),
+      body: request.method === "GET" || request.method === "HEAD" ? undefined : request.body ?? undefined,
+      signal: request.signal,
+      nextConfig: { basePath: BASE_PATH, i18n: I18N || undefined, trailingSlash: !!CONFIG?.trailingSlash },
+      page: { name: pathname, params },
+      requestMeta: ctx?.requestMeta,
+      waitUntil: ctx?.waitUntil,
+    },
+  };
+}
 
 async function __withEdgeRouteEnv(entryKey, fn) {
   const envOverrides = entryKey ? EDGE_ROUTE_ENVS[entryKey] : null;
@@ -8624,9 +8659,15 @@ async function __handleRequestInner(request, env, ctx) {
             if (edgeMod) {
               const fn = edgeMod[handlerName] || edgeMod.default;
               if (typeof fn === "function") {
+                // No \`handler\` export: a webpack edge page/API entry, whose
+                // \`default\` is Next's edge adapter (see __creekEdgeAdapterParams).
+                const adapterStyle = typeof edgeMod[handlerName] !== "function";
                 const edgeResult = await __withEdgeRouteEnv(
                   handler.entryKey,
-                  () => fn(edgeRequest, edgeHandlerContext),
+                  () =>
+                    adapterStyle
+                      ? fn(__creekEdgeAdapterParams(edgeRequest, handler.pathname, edgeRouteParams, edgeHandlerContext))
+                      : fn(edgeRequest, edgeHandlerContext),
                 );
                 if (edgeResult instanceof Response) {
                   const edgeResponse = __applyMwResponseHeaders(edgeResult);
@@ -8643,7 +8684,11 @@ async function __handleRequestInner(request, env, ctx) {
                 }
               }
             }
-          } catch {}
+          } catch (edgeErr) {
+            // Falling through to the Node bridge hides the real cause behind
+            // "No handler function found on module"; say what failed.
+            console.error("[creek-edge] " + handler.pathname + ":", edgeErr);
+          }
         }
         __cleanupAppPageFetchCacheShim();
         // Fall through to Node.js handler bridge

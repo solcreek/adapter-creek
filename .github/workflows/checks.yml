@@ -63,3 +63,20 @@ jobs:
         run: e2e/prisma-d1/run.sh
         env:
           E2E_MINIFY: ${{ matrix.minify }}
+
+  # Runtime gate for Edge-runtime routes built with webpack, what `creek deploy`
+  # runs: edge pages API routes, app route handlers and edge pages, with and
+  # without middleware. Every one of them used to return 500 under webpack.
+  edge-webpack-e2e:
+    name: edge-webpack-e2e
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/install-dependencies
+        with:
+          node-version: '24'
+
+      - name: Edge routes under webpack, in workerd
+        run: e2e/edge-webpack/run.sh

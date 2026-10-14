@@ -397,41 +397,44 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
   // 2. node_modules_..._edge-wrapper (contains _ENTRIES registration + module loader)
   // File 2 is NOT referenced by modulePath, so we need to import it explicitly.
   //
-  // Webpack builds take a different path: the middleware output's `assets`
-  // include `server/edge-runtime-webpack.js`, a tiny IIFE that installs a
-  // `webpackChunk_N_E.push` hook. Without importing it BEFORE `middleware.js`,
-  // the chunk push becomes a plain Array.push and the entry chunk never
-  // evaluates — `_ENTRIES["middleware_middleware"]` stays undefined and all
-  // middleware rewrites silently no-op (reproduces as search-params 404s).
+  // Webpack builds take a different path: see collectWebpackEdgeAssets below,
+  // which covers middleware and edge pages/routes alike.
   let edgeRegistrationChunkPath: string | undefined;
   let edgeRuntimeModuleIds: number[] = [];
   let edgeOtherChunkPaths: string[] = [];
-  let webpackEdgeRuntimePath: string | undefined;
+  // Webpack edge outputs — middleware and edge pages/routes alike — are
+  // `webpackChunk_N_E.push` chunks. Each needs `server/edge-runtime-webpack.js`
+  // (installs the push hook) and the shared `server/edge-chunks/*.js` its entry
+  // depends on (`a.O(0,[754],…)`). Without a dependency chunk the entry never
+  // evaluates, `_ENTRIES["middleware_pages/api/x"]` stays unset, and the route
+  // falls through to the Node handler path ("No handler function found on
+  // module"). The middleware manifest lists them under each function's
+  // `files`; an edge page/route output's `assets` does not, so a project with
+  // edge routes and no middleware had neither.
+  const { webpackEdgeRuntimePath, webpackEdgeChunkPaths } = collectWebpackEdgeAssets(
+    ctx.distDir,
+    await readMiddlewareManifest(ctx.distDir),
+  );
+  if (webpackEdgeRuntimePath) {
+    console.log(
+      `  [Creek Adapter] Webpack edge runtime: ${path.basename(webpackEdgeRuntimePath)}` +
+        (webpackEdgeChunkPaths.length > 0 ? ` + ${webpackEdgeChunkPaths.length} edge chunk(s)` : ""),
+    );
+  }
+  // Webpack's edge entries end with `(_ENTRIES="u"<typeof _ENTRIES?{}:
+  // _ENTRIES)["middleware_…"]=b` — a bare assignment that needs `_ENTRIES` to
+  // resolve to a writable global. esbuild bundles the file as strict-mode
+  // ESM, so the bare identifier throws ReferenceError unless
+  // `globalThis._ENTRIES` already exists. This bootstrap file ensures it
+  // does; importing it before the runtime and entries runs it first
+  // (imports evaluate in declaration order).
   let webpackEdgeBootstrapPath: string | undefined;
+  if (webpackEdgeRuntimePath) {
+    const bootstrapPath = path.join(ctx.distDir, "server", "creek-edge-bootstrap.js");
+    await fs.writeFile(bootstrapPath, "globalThis._ENTRIES = globalThis._ENTRIES || {};\n");
+    webpackEdgeBootstrapPath = bootstrapPath;
+  }
   if (ctx.outputs.middleware?.edgeRuntime) {
-    const mwAssets = ctx.outputs.middleware.assets || {};
-    for (const [rel, abs] of Object.entries(mwAssets)) {
-      if (/(^|\/)server\/edge-runtime-webpack\.js$/.test(rel)) {
-        webpackEdgeRuntimePath = abs;
-        console.log(`  [Creek Adapter] Webpack edge runtime: ${path.basename(abs)}`);
-        break;
-      }
-    }
-    // Webpack's middleware.js ends with `(_ENTRIES="u"<typeof _ENTRIES?{}:
-    // _ENTRIES).middleware_middleware=b` — a bare assignment that needs
-    // `_ENTRIES` to resolve to a writable global. esbuild bundles the file as
-    // strict-mode ESM, so the bare identifier throws ReferenceError unless
-    // `globalThis._ENTRIES` already exists. This bootstrap file ensures it
-    // does; importing it before the runtime/middleware imports runs it first
-    // (imports evaluate in declaration order).
-    if (webpackEdgeRuntimePath) {
-      const bootstrapPath = path.join(ctx.distDir, "server", "creek-edge-bootstrap.js");
-      await fs.writeFile(
-        bootstrapPath,
-        "globalThis._ENTRIES = globalThis._ENTRIES || {};\n"
-      );
-      webpackEdgeBootstrapPath = bootstrapPath;
-    }
     try {
       const edgeChunksDir = path.join(ctx.distDir, "server", "edge", "chunks");
       const files = await fs.readdir(edgeChunksDir);
@@ -596,6 +599,7 @@ export async function handleBuild(ctx: BuildContext): Promise<void> {
     edgeOtherChunkPaths,
     webpackEdgeRuntimePath,
     webpackEdgeBootstrapPath,
+    webpackEdgeChunkPaths,
     userInstrumentationPath,
   });
 
@@ -1459,6 +1463,47 @@ export async function assertWorkerWithinLimit(serverDir: string, serverFiles: st
   if (verdict.level === "near-limit" && verdict.message) {
     console.warn(`  [Creek Adapter] ${verdict.message}`);
   }
+}
+
+interface MiddlewareManifest {
+  middleware?: Record<string, { files?: string[] }>;
+  functions?: Record<string, { files?: string[] }>;
+}
+
+/** `.next/server/middleware-manifest.json`, or null when absent or unreadable. */
+async function readMiddlewareManifest(distDir: string): Promise<MiddlewareManifest | null> {
+  try {
+    return JSON.parse(await fs.readFile(path.join(distDir, "server", "middleware-manifest.json"), "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The webpack edge runtime and the shared edge chunks that webpack edge
+ * functions (middleware, edge pages and routes) need: the
+ * `server/edge-runtime-webpack.js` and `server/edge-chunks/*.js` entries of
+ * each function's `files` in the middleware manifest, as absolute paths.
+ * Turbopack edge functions list neither and yield nothing. Exported for tests.
+ */
+export function collectWebpackEdgeAssets(
+  distDir: string,
+  manifest: MiddlewareManifest | null,
+): { webpackEdgeRuntimePath?: string; webpackEdgeChunkPaths: string[] } {
+  let webpackEdgeRuntimePath: string | undefined;
+  const webpackEdgeChunkPaths: string[] = [];
+  const entries = [...Object.values(manifest?.middleware ?? {}), ...Object.values(manifest?.functions ?? {})];
+  for (const entry of entries) {
+    for (const rel of entry?.files ?? []) {
+      const abs = path.join(distDir, rel);
+      if (/^server\/edge-runtime-webpack\.js$/.test(rel)) {
+        webpackEdgeRuntimePath ??= abs;
+      } else if (/^server\/edge-chunks\/[^/]+\.js$/.test(rel) && !webpackEdgeChunkPaths.includes(abs)) {
+        webpackEdgeChunkPaths.push(abs);
+      }
+    }
+  }
+  return { webpackEdgeRuntimePath, webpackEdgeChunkPaths };
 }
 
 /**
