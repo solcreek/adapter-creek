@@ -114,7 +114,7 @@ describe("generateWorkerEntry: the render in progress for edge entries", () => {
   type Render = { page?: string; route?: string } | undefined;
 
   /** The generated helpers, with a node work store the test controls. */
-  function load(nodeStore: { getStore(): unknown }) {
+  function load(nodeStore: { getStore(): unknown; run?: unknown }) {
     const decl = src.slice(src.indexOf("const __creekEdgeEntryStorage"), src.indexOf(";", src.indexOf("const __creekEdgeEntryStorage")) + 1);
     const body = [
       fnSource(src, "__creekNormalizeAppPath"),
@@ -142,13 +142,18 @@ describe("generateWorkerEntry: the render in progress for edge entries", () => {
       await new Promise((r) => setTimeout(r, 1));
       return h.__creekCurrentRender();
     });
-    expect(seen).toEqual({ page: "app/header/(g)/edge/form/page", route: "/header/edge/form" });
+    expect(seen).toEqual({
+      entryKey: "middleware_app/header/(g)/edge/form/page",
+      page: "app/header/(g)/edge/form/page",
+      route: "/header/edge/form",
+    });
     expect(h.__creekCurrentRender()).toBeUndefined();
   });
 
   it("keeps it for entries with env overrides", async () => {
     const h = load({ getStore: () => undefined });
     expect(await h.__withEdgeRouteEnv("middleware_app/env/page", async () => h.__creekCurrentRender())).toEqual({
+      entryKey: "middleware_app/env/page",
       page: "app/env/page",
       route: "/env",
     });
@@ -167,9 +172,35 @@ describe("generateWorkerEntry: the render in progress for edge entries", () => {
   it("gives no route for a non-app entry", async () => {
     const h = load({ getStore: () => undefined });
     expect(await h.__withEdgeRouteEnv("middleware_pages/api/edge", async () => h.__creekCurrentRender())).toEqual({
+      entryKey: "middleware_pages/api/edge",
       page: "pages/api/edge",
       route: undefined,
     });
+  });
+
+  it("gives a nested request to another edge entry that entry, and restores the caller's", async () => {
+    const h = load({ getStore: () => undefined });
+    const seen = await h.__withEdgeRouteEnv("middleware_app/source/page", async () => {
+      const inner = await h.__withEdgeRouteEnv("middleware_app/target/page", async () => {
+        await new Promise((r) => setTimeout(r, 1));
+        return h.__creekCurrentRender()?.page;
+      });
+      await new Promise((r) => setTimeout(r, 1));
+      return { inner, outer: h.__creekCurrentRender()?.page };
+    });
+    expect(seen).toEqual({ inner: "app/target/page", outer: "app/source/page" });
+  });
+
+  it("hides a node render's work store from an edge entry it requests, and restores it", async () => {
+    const node = new AsyncLocalStorage<{ page: string; route: string }>();
+    const h = load(node);
+    const nodeStore = { page: "/node/page", route: "/node" };
+    const seen = await node.run(nodeStore, async () => {
+      const inner = await h.__withEdgeRouteEnv("middleware_app/edge/page", async () => h.__creekCurrentRender()?.page);
+      return { inner, outer: h.__creekCurrentRender() };
+    });
+    expect(seen.inner).toBe("app/edge/page");
+    expect(seen.outer).toBe(nodeStore);
   });
 
   it("prefers the node work store when one is active", async () => {

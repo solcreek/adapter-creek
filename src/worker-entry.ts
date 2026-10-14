@@ -2108,6 +2108,7 @@ const __creekEdgeEntryStorage = new AsyncLocalStorage();
 function __creekEdgeEntryInfo(entryKey) {
   const page = String(entryKey).replace(/^middleware_/, "");
   return {
+    entryKey,
     page,
     route: page.startsWith("app/") ? __creekNormalizeAppPath(page.slice(3)) : undefined,
   };
@@ -2124,10 +2125,16 @@ function __creekCurrentRender() {
 }
 
 async function __withEdgeRouteEnv(entryKey, fn) {
-  if (entryKey && !__creekEdgeEntryStorage.getStore()) {
-    return await __creekEdgeEntryStorage.run(__creekEdgeEntryInfo(entryKey), () =>
-      __withEdgeRouteEnv(entryKey, fn),
-    );
+  // A same-origin request a render makes runs in-process (__creekSameOriginFetch)
+  // and inherits the caller's scope, so enter this entry's scope whenever it
+  // is not already the current one, and hide a node render's work store,
+  // which __creekCurrentRender would otherwise prefer.
+  if (entryKey && __creekEdgeEntryStorage.getStore()?.entryKey !== entryKey) {
+    const enter = () =>
+      __creekEdgeEntryStorage.run(__creekEdgeEntryInfo(entryKey), () => __withEdgeRouteEnv(entryKey, fn));
+    return await (typeof __nextWorkAsyncStorage?.getStore === "function" && __nextWorkAsyncStorage.getStore()
+      ? __nextWorkAsyncStorage.run(undefined, enter)
+      : enter());
   }
   const envOverrides = entryKey ? EDGE_ROUTE_ENVS[entryKey] : null;
   if (!envOverrides || typeof process === "undefined") {
