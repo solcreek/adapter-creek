@@ -4,7 +4,7 @@
 // modifyConfig); local dev keeps the real better-sqlite3 driver. The user's
 // `drizzle(new Database(...), config)` call is preserved verbatim — we ignore
 // the local client and back the same Drizzle instance with the request's D1
-// binding instead, resolved lazily so it works at module scope (env.DB is
+// binding instead, resolved lazily so it works at module scope (the binding is
 // only available per-request via AsyncLocalStorage).
 import { drizzle as drizzleD1 } from "drizzle-orm/d1";
 
@@ -13,7 +13,7 @@ import { drizzle as drizzleD1 } from "drizzle-orm/d1";
 //   - no `__creekEnv` accessor  → we're running outside a request, i.e. at
 //     BUILD time. Next runs DB code during static generation (`next build`);
 //     the D1 binding only exists at request time on Workers.
-//   - accessor present, no DB   → deployed, but no database resource is bound.
+//   - accessor present, no D1   → deployed, but no database resource is bound.
 function resolveCreekD1() {
   const accessor = globalThis.__creekEnv;
   if (typeof accessor !== "function") {
@@ -24,10 +24,13 @@ function resolveCreekD1() {
         "request handler) so it runs on D1 at runtime.",
     );
   }
-  const db = (accessor() || {}).DB;
+  // `database = true` binds DATABASE; DB is the legacy alias and the name a
+  // project's own Workers config may use.
+  const env = accessor() || {};
+  const db = env.DATABASE ?? env.DB;
   if (!db) {
     throw new Error(
-      "[creek] D1 binding `env.DB` is unavailable. Add `database = true` under [resources] in creek.toml.",
+      "[creek] D1 binding `env.DATABASE` (or `env.DB`) is unavailable. Add `database = true` under [resources] in creek.toml.",
     );
   }
   return db;
