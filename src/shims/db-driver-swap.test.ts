@@ -177,13 +177,16 @@ describe("prisma-adapter-better-sqlite3 shim", () => {
     expect(shadow.kind).toBe("d1-shadow");
   });
 
-  it("connects against env.DATABASE when only DATABASE is bound", async () => {
+  it("prefers env.DATABASE, the binding `database = true` creates, over env.DB", async () => {
     const { PrismaBetterSqlite3 } = await import("./prisma-adapter-better-sqlite3.js");
     const adapter = new PrismaBetterSqlite3({ url: "file:./dev.db" });
-    const fakeD1 = { tag: "database" };
-    (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({ DATABASE: fakeD1 });
-    const conn = adapter.connect() as { kind: string; db: unknown };
-    expect(conn.db).toBe(fakeD1);
+    const database = { tag: "DATABASE" };
+    const legacy = { tag: "DB" };
+    (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({ DATABASE: database });
+    expect((adapter.connect() as { db: unknown }).db).toBe(database);
+
+    (globalThis as { __creekEnv?: () => unknown }).__creekEnv = () => ({ DATABASE: database, DB: legacy });
+    expect((adapter.connect() as { db: unknown }).db).toBe(database);
   });
 
   it("throws a helpful error when no D1 binding is available at connect() (deployed, no binding)", async () => {
