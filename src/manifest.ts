@@ -8,7 +8,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { createRequire } from "node:module";
-import type { DeployManifestBase } from "@solcreek/adapter-core";
+import type { DeployManifestBase } from "@solcreek/adapter-next-core";
 import { WORKER_COMPATIBILITY_DATE, WORKER_COMPATIBILITY_FLAGS } from "./compat.js";
 
 const require = createRequire(import.meta.url);

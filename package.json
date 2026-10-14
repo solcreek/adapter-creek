@@ -46,8 +46,7 @@
   "dependencies": {
     "@next/routing": "16.2.3",
     "@node-rs/xxhash": "^1.7.6",
-    "@solcreek/adapter-core": "^0.2.0",
-    "@solcreek/adapter-next-core": "^0.1.1",
+    "@solcreek/adapter-next-core": "^0.1.2",
     "acorn": "^8.19.0",
     "sql.js": "^1.14.1",
     "wrangler": "^4.82.2"
